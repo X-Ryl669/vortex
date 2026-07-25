@@ -6,11 +6,8 @@
 target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
-
-# Keep Cargo.lock for binaries (not for libraries)
-# Uncomment if this becomes a binary-only repo:
-# !Cargo.lock
+# Cargo.lock is COMMITTED — this repo ships binaries (daemon + tauri app),
+# and CI runs `cargo test --locked` for reproducible builds.
 
 # ===== Android / Kotlin =====
 # Gradle
@@ -76,7 +73,6 @@ pnpm-debug.log*
 
 # ===== Tauri =====
 src-tauri/target/
-src-tauri/Cargo.lock
 src-tauri/gen/
 
 # ===== Environment & Secrets =====
