@@ -1,0 +1,59 @@
+[workspace]
+# Standalone workspace so cargo doesn't try to inherit linux/'s settings.
+members = []
+
+[package]
+name = "vortex-ui-tauri"
+version = "1.0.0-beta.1"
+license = "GPL-3.0-or-later"
+description = "Vortex Tauri UI"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "vortex_ui_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "vortex-ui-tauri"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+# Bulk-sync hash gate: sha256 of the cached mirror JSON (matches the
+# phone's hash of the same bytes).
+sha2 = "0.10"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+futures = "0.3"
+# In-process folder zipping for "Share via Vortex" (no system `zip` binary).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+walkdir = "2"
+
+# Local crate dependency — the same library powers the CLI (vortex-l3d).
+vortex-l3-daemon = { path = "../../daemon" }
+# Remember window size/position across restarts (auto save+restore).
+tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2"
+arboard = "3.6.1"
+# Already in the tree via arboard — used here to probe the CLIPBOARD selection's
+# `x-kde-passwordManagerHint` target so password-manager copies aren't synced.
+x11rb = "0.13"
+image = { version = "0.25.6", default-features = false, features = ["png", "ico", "jpeg", "gif"] }
+# Screen mirroring (laptop receiver): decode the phone's sealed H.264 stream
+# into a native window. Links against the system GStreamer (1.20+).
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+# Laptop→phone screen cast (sender): capture the laptop screen via the
+# xdg-desktop-portal ScreenCast portal (Wayland). tokio backend to match our runtime.
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+# Fresh random per-cast media key for the laptop→phone screen stream.
+rand = "0.8"

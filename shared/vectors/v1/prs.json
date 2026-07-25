@@ -1,0 +1,21 @@
+{
+  "algorithm": "HMAC-SHA256(label, ck)",
+  "cases": [
+    {
+      "ck_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "prs_hex": "cb80f96d653e9474fdd741beb6435f537cdad23a685a1cfbca3d29be5a5a2968"
+    },
+    {
+      "ck_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+      "prs_hex": "a004279f3a2a6955f9aebddd3d9f1bafaaa73f9bb2b5306624d3ed4cbe47f17b"
+    },
+    {
+      "ck_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "prs_hex": "604c375040fe2dc4c9b8a221444dfdfa0a817b01df90f73b125eeefa186489ac"
+    }
+  ],
+  "comment": "Pairwise Reconnect Secret per docs3/01-spec.md §6.5.2.",
+  "label": "vortex/v1/prs",
+  "vector_set": "vortex/v1/prs",
+  "version": 1
+}

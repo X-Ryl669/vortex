@@ -1,0 +1,15 @@
+{
+  "vector_id": "sas_v1_001",
+  "protocol_version": 1,
+  "crypto_suite": "VORTEX_CRYPTO_V1",
+  "inputs": {
+    "noise_handshake_hash_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+    "initiator_static_public_key_hex": "00112233445566778899aabbccddeeff102132435465768798a9babbdcddedef",
+    "responder_static_public_key_hex": "f0e1d2c3b4a5968778695a4b3c2d1e0fffeddbcab99887766554433221100f1e"
+  },
+  "expected": {
+    "sas_key_hex": "9cd70c6eb4b05eecb8955936b8d87b500fe4e1882ce53f4f4186f32132b9168f",
+    "sas_code": "576035"
+  },
+  "notes": "Pure SAS derivation vector using deterministic transcript material. The transcript hash is a fixed vector input, not a live Noise proof."
+}

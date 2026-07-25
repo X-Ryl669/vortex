@@ -1,0 +1,20 @@
+# Optional systemd USER unit for headless/session-managed setups. Most
+# users want the XDG autostart entry instead (see README.md) because the
+# app is a tray app; this unit exists for window managers without an
+# XDG autostart implementation.
+#
+#   install: cp vortex.service ~/.config/systemd/user/
+#   enable:  systemctl --user enable --now vortex.service
+[Unit]
+Description=Vortex phone companion
+# Needs the session bus (Secret Service, MPRIS, notifications) and BlueZ.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/vortex-ui-tauri
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

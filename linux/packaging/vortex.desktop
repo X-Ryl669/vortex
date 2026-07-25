@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Vortex
+Comment=Phone companion — calls, messages, notifications and earbuds hand-off
+Exec=vortex-ui-tauri
+Icon=vortex-ui-tauri
+Terminal=false
+Categories=Utility;Network;
+# Autostart: the app lives in the tray and owns the BLE/LAN link, so it
+# should come up with the session.
+X-GNOME-Autostart-enabled=true

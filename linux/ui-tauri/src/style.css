@@ -1,0 +1,119 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+
+/* ---------------------------------------------------------------------
+   Vortex palette — emerald primary, light/dark variants. Both themes
+   share the same primary so the brand stays consistent.
+   --------------------------------------------------------------------- */
+@layer base {
+  :root {
+    /* light mode (default if no class) */
+    --background: 0 0% 98%;
+    --foreground: 240 10% 8%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 8%;
+    --primary: 152 76% 36%;          /* emerald-600 */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 5% 96%;
+    --secondary-foreground: 240 10% 12%;
+    --muted: 240 5% 96%;
+    --muted-foreground: 240 4% 40%;
+    --accent: 240 5% 94%;
+    --accent-foreground: 240 10% 12%;
+    --destructive: 0 75% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 240 6% 90%;
+    --input: 240 5% 92%;
+    --ring: 152 76% 36%;
+    color-scheme: light;
+  }
+
+  .dark {
+    /* Vortex design system (dark). Surfaces are the original spec
+       (#141519/#17181D); only the page CANVAS is softened from the harsh dead
+       black (#0E0E10) to a gentle blue-grey charcoal (#101116) — same near-black
+       depth, but a subtle cool tone instead of pure neutral so it's easier on
+       the eyes. Canvas stays below the cards so they keep their raised look.
+       Emerald #2ECC71, text #F2F4F6/#8A8D93. HSL so one place re-themes all. */
+    --background: 228 9% 9%;          /* #15161B soft charcoal canvas (was #0E0E10) */
+    --foreground: 220 13% 96%;        /* #F2F4F6 */
+    --card: 228 10% 11%;              /* #191A20 surface — kept just ~2% above canvas */
+    --card-foreground: 220 13% 96%;
+    --primary: 145 63% 49%;           /* #2ECC71 emerald accent */
+    --primary-foreground: 150 42% 7%; /* near-black green for text on accent */
+    --secondary: 228 10% 13%;         /* #1E1F25 lifted surface */
+    --secondary-foreground: 220 13% 92%;
+    --muted: 228 10% 13%;
+    --muted-foreground: 220 5% 57%;   /* #8A8D93 */
+    --accent: 228 9% 16%;             /* hover surface */
+    --accent-foreground: 220 13% 96%;
+    --destructive: 0 70% 55%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 228 8% 18%;             /* solid stand-in for hairline rgba-white */
+    --input: 228 8% 16%;
+    --ring: 145 63% 49%;
+    color-scheme: dark;
+  }
+
+  html, body, #app {
+    @apply h-full bg-background text-foreground;
+  }
+
+  body {
+    /* Inter is the design font; falls back to the system UI font when Inter
+       isn't installed (bundle @fontsource/inter once npm is healthy). */
+    font-family: "Inter", system-ui, "Segoe UI", Roboto, Ubuntu, sans-serif;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overscroll-behavior: none;
+    /* Desktop-app feel: no accidental text selection on UI chrome. Editable
+       fields opt back in below. */
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: default;
+  }
+
+  /* Typing / editing still needs real text selection. Content the user may
+     want to copy out (message bodies etc.) opts in via .selectable-text. */
+  input,
+  textarea,
+  [contenteditable="true"],
+  .selectable-text {
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  /* No browser focus outline anywhere — navigation is by our own selection /
+     :active state (arrows + click), not the Tab focus ring. */
+  *:focus,
+  *:focus-visible {
+    outline: none;
+  }
+}
+
+/* Design-system motion: the connection dot breathes. */
+@keyframes vx-pulse {
+  0% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0.5); }
+  70% { box-shadow: 0 0 0 7px hsl(var(--primary) / 0); }
+  100% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0); }
+}
+
+@layer utilities {
+  .vx-pulse { animation: vx-pulse 2.2s ease-out infinite; }
+
+  .scrollbar-thin::-webkit-scrollbar { width: 6px; }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 3px;
+  }
+}

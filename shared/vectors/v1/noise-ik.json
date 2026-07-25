@@ -1,0 +1,19 @@
+{
+  "comment": "Noise IK wire vector per docs3/01-spec.md §7.4. Empty handshake payload.",
+  "inputs": {
+    "initiator_ephemeral_priv_hex": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+    "initiator_static_priv_hex": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+    "responder_ephemeral_priv_hex": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+    "responder_static_priv_hex": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+    "responder_static_pub_hex": "34e42d4af5ef94a07a3a84201b889d4cd1a743cb27b11b6a10438a8feb8e5847"
+  },
+  "noise_pattern": "Noise_IK_25519_ChaChaPoly_SHA256",
+  "outputs": {
+    "msg1_hex": "392d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c6e23fa619a9898607591b362886731c1bace1c9a3d42d0e1cd2dad0bf50f315013b9096ce33f3f1135c2c06a6118934eb1d54bfe82017a1b7f73fcf4c733e211",
+    "msg2_hex": "23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c48230e817c1f9f8cb0e90620de8954c960ea",
+    "transcript_hash_hex": "7e76da74c8365dc65a0898c11306f04f6122c32efb6f73e30739ce06eb4c685c"
+  },
+  "prologue_hex": "766f727465782f76312f7265636f6e6e656374",
+  "vector_set": "vortex/v1/noise-ik",
+  "version": 1
+}

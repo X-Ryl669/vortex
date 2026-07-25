@@ -1,0 +1,51 @@
+.vortex-pill {
+  spacing: 4px;
+}
+.vortex-pill-label {
+  font-weight: 600;
+}
+
+.vortex-card {
+  spacing: 6px;
+  padding: 14px 16px;
+  min-width: 260px;
+}
+.vortex-card-head {
+  spacing: 8px;
+}
+.vortex-app {
+  font-size: 12px;
+  color: #9aa0a6;
+}
+.vortex-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+.vortex-text {
+  font-size: 13px;
+  color: #c8ccd0;
+}
+.vortex-sub {
+  font-size: 12px;
+  color: #9aa0a6;
+  padding-top: 2px;
+}
+.vortex-bar {
+  height: 6px;
+  margin: 6px 0 2px 0;
+  min-width: 240px;
+}
+.vortex-call-actions {
+  spacing: 8px;
+  margin-top: 10px;
+}
+.vortex-call-btn {
+  background-color: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  font-weight: 600;
+  border-radius: 8px;
+  padding: 8px 0;
+}
+.vortex-call-btn:hover {
+  background-color: rgba(255, 255, 255, 0.22);
+}

@@ -1,0 +1,15 @@
+{
+  "vector_id": "presence_token_v1_001",
+  "protocol_version": 1,
+  "crypto_suite": "VORTEX_CRYPTO_V1",
+  "inputs": {
+    "pairwise_reconnect_secret_hex": "e6ac1946fd30235ef44b2ce36a495de6d4bb98d6133ccdf9fbee42db9c3d8e02",
+    "time_bucket": 59234567,
+    "sender_role": "android"
+  },
+  "expected": {
+    "token_8_hex": "59ab401da9a6aa05",
+    "token_16_hex": "59ab401da9a6aa05b26c4c2cb94f1989"
+  },
+  "notes": "Private presence token derivation with 30-second bucket encoded as big-endian uint64."
+}

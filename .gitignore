@@ -1,0 +1,152 @@
+# ===================================
+# Vortex-Lab .gitignore
+# ===================================
+
+# ===== Rust =====
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Keep Cargo.lock for binaries (not for libraries)
+# Uncomment if this becomes a binary-only repo:
+# !Cargo.lock
+
+# ===== Android / Kotlin =====
+# Gradle
+.gradle/
+build/
+/build
+gradle-app.setting
+!gradle-wrapper.jar
+!gradle-wrapper.properties
+.gradletasknamecache
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/gradle.xml
+.idea/assetWizardSettings.xml
+.idea/dictionaries
+.idea/libraries
+.idea/caches
+
+# Android local config
+local.properties
+
+# Android build outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+bin/
+# …but `bin/` above must not swallow the live daemon's `src/bin/` sources.
+!linux/daemon/src/bin/
+gen/
+out/
+release/
+
+# Android signing
+*.jks
+*.keystore
+keystore/
+keystore.properties
+
+# Android native
+.externalNativeBuild
+.cxx/
+
+# ===== Node.js / Vue / Tauri Frontend =====
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+.turbo/
+
+# NPM / Yarn / Pnpm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ===== Tauri =====
+src-tauri/target/
+src-tauri/Cargo.lock
+src-tauri/gen/
+
+# ===== Environment & Secrets =====
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+*.key
+*.pem
+*.p12
+secrets.toml
+secrets.json
+config.local.toml
+
+# ===== IDE =====
+.vscode/*
+!.vscode/settings.json.example
+!.vscode/extensions.json
+!.vscode/launch.json.example
+.fleet/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ===== OS =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ===== Logs =====
+*.log
+logs/
+log/
+
+# ===== Misc =====
+*.tmp
+*.temp
+*.bak
+*.orig
+*.swp
+.cache/
+.parcel-cache/
+coverage/
+
+# ===== Project specific =====
+# Local test outputs
+test-output/
+benchmarks/results/
+
+# Generated ProtoBuf files (generate qilgan kodni push qilmaymiz)
+**/generated/
+**/*.pb.rs
+**/*.pb.kt
+
+# ===== Local backups & tooling (never commit) =====
+# Local snapshot copies of old project versions (huge build dirs — never
+# enter history).
+*.old/
+# Claude Code local project dir (memory, transcripts, settings).
+.claude/
+# Tauri / TS / lint incremental build artifacts.
+.tmp-build/
+*.tsbuildinfo
+.eslintcache

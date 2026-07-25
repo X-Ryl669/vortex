@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- BLE on Android 12+ (API 31+) -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+
+    <!-- Legacy Bluetooth (API 30 and below) -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!-- Required for BLE scan on API 29-30 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
+
+    <!-- LAN runtime (Phase 8) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- High-throughput Wi-Fi lock during file transfer (keeps the radio out
+         of power-save so throughput isn't RTT-limited). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Wi-Fi Direct (peer-to-peer, AirDrop-style fast file transfer that
+         bypasses the router). NEARBY_WIFI_DEVICES is the API 33+ replacement
+         for location-gated Wi-Fi P2P. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+
+    <!-- Foreground service (Phase 13 — background reliability) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- Continuity Camera: use the phone camera as a laptop webcam. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Find-My "ring my phone": vibrate alongside the locate tone. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Screen-mirror request while Vortex is backgrounded: a full-screen-intent
+         notification launches the MediaProjection consent (background activity
+         starts are otherwise blocked). -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Todo due-date reminders fire at an exact time -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- Doze whitelist: keep foreground service alive under screen-off -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Automatic phone→laptop clipboard capture. Protection is signature/dev,
+         so a sideloaded app can't hold it at runtime; the operative grant is the
+         READ_CLIPBOARD AppOp set once via ADB. Declaring it is harmless and lets
+         the grant "stick" on some OEMs. -->
+    <uses-permission android:name="android.permission.READ_CLIPBOARD_IN_BACKGROUND"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Phase 2 — call handoff. READ_PHONE_STATE lets us observe
+         RINGING / OFFHOOK / IDLE transitions via TelephonyCallback,
+         the trigger for the auto-reroute-buds-to-phone flow.
+         MODIFY_AUDIO_SETTINGS is the 2-s fallback: if the buds don't
+         reach the phone in time we flip SpeakerphoneOn so the user
+         still hears the caller. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- Remote laptop UNLOCK is gated behind the system biometric prompt
+         (fingerprint, device-credential fallback). -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <!-- Call mirroring (Apple-Continuity-style banner + in-call pill on the
+         laptop). READ_CALL_LOG surfaces the incoming caller number (Android 9+
+         withholds it from the phone-state listener otherwise); READ_CONTACTS
+         resolves that number to a contact name; ANSWER_PHONE_CALLS lets the
+         laptop's Accept/End buttons answer/hang up via TelecomManager; SEND_SMS
+         backs the "reject with message" action. All optional — the mirror
+         degrades to number-only / fewer actions when a permission is absent. -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <!-- Place outgoing calls when the laptop dials from Contacts/Recents. -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <!-- Mirror recent SMS to the laptop's Messages page. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <!-- Best-effort mark-read when the laptop opens a conversation (only the
+         default SMS app can actually write the provider on KitKat+). -->
+    <uses-permission android:name="android.permission.WRITE_SMS" />
+
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Vortex">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.VortexService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- Screen mirroring: MediaProjection capture → sealed H.264 → UDP to the
+             laptop. mediaProjection FGS type is mandatory for the capture. -->
+        <service
+            android:name=".service.ScreenMirrorService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- Continuity Camera: Camera2 → sealed H.264 → TCP to the laptop, which
+             pipes it into a v4l2 webcam. camera FGS type is mandatory (API 34+). -->
+        <service
+            android:name=".service.CameraStreamService"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
+
+        <!-- Screen control: laptop → phone touch/nav injection via the gesture
+             accessibility API while mirroring. The user enables it once in
+             Settings → Accessibility; we inject only over the sealed mirror
+             session and consume no events. -->
+        <service
+            android:name=".service.VortexInputService"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- One-shot MediaProjection consent prompt (transparent). Launched
+             internally by VortexStack when the laptop opens a mirror session, so
+             it needs no external entry point. -->
+        <activity
+            android:name=".service.MirrorConsentActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Fullscreen viewer for the LAPTOP's screen (laptop→phone mirror).
+             Landscape (the laptop streams 1280x720), keeps the screen on. -->
+        <activity
+            android:name=".ui.LaptopMirrorActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+        <!-- Full-screen "Found it!" page for find-my-phone: pops over the
+             lockscreen (screen forced on) while the ring plays; one tap
+             anywhere silences it. Launched by the ring notification's
+             full-screen intent. -->
+        <activity
+            android:name=".core.ring.RingActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true" />
+
+        <!-- Shares synced clipboard images as content:// URIs so they can be
+             put on the system clipboard via ClipData.newUri. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.clipboard"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Invisible foreground trampoline: reads the clipboard (Android
+             forbids background reads) and forwards it to the laptop. -->
+        <activity
+            android:name=".core.clipboard.ClipboardQuickSendActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:finishOnTaskLaunch="true"
+            android:launchMode="singleTask"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Vortex.ClipboardOverlay" />
+
+        <!-- Share-sheet target: share an image / screenshot to "Vortex" → it's
+             sent to the laptop over the reliable LAN pull. -->
+        <activity
+            android:name=".core.clipboard.ShareReceiverActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Vortex.ClipboardOverlay">
+            <intent-filter>
+                <!-- SEND = one file, SEND_MULTIPLE = a multi-selection (file
+                     managers use the latter; a SEND-only filter never appeared
+                     in the share sheet for multiple files). */* = any type,
+                     AirDrop-style → laptop Downloads. -->
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+                <!-- text/plain = a shared URL (Chrome "Share") → browsing handoff. -->
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- Quick Settings tile: tap to send this phone's clipboard to the
+             laptop (the user gesture Android's read restriction requires). -->
+        <service
+            android:name=".core.clipboard.ClipboardTileService"
+            android:exported="true"
+            android:icon="@android:drawable/ic_menu_save"
+            android:label="@string/clipboard_tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!--
+            Empty notification-listener. Only purpose: lets
+            MediaSessionManager.getActiveSessions() work (precise
+            media-playing detection for the smart audio-follow switch).
+            The user enables it once in Settings → Notification access;
+            if not enabled, the coordinator falls back to AudioManager.
+            We never read notification content.
+        -->
+        <service
+            android:name=".core.media.MediaNotificationListenerService"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!--
+            Boot receiver wakes the foreground service after a reboot
+            (Telegram-style autostart).
+
+            LOCKED_BOOT_COMPLETED is intentionally NOT listed: the
+            receiver is not directBootAware (it cannot be, because the
+            EncryptedSharedPreferences trust store is keyed on the
+            user's credential and is unreachable until the device is
+            unlocked). Android silently ignores LOCKED_BOOT_COMPLETED
+            for non-directBootAware receivers, so leaving it in the
+            filter was misleading.
+
+            We still listen for the OEM "quick boot" variants because
+            some MIUI / HTC firmwares dispatch those instead of the
+            stock BOOT_COMPLETED.
+        -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter android:priority="999">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Todo due-date reminders: fires the alarm notification + re-arms on boot. -->
+        <receiver
+            android:name=".core.notes.NoteReminderReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.vortex.a3.NOTE_REMINDER" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

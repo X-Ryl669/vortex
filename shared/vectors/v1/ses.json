@@ -1,0 +1,21 @@
+{
+  "algorithm": "HMAC-SHA256(label, h)",
+  "cases": [
+    {
+      "h_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "ses_hex": "52d859e013e0dd610dfddc020bded0403065111a6dda20d2e3bc083bdd4cb9aa"
+    },
+    {
+      "h_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "ses_hex": "1137cf208a2041acdf83faa88d5667e4a2be8e566d744d719440297309bc57c0"
+    },
+    {
+      "h_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "ses_hex": "ce0813423367f00e27e57633b528326b77b2a7841780bad2c1b49d42b8d85fb8"
+    }
+  ],
+  "comment": "Session Export Secret per docs3/01-spec.md §6.5.3.",
+  "label": "vortex/v1/ses",
+  "vector_set": "vortex/v1/ses",
+  "version": 1
+}

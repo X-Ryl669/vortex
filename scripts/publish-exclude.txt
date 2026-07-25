@@ -1,0 +1,23 @@
+# Paths NEVER copied to the public mirror (rsync --exclude-from syntax).
+# The dev repo (vortex-lab) stays private; scripts/publish.sh snapshots the
+# tree into the public repo minus these.
+# (NB: .git must NOT be listed — git-archive never exports it, and the
+# cleanup loop would nuke the freshly-cloned public repo's own .git.)
+.gitleaksignore
+# 2026-07-23 decision: the public repo ships CODE ONLY — no project docs.
+# (README/LICENSE/CONTRIBUTING stay: repo face, not docs.)
+docs3
+docs
+BETA_GUIDE.md
+CHANGELOG.md
+TECH_DEBT.md
+README.md
+# Local build artifacts (belt & braces — also gitignored)
+target
+node_modules
+build
+dist
+.tmp-build
+*.apk
+*.jks
+keystore.properties

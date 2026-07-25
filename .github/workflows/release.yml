@@ -1,0 +1,78 @@
+# Release pipeline: pushing a `v*` tag builds the SIGNED Android APK and
+# publishes a GitHub Release with it attached.
+#
+# Linux deliberately ships NO binary for now — users run install_linux.sh,
+# which builds against their own distro's webkit (a universal binary is
+# painful; AppImage/Flatpak is a later step).
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   KEYSTORE_B64      — base64 of vortex-release.jks
+#                       (`base64 -w0 ~/secure/vortex-release.jks`)
+#   KEYSTORE_PASSWORD — storePassword
+#   KEY_ALIAS         — key alias (vortex)
+#   KEY_PASSWORD      — keyPassword
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  android-apk:
+    name: Signed APK + GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Materialize keystore from secrets
+        working-directory: android
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > vortex-release.jks
+          cat > keystore.properties <<EOF
+          storeFile=$GITHUB_WORKSPACE/android/vortex-release.jks
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      - name: Tests
+        working-directory: android
+        run: ./gradlew test --no-daemon
+
+      - name: Build signed release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Rename APK to versioned name
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk \
+             "vortex-${GITHUB_REF_NAME}.apk"
+
+      - name: Shred keystore materialization
+        if: always()
+        working-directory: android
+        run: rm -f vortex-release.jks keystore.properties
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vortex-*.apk
+          generate_release_notes: true
+          body: |
+            **Android:** download `vortex-${{ github.ref_name }}.apk` and install it on the phone
+            (or use `android/install.sh` over adb — it auto-grants the Accessibility/Notification permissions).
+
+            **Linux:** clone the repo and run `./install_linux.sh` — it installs deps, builds, and installs in one go.

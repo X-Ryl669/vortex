@@ -1,0 +1,70 @@
+name: Bug report
+description: Something broke or misbehaves. BLE issues are ~90% device-specific, so the device fields matter a lot.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+      placeholder: |
+        1. Paired phone and laptop
+        2. Played music on the phone
+        3. Expected the notification on the laptop — nothing arrived
+    validations:
+      required: true
+  - type: dropdown
+    id: feature
+    attributes:
+      label: Feature area
+      options:
+        - Pairing / connection (BLE or LAN)
+        - Notification mirror
+        - Clipboard sync
+        - Smart audio / earbuds hand-off
+        - Calls / SMS / contacts (phone companion)
+        - Browsing handoff
+        - Proximity lock
+        - Notes & todos
+        - File sharing
+        - Screen mirror / continuity camera (Experimental)
+        - Installer / build
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: phone
+    attributes:
+      label: Phone model + Android version + ROM
+      description: ROM matters (MIUI/HyperOS, One UI, ColorOS… behave very differently for background apps and BLE).
+      placeholder: "Redmi 9, Android 12, MIUI 13"
+    validations:
+      required: true
+  - type: input
+    id: laptop
+    attributes:
+      label: Linux distro + desktop environment
+      placeholder: "Ubuntu 24.04, GNOME 46 (Wayland)"
+    validations:
+      required: true
+  - type: input
+    id: bt
+    attributes:
+      label: Bluetooth hardware (if connection-related)
+      description: "`lsusb | grep -i blue` or `bluetoothctl show | head -3`, and BlueZ version (`bluetoothctl version`)."
+      placeholder: "Intel AX201, BlueZ 5.72"
+  - type: input
+    id: version
+    attributes:
+      label: Vortex version
+      placeholder: "v1.0.0-beta.2 (APK from Releases / built from main)"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional but golden)
+      description: |
+        Linux: `journalctl --user -u vortex* -n 200` or the daemon's stdout.
+        Android: `adb logcat -s Vortex` while reproducing.
+      render: text

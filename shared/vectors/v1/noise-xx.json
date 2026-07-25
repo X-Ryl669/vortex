@@ -1,0 +1,19 @@
+{
+  "comment": "Noise XX wire vector per docs3/01-spec.md §6.4. Empty handshake payload.",
+  "inputs": {
+    "initiator_ephemeral_priv_hex": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+    "initiator_static_priv_hex": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+    "responder_ephemeral_priv_hex": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+    "responder_static_priv_hex": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f"
+  },
+  "noise_pattern": "Noise_XX_25519_ChaChaPoly_SHA256",
+  "outputs": {
+    "msg1_hex": "392d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c",
+    "msg2_hex": "23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c48231cb6623a5166093b7a70a765b6f8fe919daa693c947482037da638d62f65c89688ef85314173be4abfe8812e0dfcd98c57adbbe1fb1f315974ffe68937ba3771",
+    "msg3_hex": "fc1e64d1baf8daa67130532a9c9be98697631f17b8cc8ee364b606f575146e81eddac9c2ac9acfcef89b1ac5ccd86bf12079b58f65bac65997382613a0e678b8",
+    "transcript_hash_hex": "c0c2209891fa5130e9932f33acbba2e639dc4fe0528120bf3cf92e1372117ddf"
+  },
+  "prologue_hex": "766f727465782f76312f70616972696e67",
+  "vector_set": "vortex/v1/noise-xx",
+  "version": 1
+}

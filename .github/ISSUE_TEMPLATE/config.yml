@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions & ideas (Discussions)
+    url: https://github.com/zoir-dev/vortex/discussions
+    about: Feature requests, setup help, and general questions.
+  - name: Telegram community
+    url: https://t.me/vortexconnect
+    about: Quick questions and beta-tester chat.

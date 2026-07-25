@@ -1,0 +1,7 @@
+{
+  "uuid": "vortex-live@vortex",
+  "name": "Vortex Live Activities",
+  "description": "Shows your phone's live activities (navigation, ride, delivery) as a menu-bar pill that expands to a detailed card. Fed by the Vortex daemon over D-Bus (org.vortex.LiveActivities).",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/vortex"
+}

@@ -1,0 +1,60 @@
+[package]
+name = "vortex-l3-daemon"
+version = "1.0.0-beta.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.77"
+
+[lib]
+name = "vortex_l3_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vortex-l3d"
+path = "src/main.rs"
+
+# Dev/CI tools — not part of a normal build. Build them explicitly with
+# `cargo build --features dev-tools --bin <name>`.
+[features]
+dev-tools = []
+
+[[bin]]
+name = "vector-gen"
+path = "src/bin/vector_gen.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "vortex-switch-bench"
+path = "src/bin/switch_bench.rs"
+required-features = ["dev-tools"]
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+snow = "0.10"
+hex = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+uuid = "1"
+thiserror = "1"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "signal"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+humantime = "2"
+rand = "0.8"
+secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
+mdns-sd = "0.13"
+# Re-use the zbus that secret-service already pulls in for direct
+# MPRIS calls (call-handoff media pause/resume).
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+
+[dev-dependencies]
+# `test-util` enables the paused-clock APIs (tokio::time::pause /
+# advance) used by the audio_orchestrator dedup-window unit tests.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }

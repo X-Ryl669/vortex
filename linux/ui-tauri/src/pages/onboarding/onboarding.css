@@ -1,0 +1,32 @@
+/* Onboarding animations — ported from the Vortex Onboarding design. All
+   keyframes are `vxo-` prefixed so they never collide with app-wide CSS, and
+   live in one file (imported once by OnboardingFlow.vue) so every art component
+   can reference them from inline styles. */
+
+@keyframes vxo-screenIn { 0% { opacity: 0; transform: translateY(18px) } 100% { opacity: 1; transform: translateY(0) } }
+@keyframes vxo-featIn { 0% { opacity: 0; transform: translateY(12px) scale(.98) } 100% { opacity: 1; transform: none } }
+@keyframes vxo-logoPulse { 0%,100% { filter: drop-shadow(0 0 5px rgba(46,204,113,.35)) } 50% { filter: drop-shadow(0 0 16px rgba(46,204,113,.7)) } }
+@keyframes vxo-checkPop { 0% { transform: scale(.3); opacity: 0 } 60% { transform: scale(1.1); opacity: 1 } 100% { transform: scale(1) } }
+@keyframes vxo-haloPulse { 0% { transform: translate(-50%,-50%) scale(.5); opacity: .5 } 100% { transform: translate(-50%,-50%) scale(1.7); opacity: 0 } }
+@keyframes vxo-floaty { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-7px) } }
+@keyframes vxo-hopBud { 0%,12% { transform: translate(0,0) } 22% { transform: translate(80px,-24px) } 32%,62% { transform: translate(160px,0) } 75% { transform: translate(80px,-24px) } 88%,100% { transform: translate(0,0) } }
+@keyframes vxo-sonar { 0% { transform: scale(.5); opacity: .7 } 100% { transform: scale(2.1); opacity: 0 } }
+@keyframes vxo-eqPhoneOn { 0%,46% { opacity: 0 } 52% { opacity: 1 } 96% { opacity: 1 } 100% { opacity: 0 } }
+@keyframes vxo-eqLapOn { 0%,4% { opacity: 1 } 58% { opacity: 1 } 64%,96% { opacity: 0 } 100% { opacity: 1 } }
+@keyframes vxo-eqb { 0%,100% { transform: scaleY(.35) } 50% { transform: scaleY(1) } }
+@keyframes vxo-notifSlide { 0%,12% { transform: translateY(-16px); opacity: 0 } 26%,78% { transform: translateY(0); opacity: 1 } 92%,100% { transform: translateY(-16px); opacity: 0 } }
+@keyframes vxo-copyFly { 0%,8% { transform: translateX(0) } 45% { transform: translateX(160px) } 55% { transform: translateX(160px) } 92%,100% { transform: translateX(0) } }
+@keyframes vxo-clipShow { 0%,6% { opacity: 0 } 10%,43% { opacity: 1 } 45%,55% { opacity: 0 } 58%,89% { opacity: 1 } 93%,100% { opacity: 0 } }
+@keyframes vxo-checkShow { 0%,6% { opacity: 1 } 10%,43% { opacity: 0 } 46%,54% { opacity: 1 } 58%,89% { opacity: 0 } 93%,100% { opacity: 1 } }
+@keyframes vxo-proxMove { 0%,100% { transform: translateX(0); opacity: .5 } 50% { transform: translateX(56px); opacity: 1 } }
+@keyframes vxo-lockClosedK { 0%,42% { opacity: 1 } 56%,94% { opacity: 0 } 100% { opacity: 1 } }
+@keyframes vxo-lockOpenK { 0%,42% { opacity: 0 } 56%,94% { opacity: 1 } 100% { opacity: 0 } }
+
+/* welcome halo + stagger-in (cheap: small elements, transform/opacity only) */
+@keyframes vxo-ring { 0% { transform: translate(-50%,-50%) scale(.65); opacity: .55 } 100% { transform: translate(-50%,-50%) scale(1.6); opacity: 0 } }
+@keyframes vxo-rise { from { opacity: 0; transform: translateY(12px) } to { opacity: 1; transform: none } }
+
+/* shared step container + green CTA pill (used by every step component) */
+.vxo-screen { width: 100%; animation: vxo-screenIn 0.38s cubic-bezier(0.34, 1.3, 0.5, 1) both; }
+.vxo-pill { padding: 13px 32px; border-radius: 999px; background: #2ECC71; border: none; color: #07120D; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; box-shadow: 0 8px 22px rgba(46, 204, 113, 0.35); transition: transform 0.2s ease, box-shadow 0.2s ease; }
+.vxo-pill:hover { transform: translateY(-1px); box-shadow: 0 10px 28px rgba(46, 204, 113, 0.5); }

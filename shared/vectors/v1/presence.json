@@ -1,0 +1,29 @@
+{
+  "algorithm": "HMAC-SHA256(prs, label || u64_be(bucket))[0..8]",
+  "cases": [
+    {
+      "bucket": 0,
+      "prs_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "token_hex": "e2d91c1d0c35f010"
+    },
+    {
+      "bucket": 1,
+      "prs_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "token_hex": "4edf330af4f39d13"
+    },
+    {
+      "bucket": 1000000,
+      "prs_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "token_hex": "82460a3a2ae1df14"
+    },
+    {
+      "bucket": 28633333,
+      "prs_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "token_hex": "de8dbab36f5982b3"
+    }
+  ],
+  "comment": "Private Presence Token per docs3/01-spec.md §7.3.",
+  "label": "vortex/v1/presence",
+  "vector_set": "vortex/v1/presence",
+  "version": 1
+}

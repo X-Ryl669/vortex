@@ -1,0 +1,16 @@
+{
+  "vector_id": "session_export_v1_001",
+  "protocol_version": 1,
+  "crypto_suite": "VORTEX_CRYPTO_V1",
+  "inputs": {
+    "initiator_export_contribution_hex": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+    "responder_export_contribution_hex": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+    "initiator_device_id": "11111111-2222-4333-8444-555555555555",
+    "responder_device_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "noise_handshake_hash_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+  },
+  "expected": {
+    "session_export_secret_v1_hex": "f7eef45cba73faed93f34f7700a30c56c2c0867795e079cf8ee734509c467ba4"
+  },
+  "notes": "Post-handshake export derivation from encrypted contribution inputs."
+}

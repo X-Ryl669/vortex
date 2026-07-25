@@ -1,0 +1,268 @@
+// ============================================================================
+// Vortex Wire Protocol — A2/L2
+//
+// Rules:
+//   1. Field numbers are stable once A2/L2 implementation starts.
+//      Never reuse a retired field number — mark it reserved instead.
+//   2. New payload types must go through VortexMessage.payload oneof only.
+//   3. All messages after handshake must carry a non-zero session_id.
+//   4. Sensitive identity material travels only inside Noise-encrypted
+//      HandshakeFrame.payload bytes. Never in outer VortexMessage fields.
+//   5. Fields 1-15 use single-byte tags — reserve for hot-path fields.
+//
+// See docs3/01-spec.md (protocol + crypto) and docs3/03-test-vectors.md
+// ============================================================================
+
+syntax = "proto3";
+
+package vortex;
+
+option java_package = "com.vortex.proto";
+option java_multiple_files = true;
+
+// ============================================================================
+// 0. Envelope
+// ============================================================================
+
+message VortexMessage {
+  uint32 protocol_version = 1;
+  uint64 message_id       = 2;
+  uint64 session_id       = 3;  // 0 only during pre-authentication handshake frames
+  int64  timestamp_ms     = 4;
+
+  oneof payload {
+    // --- Pairing and session setup (10–19) ---
+    HandshakeFrame            handshake          = 10;
+    PairingControl            pairing_ctrl       = 11;
+    SessionExportContribution session_export     = 12;
+    SessionExportAck          session_export_ack = 13;
+    ChannelJoinRequest        channel_join_req   = 14;
+    ChannelJoinAccept         channel_join_accept = 15;
+
+    // --- Session health (20–29) ---
+    Ping       ping  = 20;
+    Pong       pong  = 21;
+    ErrorFrame error = 22;
+  }
+}
+
+// ============================================================================
+// 1. Handshake and Pairing
+// ============================================================================
+
+// Raw Noise handshake frame.
+//   step 1: initiator -> responder, payload = raw Noise message 1 bytes
+//   step 2: responder -> initiator, payload = raw Noise message 2 bytes
+//   step 3: initiator -> responder, payload = Noise-encrypted EncryptedPairingIdentity bytes
+// No identity fields belong in the outer HandshakeFrame.
+message HandshakeFrame {
+  uint32 step    = 1;
+  bytes  payload = 2;
+}
+
+// Sent inside the Noise-encrypted step 3 payload only.
+// Must never appear in a plaintext outer VortexMessage field.
+// See CRYPTOGRAPHY.md — First Pairing.
+message EncryptedPairingIdentity {
+  string     device_id            = 1;
+  string     display_name         = 2;
+  DeviceRole device_role          = 3;
+  bytes      static_x25519_pubkey = 4;  // 32 bytes, X25519 public key
+  uint64     capability_flags     = 5;
+  string     crypto_suite         = 6;  // "VORTEX_CRYPTO_V1"
+  uint32     protocol_version     = 7;
+  uint32     protocol_minor       = 8;
+  bytes      irk                  = 9;  // 16 bytes, Identity Resolving Key for RPA resolution
+}
+
+// ============================================================================
+// 1a. Secure Advertisement (Service Data)
+// ============================================================================
+
+// This message is NOT sent via VortexMessage. It is serialized and placed
+// directly into the BLE Service Data (31-byte limit).
+// It enables Apple-style GATT-less discovery.
+message AdvertisementPayload {
+  bytes presence_token  = 1;  // 6 bytes, HMAC-SHA256(DeviceId + Counter, ReconnectKey)
+  bytes encrypted_state = 2;  // 8-12 bytes, AES-GCM(Status + Battery, ReconnectKey)
+}
+
+// Approval and revocation control messages.
+// reconnect_secret is NOT sent here in A2/L2.
+// Reconnect secret is derived via SessionExportContribution exchange.
+message PairingControl {
+  enum Type {
+    UNSPECIFIED  = 0;
+    APPROVAL     = 1;  // local user approved; sent to peer
+    APPROVAL_ACK = 2;  // peer confirmed it received approval
+    REJECT       = 3;  // local user or timeout rejected; sent to peer
+    REVOKE       = 4;  // remove existing pairwise trust
+    REVOKE_ACK   = 5;  // peer confirmed revocation delivery
+  }
+
+  Type   type      = 1;
+  bool   accepted  = 2;
+  string reason    = 3;
+  string device_id = 4;
+}
+
+// Post-handshake contribution for session_export_secret_v1 derivation.
+// Sent only after Noise transport encryption is active on both sides.
+// See CRYPTOGRAPHY.md — Post-Handshake Export Secret.
+message SessionExportContribution {
+  bytes  contribution = 1;  // exactly 32 bytes, OS CSPRNG
+  string device_id    = 2;
+}
+
+// Sent by the responder to confirm contribution receipt.
+// Receipt of a successfully decrypted SessionExportAck is the
+// "authenticated acknowledgement" required by the fallback protocol.
+message SessionExportAck {
+  bool ok = 1;
+}
+
+// ============================================================================
+// 2. Channel Join Protocol
+// ============================================================================
+
+enum ChannelType {
+  CHANNEL_TYPE_UNSPECIFIED = 0;
+  CHANNEL_TYPE_BLE_GATT    = 1;
+  CHANNEL_TYPE_LAN_TCP     = 2;
+  CHANNEL_TYPE_WIFI_DIRECT = 3;
+  CHANNEL_TYPE_ADB_DEV     = 4;  // diagnostics mode only; never consumer primary
+}
+
+// Sent by a candidate channel to prove it belongs to the active session.
+// proof = HMAC-SHA256(channel_join_key, proof_input)
+// See docs3/01-spec.md for proof_input definition.
+message ChannelJoinRequest {
+  uint32      protocol_version            = 1;
+  uint64      session_id                  = 2;
+  ChannelType channel_type                = 3;
+  bytes       join_nonce                  = 4;  // >= 128 bits randomness
+  string      endpoint_hint               = 5;  // e.g. "192.0.2.10:45678"
+  uint64      sender_channel_capabilities = 6;
+  int64       created_at_ms              = 7;
+  bytes       proof                      = 8;
+}
+
+// Sent by the session anchor to accept or reject the candidate channel.
+// proof = HMAC-SHA256(channel_join_key, accept_proof_input)
+message ChannelJoinAccept {
+  uint32      protocol_version               = 1;
+  uint64      session_id                     = 2;
+  ChannelType channel_type                   = 3;
+  bytes       join_nonce                     = 4;  // echoed from request
+  uint64      receiver_channel_capabilities  = 5;
+  bool        accepted                       = 6;
+  string      rejection_reason               = 7;
+  bytes       proof                          = 8;
+}
+
+// ============================================================================
+// 3. Session Health
+// ============================================================================
+
+message Ping {
+  bytes nonce = 1;
+}
+
+message Pong {
+  bytes nonce = 1;
+}
+
+message ErrorFrame {
+  enum Code {
+    GENERIC             = 0;
+    VERSION_MISMATCH    = 1;
+    UNAUTHORIZED        = 2;
+    SESSION_EXPIRED     = 3;
+    DECRYPTION_FAILED   = 4;
+    MALFORMED_PACKET    = 5;
+    TIMEOUT             = 6;
+    RATE_LIMITED        = 7;
+    CHANNEL_JOIN_FAILED = 8;
+    REPLAY_DETECTED     = 9;
+  }
+  Code   code    = 1;
+  string message = 2;  // diagnostics only; must not leak secrets
+}
+
+// ============================================================================
+// 4. Shared enums
+// ============================================================================
+
+enum DeviceRole {
+  DEVICE_ROLE_UNSPECIFIED = 0;
+  DEVICE_ROLE_PHONE       = 1;
+  DEVICE_ROLE_LAPTOP      = 2;
+  DEVICE_ROLE_TABLET      = 3;
+  DEVICE_ROLE_DESKTOP     = 4;
+}
+
+enum PairingState {
+  PAIRING_STATE_UNSPECIFIED = 0;
+
+  // Top-level modes
+  PAIRING_STATE_SETUP_BLOCKED     = 1;
+  PAIRING_STATE_IDLE_READY        = 2;
+  PAIRING_STATE_DISCOVERING       = 3;
+  PAIRING_STATE_PAIRING           = 4;
+  PAIRING_STATE_TRUSTED_PRESENCE  = 5;
+  PAIRING_STATE_CONNECTING        = 6;
+  PAIRING_STATE_CONNECTED         = 7;
+  PAIRING_STATE_DEGRADED          = 8;
+  PAIRING_STATE_RECOVERY          = 9;
+
+  // First-pairing flow states
+  PAIRING_STATE_PAIRING_STARTING           = 20;
+  PAIRING_STATE_HANDSHAKE_MESSAGE_1        = 21;
+  PAIRING_STATE_HANDSHAKE_MESSAGE_2        = 22;
+  PAIRING_STATE_HANDSHAKE_MESSAGE_3        = 23;
+  PAIRING_STATE_COMPARE_CODE               = 24;
+  PAIRING_STATE_WAITING_FOR_LOCAL_APPROVAL = 25;
+  PAIRING_STATE_WAITING_FOR_PEER_APPROVAL  = 26;
+  PAIRING_STATE_STORING_TRUST              = 27;
+  PAIRING_STATE_PROVING_RECONNECT          = 28;
+  PAIRING_STATE_PAIRED                     = 29;
+
+  // Trusted reconnect flow states
+  PAIRING_STATE_RECONNECT_STARTING        = 40;
+  PAIRING_STATE_OPENING_BLE_ANCHOR        = 41;
+  PAIRING_STATE_AUTHENTICATING_SESSION    = 42;
+  PAIRING_STATE_JOINING_SECONDARY_CHANNELS = 43;
+  PAIRING_STATE_RECONNECT_BACKOFF         = 44;
+  PAIRING_STATE_PEER_UNAVAILABLE          = 45;
+}
+
+enum PairingFailureReason {
+  PAIRING_FAILURE_UNSPECIFIED       = 0;
+  PAIRING_FAILURE_PEER_MOVED_AWAY   = 1;
+  PAIRING_FAILURE_BLUETOOTH_LOST    = 2;
+  PAIRING_FAILURE_CODE_EXPIRED      = 3;
+  PAIRING_FAILURE_LOCAL_REJECTED    = 4;
+  PAIRING_FAILURE_PEER_REJECTED     = 5;
+  PAIRING_FAILURE_PROTOCOL_MISMATCH = 6;
+  PAIRING_FAILURE_SECURITY_MISMATCH = 7;
+  PAIRING_FAILURE_STORAGE_FAILED    = 8;
+  PAIRING_FAILURE_ALREADY_PAIRING   = 9;
+  PAIRING_FAILURE_RATE_LIMITED      = 10;
+}
+
+// Structured local diagnostics event. This is not part of VortexMessage payload
+// in A2/L2 Phase 1 and must not be sent to peers unless a future diagnostics
+// protocol explicitly allows it.
+//
+// It must not contain secrets, raw SAS input, private keys, reconnect secrets,
+// or unencrypted identity payloads.
+message PairingEvent {
+  string               event_id          = 1;
+  int64                timestamp_ms      = 2;
+  PairingState         local_state       = 3;
+  string               peer_candidate_id = 4;
+  string               trust_state       = 5;
+  ChannelType          channel_type      = 6;
+  PairingFailureReason reason_code       = 7;
+  uint64               duration_ms       = 8;
+}

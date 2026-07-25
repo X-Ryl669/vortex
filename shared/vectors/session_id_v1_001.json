@@ -1,0 +1,15 @@
+{
+  "vector_id": "session_id_v1_001",
+  "protocol_version": 1,
+  "crypto_suite": "VORTEX_CRYPTO_V1",
+  "inputs": {
+    "session_export_secret_v1_hex": "f7eef45cba73faed93f34f7700a30c56c2c0867795e079cf8ee734509c467ba4",
+    "initiator_device_id": "11111111-2222-4333-8444-555555555555",
+    "responder_device_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+  },
+  "expected": {
+    "session_id": "16248906421577575393",
+    "session_id_hex": "e17fb64cceb1ebe1"
+  },
+  "notes": "Non-zero uint64 session identifier derived with HKDF-SHA256."
+}

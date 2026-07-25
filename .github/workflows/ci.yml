@@ -1,0 +1,65 @@
+# Test gate on every push/PR: Android unit tests + Rust daemon tests +
+# the Vue/TS build (vue-tsc). Public-repo prerequisite so external PRs
+# get checked automatically. Docs-only changes skip the whole run.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "docs3/**"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "docs3/**"
+
+jobs:
+  android:
+    name: Android tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Unit tests
+        working-directory: android
+        run: ./gradlew test --no-daemon
+
+  rust:
+    name: Rust daemon tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: linux
+      - name: cargo test
+        working-directory: linux
+        run: cargo test --locked
+
+  web:
+    name: UI typecheck + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: linux/ui-tauri/pnpm-lock.yaml
+      - name: Install deps
+        working-directory: linux/ui-tauri
+        run: pnpm install --frozen-lockfile
+      - name: Build (vue-tsc + vite)
+        working-directory: linux/ui-tauri
+        run: pnpm run build

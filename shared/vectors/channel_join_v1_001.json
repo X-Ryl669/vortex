@@ -1,0 +1,23 @@
+{
+  "vector_id": "channel_join_v1_001",
+  "protocol_version": 1,
+  "crypto_suite": "VORTEX_CRYPTO_V1",
+  "inputs": {
+    "session_export_secret_v1_hex": "f7eef45cba73faed93f34f7700a30c56c2c0867795e079cf8ee734509c467ba4",
+    "session_id": "16248906421577575393",
+    "channel_type": "LAN_TCP",
+    "join_nonce_hex": "00112233445566778899aabbccddeeff",
+    "endpoint_hint": "192.0.2.10:45678",
+    "sender_channel_capabilities": "72623859790382856",
+    "created_at_ms": 1713945600123,
+    "accepted": true,
+    "rejection_reason": "",
+    "receiver_channel_capabilities": "1230066625199609624"
+  },
+  "expected": {
+    "channel_join_key_hex": "fadaa81e6ef195bc8292e8f25dd4fa162a732ef70871df251624f59181cd86a7",
+    "request_proof_hex": "4558a2e831c20d801aa9783bbfe2f50ffb7e83678344e5011afe7cce6d67a057",
+    "accept_proof_hex": "1460790d3b63b56f8007df05c846387c7a3fbf378d75dafb738203969d99780a"
+  },
+  "notes": "LAN channel join key, request proof, and accept proof vector."
+}

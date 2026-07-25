@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      The Compose theme owns the surface colors at runtime, so the XML
+      base theme stays neutral. Two important opt-outs:
+        • forceDarkAllowed=false — keeps OEM "Force Dark" overrides (e.g.
+          MIUI) from inverting our hand-rolled light palette.
+        • windowLightStatusBar set from a runtime call in MainActivity so
+          the status-bar icons follow the active Compose theme.
+    -->
+    <style name="Theme.Vortex" parent="android:Theme.Material.NoActionBar">
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+    </style>
+
+    <!-- Fully invisible, no-animation, no-preview overlay for the clipboard
+         quick-send trampoline: it flashes foreground only long enough to read
+         the clipboard. windowDisablePreview + null animation keep it from
+         showing as "Vortex opening"; the activity uses taskAffinity="" so it
+         never reveals the main app on finish. -->
+    <style name="Theme.Vortex.ClipboardOverlay" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:colorBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+</resources>

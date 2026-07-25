@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Earbuds-owner tint in the foreground notification (same as the
+         ecosystem): green = phone holds them, blue = laptop holds them. -->
+    <color name="notification_audio_android">#FF5EE27A</color>
+    <color name="notification_audio_linux">#FF69B7FF</color>
+    <!-- Adaptive launcher-icon backdrop — the app canvas colour (matches the
+         desktop badge and the UI dark canvas). -->
+    <color name="ic_launcher_background">#15161B</color>
+</resources>
