@@ -1,12 +1,20 @@
-# 🌀 Vortex
+<p align="center">
+  <img src="linux/ui-tauri/src/assets/vortex_logo.png" width="128" alt="Vortex logo">
+</p>
 
-> **Your devices, one flow.**
-> A seamless ecosystem for Linux and Android.
+<h1 align="center">Vortex</h1>
 
-![Status](https://img.shields.io/badge/status-beta-brightgreen)
-![Version](https://img.shields.io/badge/version-1.0.0--beta-blue)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Android-blue)
-![License](https://img.shields.io/badge/license-GPLv3-blue)
+<p align="center">
+  <b>Your devices, one flow.</b><br>
+  A seamless ecosystem for Linux and Android.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/status-beta-brightgreen" alt="Status">
+  <img src="https://img.shields.io/badge/version-1.0.0--beta-blue" alt="Version">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Android-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/license-GPLv3-blue" alt="License">
+</p>
 
 ---
 
