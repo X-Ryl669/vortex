@@ -196,6 +196,50 @@ pub(crate) fn uc_get_placement() -> String {
     format!("{}-{end}", edge_name(edge))
 }
 
+/// Where the switch's own position is remembered, next to the placement.
+fn enabled_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".local/share/vortex/universal_control/enabled"))
+}
+
+/// Remember whether the user wants the edge armed, so a reboot or a quit does
+/// not quietly turn the feature off. Only the intent is stored — whether it can
+/// actually arm is decided again on the next launch.
+fn remember_enabled(on: bool) {
+    let Some(p) = enabled_path() else { return };
+    if on {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, "1");
+    } else {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Arm the edge again at launch if that is how the user left it.
+///
+/// Deliberately does NOT require the injector: at login the phone is often not
+/// reachable yet (no cable, adb not up), and the crossing itself brings the
+/// injector up on demand — so demanding it here would turn "remember my switch"
+/// into "remember it only when the phone happens to be plugged in".
+pub(crate) fn restore(app: tauri::AppHandle) {
+    if !enabled_path().is_some_and(|p| p.exists()) {
+        return;
+    }
+    tracing::info!("universal-control: was left on — arming the edge again");
+    // On Tauri's runtime, NOT the caller's thread: this runs from `setup`, where
+    // the main thread has no reactor, and arming starts the cursor-hide publisher
+    // with a plain `tokio::spawn` — which panics there, taking the rest of setup
+    // (the clipboard hotkey, among others) down with it.
+    //
+    // Nothing to report to either: the window may not even exist yet. A failure
+    // to arm still reaches the UI from inside the loop, as `vortex:uc-stopped`.
+    tauri::async_runtime::spawn(async move {
+        let _ = arm(app, false);
+    });
+}
+
 /// Start Universal Control: bring up the injector and run the capture loop.
 #[tauri::command]
 pub(crate) async fn uc_start(app: tauri::AppHandle) -> Result<(), String> {
@@ -211,6 +255,19 @@ pub(crate) async fn uc_start(app: tauri::AppHandle) -> Result<(), String> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+    let armed = arm(app, true);
+    if armed.is_ok() {
+        remember_enabled(true);
+    }
+    armed
+}
+
+/// Claim the runtime flags and run the capture loop on its own thread.
+///
+/// `require_injector` separates a switch flipped by hand — where an unreachable
+/// phone is worth saying out loud immediately — from a restore at launch, where
+/// it is not yet worth mentioning.
+fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
     }
@@ -221,7 +278,7 @@ pub(crate) async fn uc_start(app: tauri::AppHandle) -> Result<(), String> {
     ensure_cursor_publisher();
     // The native-cursor path needs the uinput injector (adb/Shizuku). Without it
     // we'd fall back to the accessibility overlay — not wired yet, so require it.
-    if !crate::mirror_inject::active() && !crate::mirror_inject::start() {
+    if require_injector && !crate::mirror_inject::active() && !crate::mirror_inject::start() {
         RUNNING.store(false, Ordering::SeqCst);
         return Err("no_injector".into());
     }
@@ -259,6 +316,10 @@ pub(crate) async fn uc_start(app: tauri::AppHandle) -> Result<(), String> {
                 // that is not running, which is the same thing to the user as
                 // "it is broken and will not say why".
                 let _ = tauri::Emitter::emit(&app, "vortex:uc-stopped", e.to_string());
+                // …and stop remembering the switch: whatever went wrong will go
+                // wrong again at the next launch, and arming into the same error
+                // every login is worse than an off switch the user can flip.
+                remember_enabled(false);
             }
         });
     });
@@ -268,6 +329,7 @@ pub(crate) async fn uc_start(app: tauri::AppHandle) -> Result<(), String> {
 /// Stop Universal Control: the capture loop releases the portal and exits.
 #[tauri::command]
 pub(crate) fn uc_stop() {
+    remember_enabled(false);
     STOP.store(true, Ordering::SeqCst);
 }
 

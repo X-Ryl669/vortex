@@ -274,6 +274,11 @@ pub fn run() {
                 let _ = clipboard_hotkey::set_clipboard_hotkey("<Super>v".to_string());
             });
 
+            // Universal Control is the one switch that used to forget itself: it
+            // lives entirely in this process, so a reboot or a quit left the edge
+            // unarmed with the switch showing off. Put it back the way it was.
+            universal_control::restore(app.handle().clone());
+
             // The popup when THIS launch came from the GNOME shortcut (the
             // app wasn't running yet). The history WATCHER spawns inside
             // run_worker — it needs the worker's tokio runtime.
