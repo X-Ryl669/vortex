@@ -11,6 +11,9 @@ defineProps<{
   desc?: string;
   modelValue: boolean;
   divider?: boolean;
+  /// Badge beside the title — "Experimental" for a feature that ships with
+  /// requirements the rest of the app does not have.
+  tag?: string;
 }>();
 const emit = defineEmits<{ "update:modelValue": [value: boolean] }>();
 </script>
@@ -27,7 +30,10 @@ const emit = defineEmits<{ "update:modelValue": [value: boolean] }>();
       <component :is="icon" class="h-[18px] w-[18px]" :stroke-width="1.8" />
     </span>
     <div class="flex-1 min-w-0">
-      <div class="text-sm font-semibold text-foreground leading-tight">{{ title }}</div>
+      <div class="text-sm font-semibold text-foreground leading-tight">
+        {{ title }}
+        <span v-if="tag" class="vx-tag ml-1.5 inline-block align-[2px]">{{ tag }}</span>
+      </div>
       <p v-if="desc" class="text-[12.5px] text-muted-foreground mt-0.5 leading-snug">{{ desc }}</p>
     </div>
     <span

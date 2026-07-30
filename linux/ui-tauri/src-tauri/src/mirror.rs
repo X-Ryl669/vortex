@@ -130,7 +130,10 @@ fn send_input(ty: u8, nx: u16, ny: u16) {
     // Prefer the real-touch uinput injector (scrcpy-style: low latency, true
     // multitouch, bypasses MIUI's INJECT_EVENTS block). Fall back to the
     // AccessibilityService control plane when adb/the injector isn't available.
-    if crate::mirror_inject::active() {
+    // The injector is only the better path if it can actually draw a finger.
+    // Where it fell back to UHID there is no digitizer, and taps sent here would
+    // vanish — the accessibility plane is worse, but it is not nothing.
+    if crate::mirror_inject::active() && crate::mirror_inject::touch_available() {
         let cmd = match ty {
             input_proto::DOWN => format!("D 0 {nx} {ny}"),
             input_proto::MOVE => format!("M 0 {nx} {ny}"),

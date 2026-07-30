@@ -78,9 +78,161 @@ impl SmsAssembler {
     }
 }
 
+/// Shortest and longest digit run we will treat as a login code.
+const OTP_MIN: usize = 4;
+const OTP_MAX: usize = 8;
+
+/// How far from a digit run a hint word still counts as describing it.
+const OTP_HINT_WINDOW: usize = 48;
+
+/// Words that mark a nearby number as a login code. English, Uzbek and Russian
+/// together, because a phone here receives all three — often in one message.
+const OTP_HINTS: &[&str] = &[
+    "code", "otp", "pin", "password", "verification", "verify", "one-time",
+    "kod", "kodi", "kodingiz", "parol", "tasdiq", "bir martalik",
+    "код", "коды", "пароль", "подтверж", "одноразов",
+];
+
+/// Pull a one-time login code out of an SMS body, if it plausibly has one.
+///
+/// Deliberately conservative: a hint word must appear somewhere in the message,
+/// because plenty of ordinary texts (prices, order numbers, balances) contain a
+/// bare four-to-eight digit number and copying one of those over the user's
+/// clipboard is worse than missing a code. Among the candidates, the one
+/// closest to a hint word wins, so "purchase 50000 sum, code 1234" picks 1234.
+///
+/// Digit runs glued to a `+`, to a letter, or to a grouping separator with more
+/// digits on its far side are skipped — that is what phone numbers, IDs, money
+/// amounts, dates and times look like.
+pub fn extract_otp(body: &str) -> Option<String> {
+    let lower = body.to_lowercase();
+    // Spans, not just positions: which END of the hint faces the number decides
+    // how close it really is, and "code: 1234" is a much stronger claim than a
+    // word that merely happens to sit nearby.
+    let hints: Vec<(usize, usize)> = OTP_HINTS
+        .iter()
+        .flat_map(|h| lower.match_indices(h).map(|(i, m)| (i, i + m.len())))
+        .collect();
+    if hints.is_empty() {
+        return None;
+    }
+
+    let b = body.as_bytes();
+    // ASCII digits never appear inside a multi-byte UTF-8 sequence, so plain
+    // byte scanning is safe here even for Cyrillic bodies.
+    let is_sep = |c: u8| matches!(c, b'.' | b',' | b':' | b'-' | b'/');
+    let mut best: Option<(i32, &str)> = None;
+    let mut i = 0usize;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        let (end, len) = (i, i - start);
+        if !(OTP_MIN..=OTP_MAX).contains(&len) {
+            continue;
+        }
+        let prev = start.checked_sub(1).map(|p| b[p]);
+        let next = b.get(end).copied();
+        // Phone number, or part of a longer identifier.
+        if prev == Some(b'+')
+            || prev.is_some_and(|c| c.is_ascii_alphabetic())
+            || next.is_some_and(|c| c.is_ascii_alphabetic())
+        {
+            continue;
+        }
+        // "1.234", "12:34", "2026-07-28": a separator with digits beyond it
+        // means this run is one field of a bigger number, not a code.
+        if prev.is_some_and(is_sep) && start >= 2 && b[start - 2].is_ascii_digit() {
+            continue;
+        }
+        if next.is_some_and(is_sep) && b.get(end + 1).is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        // A hint BEFORE the number ("code: 1234") is the dominant shape and the
+        // stronger signal; one after ("1234 is your code") is real but weaker.
+        // Without that asymmetry a hint word trailing an unrelated number wins
+        // on raw proximity — "purchase 50000 sum. Confirmation code 1234".
+        let mut proximity = 0;
+        for &(hs, he) in &hints {
+            let (distance, weight) = if he <= start {
+                (start - he, 14)
+            } else if hs >= end {
+                (hs - end, 8)
+            } else {
+                (0, 14)
+            };
+            if distance <= OTP_HINT_WINDOW {
+                proximity =
+                    proximity.max(weight + (OTP_HINT_WINDOW - distance) as i32 / 4);
+            }
+        }
+        let mut score = match len {
+            6 => 3,
+            5 => 2,
+            4 | 7 | 8 => 1,
+            _ => 0,
+        };
+        score += proximity;
+        let candidate = &body[start..end];
+        if best.is_none_or(|(s, _)| score > s) {
+            best = Some((score, candidate));
+        }
+    }
+    best.map(|(_, c)| c.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_codes_in_the_three_languages_a_phone_here_receives() {
+        assert_eq!(extract_otp("Your code is 483920").as_deref(), Some("483920"));
+        assert_eq!(
+            extract_otp("Tasdiqlash kodi: 4821").as_deref(),
+            Some("4821")
+        );
+        assert_eq!(
+            extract_otp("Ваш код подтверждения: 90210").as_deref(),
+            Some("90210")
+        );
+        // Hint after the number.
+        assert_eq!(
+            extract_otp("123456 is your verification code").as_deref(),
+            Some("123456")
+        );
+    }
+
+    #[test]
+    fn picks_the_number_the_hint_word_describes() {
+        assert_eq!(
+            extract_otp("Xarid: 50000 sum. Tasdiqlash kodi 1234").as_deref(),
+            Some("1234")
+        );
+    }
+
+    #[test]
+    fn ignores_messages_with_no_hint_word() {
+        assert_eq!(extract_otp("Balansingiz 45000 so'm"), None);
+        assert_eq!(extract_otp("See you at 1830"), None);
+    }
+
+    #[test]
+    fn skips_phone_numbers_amounts_dates_and_ids() {
+        // A hint word is present, but every number is something else.
+        assert_eq!(extract_otp("Kod uchun qo'ng'iroq: +998901234567"), None);
+        assert_eq!(extract_otp("kod: 1.234.567"), None);
+        assert_eq!(extract_otp("kodi 2026-07-28"), None);
+        assert_eq!(extract_otp("kod ID4821X"), None);
+        // 16 digits is a card, not a code.
+        assert_eq!(extract_otp("kod 8600123412341234"), None);
+    }
 
     #[test]
     fn rejects_total_above_cap() {

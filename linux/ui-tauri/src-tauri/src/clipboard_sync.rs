@@ -163,6 +163,25 @@ pub(crate) fn set_system_text(text: String) -> Result<(), String> {
     with_clip_setter(|cb| cb.set_text(text).map_err(|e| format!("set_text: {e}")))
 }
 
+/// Put text on the clipboard for a local reason — i.e. it did NOT come from
+/// the phone and must not be sent back there.
+///
+/// Arms the same loop guard the sync path uses before writing, so the watcher
+/// recognises its own capture instead of bouncing the text to the phone, and
+/// files it in the clipboard history the way any other copy would be.
+pub(crate) fn set_local_text(text: &str) -> Result<(), String> {
+    let text = tidy_text(text);
+    if text.is_empty() {
+        return Ok(());
+    }
+    if let Ok(mut g) = LAST_SYNC_SIG.lock() {
+        *g = sync_sig(&text);
+    }
+    set_system_text(text.clone())?;
+    crate::clipboard::store_capture("text", Some(text), None);
+    Ok(())
+}
+
 /// Wire up clipboard sync (text + image). Returns the four handles the BLE
 /// loop needs: `(text_recv_tx, text_writer, image_recv_tx, image_writer)`.
 /// The `*_recv_tx` get incoming frames from the BLE listener; the `*_writer`

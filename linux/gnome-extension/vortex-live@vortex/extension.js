@@ -17,6 +17,34 @@ const BUS_NAME = 'org.vortex.LiveActivities';
 const OBJ_PATH = '/org/vortex/LiveActivities';
 const IFACE = 'org.vortex.LiveActivities1';
 
+// Universal Control: the app flips CursorHidden while the laptop cursor is
+// "on the phone", so we hide the local pointer (the InputCapture portal can't).
+const UC_NAME = 'org.vortex.UniversalControl';
+const UC_PATH = '/org/vortex/UniversalControl';
+const UC_IFACE = 'org.vortex.UniversalControl1';
+
+// Extend mode (phone as a second screen) needs to draw the pointer into the
+// stream itself: Mutter will not composite a cursor into a VIRTUAL monitor's
+// screen cast — asking it to tears the session down after half a minute — so
+// the app overlays one, and needs to know where the pointer is.
+//
+// The shell is the right place to answer that. `global.get_pointer()` is
+// already in Mutter's logical coordinates, the same space the monitor layout
+// uses, so the answer is a subtraction. Doing it from outside would mean
+// undoing XWayland's fractional-scaling transform by hand.
+const SHELL_NAME = 'org.vortex.Shell';
+const SHELL_PATH = '/org/vortex/Shell';
+const SHELL_XML = `
+<node>
+  <interface name="org.vortex.Shell1">
+    <method name="GetVirtualPointer">
+      <arg type="i" name="x" direction="out"/>
+      <arg type="i" name="y" direction="out"/>
+      <arg type="b" name="on" direction="out"/>
+    </method>
+  </interface>
+</node>`;
+
 export default class VortexLiveExtension extends Extension {
     enable() {
         this._buttons = new Map(); // key -> PanelMenu.Button
@@ -28,12 +56,175 @@ export default class VortexLiveExtension extends Extension {
             () => this._connect(),
             () => { this._disconnect(); this._clearAll(); },
         );
+
+        // Universal Control cursor-hide.
+        this._cursorHidden = false;
+        this._ucWatch = Gio.bus_watch_name(
+            Gio.BusType.SESSION, UC_NAME, Gio.BusNameWatcherFlags.NONE,
+            () => this._ucConnect(),
+            () => { this._ucDisconnect(); this._showCursor(); },
+        );
+
+        this._shellExport();
     }
 
     disable() {
         if (this._nameWatch) { Gio.bus_unwatch_name(this._nameWatch); this._nameWatch = 0; }
         this._disconnect();
         this._clearAll();
+        if (this._ucWatch) { Gio.bus_unwatch_name(this._ucWatch); this._ucWatch = 0; }
+        this._ucDisconnect();
+        this._showCursor(); // never leave the pointer inhibited on teardown
+        this._shellUnexport();
+    }
+
+    // ── Pointer position for extend mode ────────────────────────────────────
+    _shellExport() {
+        try {
+            this._shellImpl = Gio.DBusExportedObject.wrapJSObject(SHELL_XML, this);
+            this._shellImpl.export(Gio.DBus.session, SHELL_PATH);
+            this._shellOwnId = Gio.bus_own_name(
+                Gio.BusType.SESSION, SHELL_NAME, Gio.BusNameOwnerFlags.NONE,
+                null, null, null);
+        } catch (e) {
+            logError(e, 'vortex-live: shell iface');
+        }
+    }
+
+    _shellUnexport() {
+        if (this._shellOwnId) { Gio.bus_unown_name(this._shellOwnId); this._shellOwnId = 0; }
+        if (this._shellImpl) {
+            try { this._shellImpl.unexport(); } catch (e) {}
+            this._shellImpl = null;
+        }
+    }
+
+    /** Pointer position relative to the virtual monitor's top-left, and whether
+     *  it is actually on it. Virtual monitors are the ones with no physical
+     *  output behind them — Mutter names them `Meta-N`. */
+    GetVirtualPointer() {
+        try {
+            const [px, py] = global.get_pointer();
+            const layout = Main.layoutManager.monitors;
+            for (const m of layout) {
+                const conn = m.connector ?? '';
+                if (!conn.startsWith('Meta-')) continue;
+                const on = px >= m.x && px < m.x + m.width &&
+                           py >= m.y && py < m.y + m.height;
+                return [px - m.x, py - m.y, on];
+            }
+        } catch (e) {
+            logError(e, 'vortex-live: pointer');
+        }
+        return [0, 0, false];
+    }
+
+    _ucConnect() {
+        if (this._ucProxy) return;
+        try {
+            this._ucProxy = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, null,
+                UC_NAME, UC_PATH, UC_IFACE, null);
+            this._ucChangedId = this._ucProxy.connect(
+                'g-properties-changed', () => this._ucRefresh());
+            this._ucRefresh();
+        } catch (e) {
+            logError(e, 'vortex-live: uc proxy');
+        }
+    }
+
+    _ucDisconnect() {
+        if (this._ucProxy && this._ucChangedId) {
+            try { this._ucProxy.disconnect(this._ucChangedId); } catch (e) {}
+        }
+        this._ucChangedId = 0;
+        this._ucProxy = null;
+    }
+
+    _ucRefresh() {
+        if (!this._ucProxy) return;
+        // The cached property is the fast path, but it is only as good as the
+        // PropertiesChanged that filled it. Ask the app directly when the cache
+        // has nothing — otherwise a single missed signal leaves the pointer
+        // visible for the whole time it is supposed to be on the phone, which
+        // is indistinguishable from the feature being broken.
+        let hide = null;
+        const v = this._ucProxy.get_cached_property('CursorHidden');
+        if (v) hide = v.deepUnpack();
+        if (hide === null) hide = this._ucReadProperty();
+        console.log(`vortex-uc: CursorHidden=${hide} (cached=${v ? 'yes' : 'no'})`);
+        if (hide) this._hideCursor(); else this._showCursor();
+    }
+
+    /** Read CursorHidden straight off the bus. Returns false if it can't. */
+    _ucReadProperty() {
+        try {
+            const r = this._ucProxy.get_connection().call_sync(
+                UC_NAME, UC_PATH, 'org.freedesktop.DBus.Properties', 'Get',
+                new GLib.Variant('(ss)', [UC_IFACE, 'CursorHidden']),
+                new GLib.VariantType('(v)'), Gio.DBusCallFlags.NONE, 1000, null);
+            return r.deepUnpack()[0].deepUnpack();
+        } catch (e) {
+            logError(e, 'vortex-live: uc property read');
+            return false;
+        }
+    }
+
+    /** Mutter's cursor tracker, whichever way this shell version exposes it. */
+    _cursorTracker() {
+        if (global.backend?.get_cursor_tracker)
+            return global.backend.get_cursor_tracker();
+        return global.display?.get_cursor_tracker?.() ?? null;
+    }
+
+    _seat() {
+        try { return Clutter.get_default_backend().get_default_seat(); }
+        catch (e) { return null; }
+    }
+
+    // inhibit_cursor_visibility() is the API GNOME itself recommends from 49
+    // onwards; the older set_pointer_visible(false) loses the cursor again the
+    // moment the mouse moves. The inhibitor is REF-COUNTED, so hide and show
+    // have to stay balanced — hence the flag.
+    //
+    // The unfocus inhibit is what the hide-cursor extension pairs it with, and
+    // it is not decoration: without it the seat can drop pointer focus while the
+    // cursor is hidden.
+    _hideCursor() {
+        if (this._cursorHidden) return;
+        try {
+            const t = this._cursorTracker();
+            if (!t) { console.log('vortex-uc: no cursor tracker'); return; }
+            // Said plainly, because the symptom is a cursor on each screen and
+            // nothing else to explain it. The older set_pointer_visible(false) is
+            // not a fallback worth having — it loses the cursor again on the next
+            // motion event, which during a crossing is immediately.
+            if (!t.inhibit_cursor_visibility) {
+                console.log('vortex-uc: this GNOME has no inhibit_cursor_visibility '
+                    + '(needs 49+) — the laptop cursor will stay visible');
+                return;
+            }
+            const before = t.get_pointer_visible?.();
+            t.inhibit_cursor_visibility();
+            this._seat()?.inhibit_unfocus();
+            this._cursorHidden = true;
+            // These two numbers are the whole diagnosis. true -> false and a
+            // cursor still on screen means Mutter is drawing it from somewhere
+            // the tracker does not govern (it holds the pointer at the barrier
+            // during an input-capture session) — which is a compositor gap, not
+            // ours. Staying true means the inhibit never took at all.
+            console.log(`vortex-uc: hide, pointer_visible ${before} -> ${t.get_pointer_visible?.()}`);
+        } catch (e) { logError(e, 'vortex-live: hide cursor'); }
+    }
+
+    _showCursor() {
+        if (!this._cursorHidden) return;
+        try {
+            this._cursorTracker()?.uninhibit_cursor_visibility();
+            this._seat()?.uninhibit_unfocus();
+            console.log('vortex-uc: show');
+        } catch (e) { logError(e, 'vortex-live: show cursor'); }
+        this._cursorHidden = false;
     }
 
     _connect() {

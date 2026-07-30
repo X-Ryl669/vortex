@@ -110,6 +110,17 @@
 @layer utilities {
   .vx-pulse { animation: vx-pulse 2.2s ease-out infinite; }
 
+  /* Small lowercase tag for a feature that ships as Experimental. SOLID
+     (opaque) dark-amber fill so it reads cleanly wherever it sits — including
+     floated over a chip's corner, where a translucent fill looked off across
+     the button/card boundary. Position it at the point of use. */
+  .vx-tag {
+    @apply rounded-full px-1.5 py-px text-[9px] font-medium lowercase leading-none tracking-tight;
+    background: #2a1d06;
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.45);
+  }
+
   .scrollbar-thin::-webkit-scrollbar { width: 6px; }
   .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
   .scrollbar-thin::-webkit-scrollbar-thumb {

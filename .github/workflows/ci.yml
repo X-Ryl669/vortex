@@ -1,6 +1,7 @@
-# Test gate on every push/PR: Android unit tests + Rust daemon tests +
-# the Vue/TS build (vue-tsc). Public-repo prerequisite so external PRs
-# get checked automatically. Docs-only changes skip the whole run.
+# Test gate on every push/PR: Android unit tests, Rust daemon tests, and the
+# laptop app — Vue/TS build plus the Tauri backend's own tests. Public-repo
+# prerequisite so external PRs get checked automatically. Docs-only changes
+# skip the whole run.
 name: CI
 
 on:
@@ -46,8 +47,16 @@ jobs:
         working-directory: linux
         run: cargo test --locked
 
-  web:
-    name: UI typecheck + build
+  # The app: Vue frontend AND the Tauri Rust backend. Both in one job because
+  # tauri_build wants the built frontend (`frontendDist: ../dist`) present, so
+  # the Rust side gets the vite build for free here instead of repeating it.
+  #
+  # The `rust` job above covers only the daemon — `linux/Cargo.toml`'s workspace
+  # is `members = ["daemon"]`, and ui-tauri is a separate crate outside it. Which
+  # left everything in src-tauri/src uncompiled by CI, its unit tests never run,
+  # and a PR could break Universal Control with the checks all green.
+  app:
+    name: UI + Tauri backend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,3 +74,20 @@ jobs:
       - name: Build (vue-tsc + vite)
         working-directory: linux/ui-tauri
         run: pnpm run build
+
+      # webkit2gtk brings javascriptcoregtk + libsoup with it; the gstreamer
+      # pair is for the screen-mirror encoder (`gstreamer`/`gstreamer-app`).
+      - name: System deps (tauri, gstreamer, dbus)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libdbus-1-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: linux/ui-tauri/src-tauri
+      - name: cargo test (Tauri backend)
+        working-directory: linux/ui-tauri/src-tauri
+        run: cargo test --lib --locked

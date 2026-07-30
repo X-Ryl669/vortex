@@ -4,7 +4,7 @@ members = []
 
 [package]
 name = "vortex-ui-tauri"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 license = "GPL-3.0-or-later"
 description = "Vortex Tauri UI"
 edition = "2021"
@@ -55,5 +55,11 @@ gstreamer-app = "0.23"
 # Laptop→phone screen cast (sender): capture the laptop screen via the
 # xdg-desktop-portal ScreenCast portal (Wayland). tokio backend to match our runtime.
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+# Universal Control: libei (EIS) client for the InputCapture portal — receives
+# relative pointer/keyboard once the laptop cursor crosses the screen-edge barrier.
+reis = { version = "0.3", features = ["tokio"] }
+# Universal Control cursor-hide: own org.vortex.UniversalControl (CursorHidden)
+# so the GNOME extension can inhibit the laptop pointer while captured.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 # Fresh random per-cast media key for the laptop→phone screen stream.
 rand = "0.8"

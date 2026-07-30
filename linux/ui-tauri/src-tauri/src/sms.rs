@@ -27,13 +27,72 @@ pub(crate) fn deliver(app: &AppHandle, json: &[u8], source: &str) {
     match serde_json::from_slice::<Vec<SmsMessage>>(json) {
         Ok(messages) => {
             tracing::info!(count = messages.len(), source, "← sms assembled");
+            let known = get_sms();
             if let Some(p) = cache_path() {
                 let _ = vortex_l3_daemon::core::fs_private::write_private(&p, json);
             }
+            offer_login_code(&known, &messages);
             let _ = app.emit("vortex:sms", messages);
         }
         Err(e) => tracing::warn!(source, "sms JSON invalid: {e}; dropping"),
     }
+}
+
+/// A code older than this is not the one the user is waiting for.
+const OTP_FRESH_MS: i64 = 5 * 60 * 1000;
+
+/// If this delivery brought a NEW inbound message carrying a login code, put it
+/// on the laptop's clipboard and say so.
+///
+/// The point is the paste: codes arrive while you are already in the field that
+/// wants them, and walking to the phone to read six digits is the single most
+/// common reason to pick it up at all.
+///
+/// Deliberately narrow, because clobbering the clipboard is rude. It fires only
+/// for messages absent from the previous cache — so a first sync, a reconnect
+/// or a full history import stays silent — and only for codes that arrived in
+/// the last few minutes.
+fn offer_login_code(known: &[SmsMessage], incoming: &[SmsMessage]) {
+    // No prior cache means this is a first sync: everything looks new.
+    if known.is_empty() {
+        return;
+    }
+    let seen: std::collections::HashSet<&str> = known.iter().map(|m| m.id.as_str()).collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let Some((msg, code)) = incoming
+        .iter()
+        // Inbound only, genuinely new, and recent.
+        .filter(|m| m.r#type == 1 && !seen.contains(m.id.as_str()))
+        .filter(|m| now - m.date < OTP_FRESH_MS)
+        .filter_map(|m| vortex_l3_daemon::core::sms::extract_otp(&m.body).map(|c| (m, c)))
+        .max_by_key(|(m, _)| m.date)
+    else {
+        return;
+    };
+
+    // The code itself is never logged — it is a credential.
+    let sender = msg.address.clone();
+    tracing::info!(from = %sender, "sms: login code → clipboard");
+    if let Err(e) = crate::clipboard_sync::set_local_text(&code) {
+        tracing::warn!("sms: could not put the login code on the clipboard: {e}");
+        return;
+    }
+    tokio::spawn(async move {
+        let Ok(n) = serde_json::from_value::<
+            vortex_l3_daemon::core::notif_mirror::NotificationMirror,
+        >(serde_json::json!({
+            "app": "Vortex",
+            "title": format!("Code {code} copied"),
+            "text": format!("from {sender} — paste with Ctrl+V"),
+        })) else {
+            return;
+        };
+        let _ = vortex_l3_daemon::core::notification_display::show(&n, 0).await;
+    });
 }
 
 /// Wipe the cached SMS (live + full history + watermark) and blank the

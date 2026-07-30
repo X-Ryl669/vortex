@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, computed } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 import {
@@ -13,6 +13,7 @@ import {
   Lock,
   LockOpen,
   ClipboardList,
+  MousePointer2,
 } from "lucide-vue-next";
 import { theme } from "@/lib/theme";
 import { smartSwitchEnabled, setSmartSwitch } from "@/lib/smartSwitch";
@@ -25,19 +26,97 @@ import {
   initProximity,
 } from "@/lib/proximity";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { setLocale, LOCALES, type LocaleCode } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import SettingsRow from "@/components/SettingsRow.vue";
 
 const router = useRouter();
-const { t, locale } = useI18n();
+const { t, te, locale } = useI18n();
 
 onMounted(() => {
   void initProximity();
   void invoke<boolean>("get_clipboard_sync")
     .then((v) => (clipboardSync.value = v))
     .catch(() => {});
+  void invoke<boolean>("uc_running")
+    .then((v) => (ucEnabled.value = v))
+    .catch(() => {});
+  void invoke<string>("uc_get_placement")
+    .then((v) => (ucPlacement.value = v))
+    .catch(() => {});
+  // Universal Control can only fail once it is already running — the desktop
+  // withholding input capture, the phone dropping off adb — so the switch has to
+  // hear about it after the fact, or it sits on over something that stopped.
+  void listen<string>("vortex:uc-stopped", (e) => {
+    ucEnabled.value = false;
+    ucError.value = e.payload;
+  }).then((un) => (unlistenUc = un));
 });
+
+let unlistenUc: UnlistenFn | undefined;
+onUnmounted(() => unlistenUc?.());
+
+// Universal Control: the laptop cursor + keyboard cross the screen edge onto
+// the phone (drives its native cursor). Toggling on arms the edge barrier;
+// `ucPlacement` is which screen edge the phone sits past.
+const ucEnabled = ref(false);
+const ucPlacement = ref("right");
+/// Why it stopped, when it stopped by itself. Empty while all is well.
+const ucError = ref("");
+// The backend reports failures as `<code>` or `<code>|<detail>` rather than an
+// English sentence, so the reason can be said in the user's own language (see
+// universal_control.rs). Anything whose code has no translation — the errors from
+// further down, libei and zbus — is shown exactly as it arrived.
+const ucErrorText = computed(() => {
+  if (!ucError.value) return "";
+  const cut = ucError.value.indexOf("|");
+  const code = cut < 0 ? ucError.value : ucError.value.slice(0, cut);
+  const detail = cut < 0 ? "" : ucError.value.slice(cut + 1);
+  const key = `settings.uc_err_${code}`;
+  if (!te(key)) return ucError.value;
+  return detail ? `${t(key)} (${detail})` : t(key);
+});
+const UC_EDGES = computed(() =>
+  (["left", "right", "top", "bottom"] as const).map((code) => ({
+    code,
+    label: t(`settings.uc_edge_${code}`),
+  })),
+);
+// The placement is "<edge>" or "<edge>-<end>". Arming only one end leaves the
+// rest of that edge to whatever else lives there — an auto-hiding dock loses it
+// completely otherwise, because the compositor stops moving the pointer the
+// moment our barrier catches it.
+const ucEdge = computed(() => ucPlacement.value.split("-")[0] || "right");
+const ucEnd = computed(() => ucPlacement.value.split("-")[1] ?? "");
+const UC_ENDS = computed(() => {
+  const ends =
+    ucEdge.value === "top" || ucEdge.value === "bottom"
+      ? (["left", "right"] as const)
+      : (["top", "bottom"] as const);
+  return [
+    { code: "", label: t("settings.uc_end_whole") },
+    ...ends.map((code) => ({ code, label: t(`settings.uc_corner_${code}`) })),
+  ];
+});
+function setUniversalControl(v: boolean) {
+  ucEnabled.value = v;
+  ucError.value = "";
+  void invoke(v ? "uc_start" : "uc_stop").catch((e) => {
+    ucEnabled.value = !v;
+    ucError.value = String(e);
+  });
+}
+function pickUcPlacement(code: string) {
+  ucPlacement.value = code;
+  void invoke("uc_set_placement", { edge: code }).catch(() => {});
+}
+// Picking an edge drops any end with it — "bottom-right" means nothing once the
+// edge is vertical — so the edge buttons set the bare edge and the end is chosen
+// again after.
+function pickUcEnd(code: string) {
+  pickUcPlacement(code ? `${ucEdge.value}-${code}` : ucEdge.value);
+}
 
 // Phone↔laptop clipboard sync (P2). Default on. Text copied on either side
 // mirrors to the other (laptop→phone auto; phone→laptop via the phone's
@@ -158,6 +237,57 @@ const pill = (active: boolean) =>
             :model-value="clipboardSync"
             @update:model-value="setClipboardSync"
           />
+          <SettingsRow
+            divider
+            :icon="MousePointer2"
+            :title="t('settings.uc')"
+            :tag="t('mirror.experimental')"
+            :desc="t('settings.uc_hint')"
+            :model-value="ucEnabled"
+            @update:model-value="setUniversalControl"
+          />
+          <!-- Experimental for a reason, and the reasons are all environmental —
+               worth stating up front rather than as a failure later. -->
+          <p class="px-[18px] pb-4 -mt-1.5 text-[11.5px] leading-relaxed text-muted-foreground">
+            {{ t("settings.uc_needs") }}
+          </p>
+          <!-- why it switched itself off: no portal on this desktop, no adb, a
+               barrier the compositor would not arm -->
+          <p
+            v-if="ucErrorText"
+            class="px-[18px] pb-4 -mt-1 text-xs leading-relaxed text-destructive"
+          >
+            {{ ucErrorText }}
+          </p>
+          <!-- phone placement: which screen edge the phone sits past -->
+          <div v-if="ucEnabled" class="px-[18px] py-4 border-t border-border/60">
+            <div class="flex items-center gap-2.5 mb-3">
+              <MousePointer2 class="h-[18px] w-[18px] text-muted-foreground" :stroke-width="1.8" />
+              <span class="text-sm font-semibold text-foreground">
+                {{ t("settings.uc_placement") }}
+              </span>
+            </div>
+            <div class="flex gap-2.5">
+              <button
+                v-for="e in UC_EDGES"
+                :key="e.code"
+                :class="pill(ucEdge === e.code)"
+                @click="pickUcPlacement(e.code)"
+              >
+                {{ e.label }}
+              </button>
+            </div>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button
+                v-for="e in UC_ENDS"
+                :key="e.code || 'full'"
+                :class="pill(ucEnd === e.code)"
+                @click="pickUcEnd(e.code)"
+              >
+                {{ e.label }}
+              </button>
+            </div>
+          </div>
         </div>
 
         <!-- PRIVACY & PROXIMITY -->

@@ -61,7 +61,9 @@ class LaptopMirrorActivity : Activity() {
 
         surface.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
-                val c = LaptopMirrorClient(port, key, holder.surface)
+                val c = LaptopMirrorClient(port, key, holder.surface) { w, h ->
+                    runOnUiThread { surface.setAspect(w, h) }
+                }
                 client = c
                 worker = Thread({ c.start() }, "laptop-mirror-view").also { it.start() }
             }
@@ -159,8 +161,17 @@ class LaptopMirrorActivity : Activity() {
  * is letterboxed, never stretched.
  */
 private class AspectRatioSurfaceView(context: Context) : SurfaceView(context) {
-    private val aspectW = 16
-    private val aspectH = 9
+    // 16:9 only until the decoder tells us otherwise. In extend mode the laptop
+    // sends a portrait monitor, and assuming landscape stretched it badly.
+    private var aspectW = 16
+    private var aspectH = 9
+
+    fun setAspect(w: Int, h: Int) {
+        if (w <= 0 || h <= 0 || (w == aspectW && h == aspectH)) return
+        aspectW = w
+        aspectH = h
+        requestLayout()
+    }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val availW = MeasureSpec.getSize(widthMeasureSpec)

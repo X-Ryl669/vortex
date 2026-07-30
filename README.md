@@ -53,9 +53,26 @@ them as if they were one device:
 - **Notes + To-dos** — one list on both devices, with due-date reminders
 - **File sharing** — instant drop-style, Nautilus/Dolphin integration,
   Wi-Fi Direct fast path
+- **SMS login codes** — a verification code arriving on the phone lands on the
+  laptop clipboard, ready to paste
 - **Emoji-SAS pairing** — easy AND secure: compare 3 emoji, done
-- **Experimental:** screen mirroring (both directions) and continuity
-  camera (phone → Linux webcam)
+
+### Screen features (need adb — see [step 6](#6-adb--only-for-the-screen-features))
+
+- **Universal Control** — push the laptop's cursor off the screen edge and it
+  arrives on the phone, driving the phone's own cursor. The keyboard follows it,
+  and two-finger trackpad scrolling scrolls the phone. You pick which side the
+  phone sits on, the way you arrange displays; there is a little resistance at
+  the edge so you cannot cross by accident. Push back out the way you came in
+  and control returns to the laptop. **Experimental:** besides adb it needs
+  **Wayland on a recent GNOME** — holding the cursor at the screen edge goes
+  through the input-capture portal — so it does not arm on X11 or KDE.
+- **Second screen** — the phone becomes a *real* extra monitor for the laptop:
+  it appears in Displays and windows can be dragged onto it. GNOME only (it uses
+  Mutter's own screen-cast API), and view-only — touches on the phone do not
+  reach the laptop yet.
+- **Screen mirroring** (both directions) and **continuity camera**
+  (phone → Linux webcam) — experimental.
 
 ## 🛠 Tech stack
 
@@ -151,6 +168,54 @@ calling/SMS from the laptop won't work (MIUI silently blocks those permissions).
 
 ⚠ If another BLE phone-link app is running on the laptop, close it during
 pairing — they fight over the BLE channel.
+
+### 6. adb — only for the screen features
+
+Everything above works without this. Universal Control, the second screen and
+screen mirroring do not, and it is worth knowing why before you set it up.
+
+Drawing a cursor on the phone, or typing into it, means writing to
+`/dev/uinput`, and only the **shell** user can do that. adb is how a normal
+Android device hands you that user. There is no root and no vendor account
+involved — Vortex deliberately avoids the `INJECT_EVENTS` route that Xiaomi
+gates behind "USB debugging (Security settings)" and a Mi account.
+
+```bash
+# once, with the cable plugged in: Developer options → USB debugging,
+# then accept the key prompt on the phone
+adb devices          # your phone should say "device", not "unauthorized"
+
+# to go cable-free:
+adb tcpip 5555       # then unplug
+```
+
+After that the laptop reconnects on its own — it remembers the phone's address
+and re-dials it whenever adb has no device.
+
+**What actually goes onto the phone.** Vortex pushes a 20 KB native helper to
+`/data/local/tmp/vortex_inject` and runs it as the shell user; it is what opens
+`/dev/uinput` and creates the virtual mouse, touchscreen and keyboard. It is not
+installed, it holds no permissions of its own, and it dies with the session. The
+source is [`android/inject/vortex_inject.c`](android/inject/vortex_inject.c) and
+`android/inject/build.sh` rebuilds it — with NDK r26b that comes out byte-for-byte
+identical to the committed binary, so you can check the copy in this repo instead
+of taking our word for it:
+
+```bash
+OUT=/tmp/vi android/inject/build.sh
+cmp /tmp/vi linux/ui-tauri/src-tauri/assets/vortex_inject && echo identical
+```
+
+⚠ **Android 10 and older:** `adb tcpip 5555` has to be redone over the cable
+after every phone reboot. Android 11+ has proper Wireless debugging with its own
+pairing, which survives reboots.
+
+**"Configure physical keyboard"** — Android posts this whenever a keyboard is
+attached that it has no layout for, and it has no way to save a layout for a
+virtual one. Turning on **Settings → Physical keyboard → Show virtual keyboard**
+lets Vortex keep one keyboard for the whole session, so you see the notification
+once instead of on every crossing. The notification itself can also be switched
+off: long-press it → turn off that category. Nothing else uses it.
 
 ## 🔐 Security
 

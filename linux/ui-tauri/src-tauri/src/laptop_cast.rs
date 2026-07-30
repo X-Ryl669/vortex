@@ -144,6 +144,15 @@ pub fn dispatch_request(req: bool) {
 pub async fn start(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), String> {
     stop();
 
+    // Extend mode swaps the SOURCE, nothing else: instead of a view of a screen
+    // that already exists, we ask Mutter for a brand-new monitor and capture
+    // that. Everything downstream — encode, seal, transport, the phone's viewer
+    // — is identical, which is the whole reason this fits here rather than in a
+    // module of its own.
+    if extend_enabled() {
+        return start_extend(phone_ip, key).await;
+    }
+
     // ---- Portal: open a ScreenCast session and get the PipeWire node + fd. ----
     let proxy = Screencast::new()
         .await
@@ -260,7 +269,12 @@ pub async fn start(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), Stri
                 while let Some(msg) = bus.pop() {
                     match msg.view() {
                         gst::MessageView::Error(e) => {
-                            tracing::warn!("laptop-cast: pipeline error: {}", e.error());
+                            tracing::warn!(
+                                src = ?msg.src().map(|s| s.name()),
+                                debug = ?e.debug(),
+                                "laptop-cast: pipeline error: {}",
+                                e.error()
+                            );
                             fatal = true;
                         }
                         gst::MessageView::Eos(_) => fatal = true,
@@ -291,6 +305,183 @@ pub async fn start(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), Stri
             *g = None;
         }
         tracing::info!("laptop-cast: stopped (capture + portal released)");
+    });
+
+    Ok(())
+}
+
+/// Size of the monitor extend mode creates. Landscape: the phone's viewer is
+/// locked to landscape, and 720 logical pixels of width is uncomfortably narrow
+/// for desktop windows anyway. 1560x720 is the phone's own screen turned on its
+/// side (2340x1080 in exactly this ratio), so the picture fills it edge to edge
+/// with no letterboxing.
+///
+/// The caps force this at the source, so it really is the monitor's resolution
+/// and not a scale applied afterwards.
+const EXTEND_W: u32 = 1560;
+const EXTEND_H: u32 = 720;
+
+fn extend_flag_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".local/share/vortex/laptop_cast/extend"))
+}
+
+/// Whether the phone should be given a NEW screen rather than a copy of this one.
+pub(crate) fn extend_enabled() -> bool {
+    extend_flag_path().is_some_and(|p| p.exists())
+}
+
+/// Choose between mirroring this screen and extending onto a new one. Takes
+/// effect on the next cast — switching mid-cast would mean tearing the viewer
+/// down and re-keying it.
+#[tauri::command]
+pub(crate) fn set_extend_mode(on: bool) -> Result<(), String> {
+    let p = extend_flag_path().ok_or("no HOME")?;
+    if on {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&p, b"1").map_err(|e| e.to_string())?;
+    } else {
+        let _ = std::fs::remove_file(&p);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn get_extend_mode() -> bool {
+    extend_enabled()
+}
+
+/// Cast a NEW monitor to the phone (see [`crate::virtual_display`]).
+///
+/// Differs from the mirror path in two ways only: the frames come from a
+/// PipeWire node on our own connection (no portal, so no consent dialog and no
+/// remote fd), and the caps sit immediately after the source — with anything
+/// scalable in between, the size would not propagate back and Mutter would pick
+/// the monitor's resolution itself.
+async fn start_extend(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), String> {
+    let monitor = crate::virtual_display::create().await?;
+    let node_id = monitor.node_id;
+
+    if let Err(e) = gst::init() {
+        return Err(format!("gst init: {e}"));
+    }
+    // Same encoder reasoning as the mirror path: CPU x264 into system memory,
+    // never a GPU context the compositor owns.
+    // The cursor is drawn here rather than by the compositor: Mutter refuses to
+    // composite one into a virtual monitor without killing the session, so the
+    // overlay rides the pointer instead (starts invisible until we know where
+    // it is).
+    // Dropped from the pipeline entirely if the artwork can't be staged — an
+    // overlay with no image to load refuses to start, and losing the pointer is
+    // a far smaller loss than losing the screen.
+    let cursor_stage = match crate::virtual_display::stage_cursor_image() {
+        Some(p) => format!(
+            "gdkpixbufoverlay name=cursor location=\"{}\" alpha=0 ! ",
+            p.display()
+        ),
+        None => {
+            tracing::warn!("laptop-cast: no cursor artwork — extending without a pointer");
+            String::new()
+        }
+    };
+    let desc = format!(
+        "pipewiresrc path={node_id} do-timestamp=true keepalive-time=1000 ! \
+         video/x-raw,width={EXTEND_W},height={EXTEND_H} ! \
+         videorate ! videoconvert ! \
+         video/x-raw,format=I420,framerate=30/1 ! \
+         {cursor_stage}\
+         x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 key-int-max=30 ! \
+         h264parse config-interval=-1 ! \
+         video/x-h264,stream-format=byte-stream,alignment=au ! \
+         appsink name=vsink emit-signals=false max-buffers=3 drop=true sync=false"
+    );
+    let pipeline = gst::parse::launch(&desc)
+        .map_err(|e| format!("build pipeline: {e}"))?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "pipeline downcast".to_string())?;
+
+    let (au_tx, au_rx) = mpsc::channel::<Vec<u8>>(8);
+    let appsink = pipeline
+        .by_name("vsink")
+        .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
+        .ok_or_else(|| "appsink missing".to_string())?;
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if let Some(buf) = sample.buffer() {
+                    if let Ok(map) = buf.map_readable() {
+                        let _ = au_tx.try_send(map.as_slice().to_vec());
+                    }
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    tokio::spawn(mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx));
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| format!("pipeline play: {e}"))?;
+    tracing::info!(
+        "laptop-cast: extending onto a new {EXTEND_W}x{EXTEND_H} monitor, serving on {}",
+        mirror_tcp::LAPTOP_VIDEO_PORT
+    );
+
+    let cursor_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    if let Some(overlay) = pipeline.by_name("cursor") {
+        crate::virtual_display::spawn_cursor_overlay(overlay, cursor_alive.clone());
+    }
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut g = CAST.lock().map_err(|_| "cast lock".to_string())?;
+        *g = Some(CastHandle { stop_tx });
+    }
+    let bus = pipeline.bus();
+    tokio::spawn(async move {
+        let mut stop_rx = stop_rx;
+        loop {
+            let mut fatal = false;
+            if let Some(bus) = &bus {
+                while let Some(msg) = bus.pop() {
+                    match msg.view() {
+                        gst::MessageView::Error(e) => {
+                            tracing::warn!(
+                                src = ?msg.src().map(|s| s.name()),
+                                debug = ?e.debug(),
+                                "laptop-cast: pipeline error: {}",
+                                e.error()
+                            );
+                            fatal = true;
+                        }
+                        gst::MessageView::Eos(_) => fatal = true,
+                        _ => {}
+                    }
+                }
+            }
+            if fatal {
+                break;
+            }
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
+        }
+        cursor_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = pipeline.set_state(gst::State::Null);
+        // Take the monitor away before anything else: windows left on it need
+        // somewhere to go, and the shell only moves them once it is gone.
+        monitor.stop().await;
+        if let Ok(mut g) = CAST.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = CAST_OFFER.lock() {
+            *g = None;
+        }
+        tracing::info!("laptop-cast: stopped (extra monitor removed)");
     });
 
     Ok(())

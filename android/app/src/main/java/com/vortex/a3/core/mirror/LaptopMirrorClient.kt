@@ -40,6 +40,11 @@ class LaptopMirrorClient(
     private val surface: Surface,
     private val width: Int = 1280,
     private val height: Int = 720,
+    /** Called once the decoder reports the stream's real dimensions. The
+     *  laptop no longer only ever sends 720p landscape — in extend mode it
+     *  creates a portrait monitor shaped like this phone — so the viewer has to
+     *  learn the shape from the stream instead of assuming it. */
+    private val onVideoSize: ((Int, Int) -> Unit)? = null,
 ) {
     private val keySpec = SecretKeySpec(key, "ChaCha20")
     @Volatile private var running = false
@@ -152,8 +157,12 @@ class LaptopMirrorClient(
                         }
                     }
                     var outIdx = dec.dequeueOutputBuffer(info, 0)
-                    while (outIdx >= 0) {
-                        dec.releaseOutputBuffer(outIdx, true) // render to the surface
+                    while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            reportSize(dec.outputFormat)
+                        } else {
+                            dec.releaseOutputBuffer(outIdx, true) // render to the surface
+                        }
                         outIdx = dec.dequeueOutputBuffer(info, 0)
                     }
                 } catch (e: IllegalStateException) {
@@ -168,6 +177,29 @@ class LaptopMirrorClient(
             try { dec.release() } catch (_: Throwable) {}
             if (codec === dec) codec = null
         }
+    }
+
+    /** Pull the displayed size out of the decoder's output format and hand it
+     *  up once. Prefers the crop rectangle: coded dimensions are padded to
+     *  macroblock multiples, so using them would letterbox by a few pixels and
+     *  skew the aspect. */
+    private var reportedSize = false
+
+    private fun reportSize(format: MediaFormat) {
+        if (reportedSize) return
+        val w: Int
+        val h: Int
+        if (format.containsKey("crop-left") && format.containsKey("crop-right")) {
+            w = format.getInteger("crop-right") - format.getInteger("crop-left") + 1
+            h = format.getInteger("crop-bottom") - format.getInteger("crop-top") + 1
+        } else {
+            w = format.getInteger(MediaFormat.KEY_WIDTH)
+            h = format.getInteger(MediaFormat.KEY_HEIGHT)
+        }
+        if (w <= 0 || h <= 0) return
+        reportedSize = true
+        Log.i(TAG, "laptop-mirror: stream is ${w}x$h")
+        onVideoSize?.invoke(w, h)
     }
 
     /** True if this H.264 byte-stream access unit contains an SPS (NAL type 7)

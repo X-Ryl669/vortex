@@ -55,6 +55,8 @@ mod proximity;
 mod ring;
 mod sms;
 mod tray;
+mod universal_control;
+mod virtual_display;
 mod voice_settings;
 mod worker;
 
@@ -344,6 +346,13 @@ pub fn run() {
             notes::toggle_todo,
             notes::delete_note,
             voice_settings::set_voice_lang,
+            universal_control::uc_start,
+            universal_control::uc_stop,
+            universal_control::uc_running,
+            laptop_cast::set_extend_mode,
+            laptop_cast::get_extend_mode,
+            universal_control::uc_set_placement,
+            universal_control::uc_get_placement,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Vortex Tauri");

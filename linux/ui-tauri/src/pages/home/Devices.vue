@@ -179,13 +179,13 @@ const earbudsStatus = computed(() => {
             <MonitorUp v-else class="h-3.5 w-3.5" />
             {{ t("mirror.share_screen") }}
             <!-- Screen mirror ships Experimental in v1 (heavy GStreamer deps). -->
-            <span class="vx-exp">{{ t("mirror.experimental") }}</span>
+            <span class="vx-tag absolute -top-1.5 right-2">{{ t("mirror.experimental") }}</span>
           </button>
           <button class="vx-chip relative" :class="{ 'vx-chip--live': cameraOn }" @click="toggleCamera">
             <Video class="h-3.5 w-3.5" />
             {{ t("mirror.use_as_webcam") }}
             <!-- Continuity camera ships Experimental in v1 (v4l2loopback dep). -->
-            <span class="vx-exp">{{ t("mirror.experimental") }}</span>
+            <span class="vx-tag absolute -top-1.5 right-2">{{ t("mirror.experimental") }}</span>
           </button>
         </div>
       </div>
@@ -274,14 +274,5 @@ const earbudsStatus = computed(() => {
 @keyframes vx-ring-pulse {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.12); }
-}
-/* Small lowercase "experimental" tag floating over each chip's top-right
-   corner. SOLID (opaque) dark-amber fill so it reads cleanly where it straddles
-   the button/card edge — a translucent fill looked off across that boundary. */
-.vx-exp {
-  @apply absolute -top-1.5 right-2 rounded-full px-1.5 py-px text-[9px] font-medium lowercase leading-none tracking-tight;
-  background: #2a1d06;
-  color: #fbbf24;
-  border: 1px solid rgba(245, 158, 11, 0.45);
 }
 </style>
