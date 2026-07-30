@@ -65,8 +65,11 @@ them as if they were one device:
   phone sits on, the way you arrange displays; there is a little resistance at
   the edge so you cannot cross by accident. Push back out the way you came in
   and control returns to the laptop. **Experimental:** besides adb it needs
-  **Wayland on a recent GNOME** — holding the cursor at the screen edge goes
-  through the input-capture portal — so it does not arm on X11 or KDE.
+  **Wayland** — holding the cursor at the screen edge goes through the
+  input-capture portal, which the compositor provides. Tested on GNOME 45+;
+  KDE Plasma 6.1+ and Hyprland ship that portal too (untested here), Sway/wlroots
+  does not have it yet, and X11 has no such thing at all. Hiding the laptop's own
+  cursor is GNOME-only for now.
 - **Second screen** — the phone becomes a *real* extra monitor for the laptop:
   it appears in Displays and windows can be dragged onto it. GNOME only (it uses
   Mutter's own screen-cast API), and view-only — touches on the phone do not

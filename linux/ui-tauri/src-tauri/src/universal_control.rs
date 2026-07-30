@@ -351,10 +351,11 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     let (mut pw, mut ph) = phys;
     tracing::info!("universal-control: phone physical bounds {}x{}", phys.0, phys.1);
     // Capturing input at a screen edge is the compositor's to grant, through the
-    // input-capture portal — which only exists on Wayland, and only on a recent
-    // enough desktop. Saying so is the difference between a feature that is
-    // unavailable here and one that appears broken: the switch goes on, the edge
-    // does nothing, and nothing anywhere says why.
+    // input-capture portal — Wayland only, and only where the compositor has
+    // implemented it: GNOME 45+, KDE Plasma 6.1+, Hyprland since July 2026.
+    // Sway/wlroots has no such backend. Saying so is the difference between a
+    // feature that is unavailable here and one that appears broken: the switch
+    // goes on, the edge does nothing, and nothing anywhere says why.
     let ic = InputCapture::new()
         .await
         .map_err(|e| format!("no_portal|{e}"))?;
