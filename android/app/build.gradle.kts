@@ -30,8 +30,8 @@ android {
         applicationId = "io.github.zoir_dev.vortex"
         minSdk = 29
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.0.0-beta.2"
+        versionCode = 4
+        versionName = "1.0.0-beta.3"
     }
 
     signingConfigs {

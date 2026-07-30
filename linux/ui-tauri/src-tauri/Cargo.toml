@@ -4,7 +4,7 @@ members = []
 
 [package]
 name = "vortex-ui-tauri"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 license = "GPL-3.0-or-later"
 description = "Vortex Tauri UI"
 edition = "2021"

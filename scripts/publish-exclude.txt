@@ -4,6 +4,10 @@
 # (NB: .git must NOT be listed — git-archive never exports it, and the
 # cleanup loop would nuke the freshly-cloned public repo's own .git.)
 .gitleaksignore
+# Dev-side automation for THIS repo — it even names vortex-lab in its own
+# comments, so it reads as leftovers in the public tree.
+.ship-gate.sh
+.codex
 # 2026-07-23 decision: the public repo ships CODE ONLY — no project docs.
 # (README/LICENSE/CONTRIBUTING stay: repo face, not docs.)
 docs3

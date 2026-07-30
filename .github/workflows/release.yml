@@ -66,13 +66,60 @@ jobs:
         working-directory: android
         run: rm -f vortex-release.jks keystore.properties
 
+      # generate_release_notes is off on purpose: the public repo receives one
+      # squashed snapshot commit per publish, so GitHub's auto notes would list
+      # a single "release: snapshot …" line and nothing a tester could use.
+      # UPDATE THE `What's new` BLOCK when bumping the version — it is the only
+      # place the Releases page describes the release. (The changelog is
+      # private, so the workflow cannot read it from here.)
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: vortex-*.apk
-          generate_release_notes: true
+          generate_release_notes: false
           body: |
+            ## What's new in 1.0.0-beta.3
+
+            **Universal Control** *(Experimental)* — push the laptop's cursor off the screen
+            edge and it arrives on the phone, driving the phone's own cursor. The keyboard
+            follows it and two-finger trackpad scrolling scrolls the phone. You choose which
+            side the phone sits on — or just one corner of that edge, so a dock or hot corner
+            keeps the rest. Push back out the way you came in, or press Esc, and control
+            returns to the laptop.
+
+            It needs **adb** *and* **Wayland on a recent GNOME**: holding the cursor at the
+            edge goes through the input-capture portal, so it does not arm on X11 or KDE.
+            Hiding the laptop's own cursor needs the GNOME extension on **GNOME 49+**. When
+            it cannot arm, the switch turns itself off and says why, in your language.
+
+            **Second screen** — the phone becomes a *real* extra monitor: it shows up in
+            Displays and windows drag onto it. GNOME only, view-only for now.
+
+            **Login codes to the clipboard** — an arriving SMS verification code lands on the
+            laptop clipboard, no retyping.
+
+            **The binary we push to your phone is now verifiable.** Universal Control works
+            by pushing a 20 KB helper to `/data/local/tmp` and running it as the shell user.
+            It is committed in built form because the app embeds it at compile time, so
+            `android/inject/build.sh` rebuilds it — with NDK r26b, byte-for-byte identical:
+
+            ```bash
+            OUT=/tmp/vi android/inject/build.sh
+            cmp /tmp/vi linux/ui-tauri/src-tauri/assets/vortex_inject && echo identical
+            ```
+
+            ### Honest warning
+
+            Universal Control has been run on exactly **one** pair so far — GNOME 50 with a
+            Redmi 9/9C. The fallback for phones that will not let adb open `/dev/uinput` has,
+            by definition, never run on one. If it misbehaves on yours, that is the point of
+            this beta: please open an issue with your distro, desktop and phone model.
+
+            ---
+
             **Android:** download `vortex-${{ github.ref_name }}.apk` and install it on the phone
             (or use `android/install.sh` over adb — it auto-grants the Accessibility/Notification permissions).
+            It upgrades over beta.2 in place — same app, no re-pairing.
 
             **Linux:** clone the repo and run `./install_linux.sh` — it installs deps, builds, and installs in one go.
+            Update both sides together.
