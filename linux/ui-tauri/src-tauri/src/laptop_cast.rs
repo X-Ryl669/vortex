@@ -79,7 +79,11 @@ pub fn current_offer() -> Option<LaptopCast> {
 /// inbound phone AppState, over LAN + BLE-STATE). Starts a fresh cast on the
 /// false→true edge (random key, our LAN IP, portal consent) and stops on
 /// true→false. Idempotent across the repeated heartbeats in between.
-pub fn dispatch_request(req: bool) {
+///
+/// `extend` is the phone's choice of screen kind, carried alongside the request
+/// (`None` from a phone that does not offer the choice — then the laptop's own
+/// preference decides, as it did before the phone could ask).
+pub fn dispatch_request(req: bool, extend: Option<bool>) {
     // Any real request resets the stop-debounce: a single stale `false` between
     // genuine `true`s must not count toward a stop.
     if req {
@@ -117,7 +121,7 @@ pub fn dispatch_request(req: bool) {
             });
         }
         tokio::spawn(async move {
-            if let Err(e) = start(phone_ip, key).await {
+            if let Err(e) = start(phone_ip, key, extend).await {
                 tracing::warn!("laptop-cast: start failed: {e}");
                 if let Ok(mut g) = CAST_OFFER.lock() {
                     *g = None;
@@ -141,7 +145,14 @@ pub fn dispatch_request(req: bool) {
 /// stream on [`mirror_tcp::LAPTOP_VIDEO_PORT`]. Replaces any prior cast. Returns
 /// once the portal + pipeline are up (or an error if the user cancels consent /
 /// capture can't start).
-pub async fn start(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), String> {
+/// `extend` is the kind of screen asked for: `Some(true)` a new monitor,
+/// `Some(false)` a view of an existing one, `None` "whoever is asking did not
+/// say" — which falls back to the laptop's own saved preference.
+pub async fn start(
+    phone_ip: std::net::IpAddr,
+    key: [u8; 32],
+    extend: Option<bool>,
+) -> Result<(), String> {
     stop();
 
     // Extend mode swaps the SOURCE, nothing else: instead of a view of a screen
@@ -149,7 +160,7 @@ pub async fn start(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), Stri
     // that. Everything downstream — encode, seal, transport, the phone's viewer
     // — is identical, which is the whole reason this fits here rather than in a
     // module of its own.
-    if extend_enabled() {
+    if extend.unwrap_or_else(extend_enabled) {
         return start_extend(phone_ip, key).await;
     }
 

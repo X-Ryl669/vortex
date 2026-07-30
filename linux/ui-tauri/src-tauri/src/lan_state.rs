@@ -165,7 +165,7 @@ pub(crate) fn spawn_state_consumer(
                         // didn't get through). Consumer dedups by URL.
                         crate::handoff::dispatch_appstate_handoff(&state.handoff);
                         // Laptop→phone screen mirror over the BLE STATE path too.
-                        crate::laptop_cast::dispatch_request(state.laptop_mirror_req);
+                        crate::laptop_cast::dispatch_request(state.laptop_mirror_req, state.laptop_mirror_extend);
                         // NB: Continuity Camera is dispatched LAN-ONLY (in lan.rs),
                         // NOT here — the video stream needs LAN anyway, and acting
                         // on the offer over both transports raced start/stop. The

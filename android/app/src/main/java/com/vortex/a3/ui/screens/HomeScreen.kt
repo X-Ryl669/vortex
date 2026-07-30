@@ -4,6 +4,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -110,6 +111,9 @@ fun HomeScreen(
     val isLaptopOnline = primaryPeer != null && lastSeen > 0L &&
         (now - lastSeen) < LAPTOP_STALE_MS
     var forgetTarget by remember { mutableStateOf<TrustedPeer?>(null) }
+    // Asking which kind of laptop screen to show — a second monitor, or a view of
+    // the one that is already there.
+    var showScreenKind by remember { mutableStateOf(false) }
 
     // Pick whichever earbuds to show. Buds physically connect to only
     // one host at a time, so we combine three sources: localEarbuds,
@@ -249,10 +253,13 @@ fun HomeScreen(
                         onToggleLock = {
                             primaryState?.locked?.let { onToggleLaptopLock(it) }
                         },
-                        // View the laptop's screen on this phone — only while the
+                        // Show the laptop's screen on this phone — only while the
                         // laptop is online (it has to be reachable to cast).
+                        // Which KIND is asked here rather than assumed: the two
+                        // are different enough that guessing is always wrong for
+                        // half the taps.
                         onViewScreen = if (isLaptopOnline) {
-                            { com.vortex.a3.core.mirror.LaptopMirror.requestView() }
+                            { showScreenKind = true }
                         } else {
                             null
                         },
@@ -302,6 +309,44 @@ fun HomeScreen(
             onPick = onPickEarbud,
             onRescan = onRescanEarbuds,
             onClose = onClosePicker,
+        )
+    }
+
+    if (showScreenKind) {
+        AlertDialog(
+            onDismissRequest = { showScreenKind = false },
+            containerColor = MaterialTheme.colorScheme.surface,
+            title = {
+                Text(
+                    str("cast.kind_title"),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FW.SemiBold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    ScreenKindRow(
+                        title = str("cast.kind_extend"),
+                        hint = str("cast.kind_extend_hint"),
+                    ) {
+                        showScreenKind = false
+                        com.vortex.a3.core.mirror.LaptopMirror.requestView(extend = true)
+                    }
+                    ScreenKindRow(
+                        title = str("cast.kind_mirror"),
+                        hint = str("cast.kind_mirror_hint"),
+                    ) {
+                        showScreenKind = false
+                        com.vortex.a3.core.mirror.LaptopMirror.requestView(extend = false)
+                    }
+                }
+            },
+            // The choices ARE the confirmation; a second "OK" would only add a tap.
+            confirmButton = {
+                TextButton(onClick = { showScreenKind = false }) {
+                    Text(str("switch.cancel"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
         )
     }
 
@@ -415,5 +460,33 @@ private fun ThisPhoneCard(modifier: Modifier = Modifier) {
                 )
             }
         }
+    }
+}
+
+/**
+ * One choice in the "which laptop screen" dialog: a title and a line saying what
+ * it actually does. Tapping it IS the answer — the dialog closes and the request
+ * goes out, so there is no second confirmation to hunt for.
+ */
+@Composable
+private fun ScreenKindRow(title: String, hint: String, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 10.dp, horizontal = 4.dp),
+    ) {
+        Text(
+            title,
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = FW.SemiBold,
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        Text(
+            hint,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }

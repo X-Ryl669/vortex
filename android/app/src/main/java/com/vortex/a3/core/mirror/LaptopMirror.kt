@@ -58,11 +58,21 @@ object LaptopMirror {
     @Volatile
     var viewerCloser: (() -> Unit)? = null
 
-    /** User tapped "view laptop screen". */
-    fun requestView() {
+    /** Which kind of screen the current request is for: a second monitor to drag
+     *  windows onto (`true`), or a view of the screen the laptop already has
+     *  (`false`). Shipped as `laptop_mirror_extend` so the laptop obeys the
+     *  choice made HERE — it used to be the laptop's own setting, which meant
+     *  walking over to it to change what the phone was about to show. */
+    @Volatile
+    var extendWanted: Boolean = false
+        private set
+
+    /** User tapped the screen button and picked a kind. */
+    fun requestView(extend: Boolean) {
         if (requestActive) return
+        extendWanted = extend
         requestActive = true
-        Log.i(TAG, "view-laptop requested")
+        Log.i(TAG, "view-laptop requested (extend=$extend)")
         onRequestChanged?.invoke()
     }
 

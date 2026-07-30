@@ -84,6 +84,7 @@ internal fun VortexStack.buildLocalAppState(): com.vortex.a3.core.appstate.AppSt
         // Laptop→phone screen mirror: tell the laptop we want to see its screen
         // (it starts casting on the false→true edge). Level, not one-shot.
         laptopMirrorReq = com.vortex.a3.core.mirror.LaptopMirror.requestActive,
+        laptopMirrorExtend = com.vortex.a3.core.mirror.LaptopMirror.extendWanted,
         // Continuity Camera: where to dial + the key, while we're streaming.
         cameraOffer = VortexService.cameraOffer,
         // Our LIVE Wi-Fi IP (re-read on every build, never cached) so the

@@ -822,7 +822,7 @@ pub(crate) async fn try_lan_reconnect(
                     crate::handoff::dispatch_appstate_handoff(&state.handoff);
                     // Laptop→phone screen mirror: start/stop casting our screen
                     // off the phone's view-request level (edge-tracked).
-                    crate::laptop_cast::dispatch_request(state.laptop_mirror_req);
+                    crate::laptop_cast::dispatch_request(state.laptop_mirror_req, state.laptop_mirror_extend);
                     // Continuity Camera: dial the phone's camera into the v4l2
                     // webcam when it offers (we requested it); stop when it ends.
                     crate::camera::dispatch_offer(

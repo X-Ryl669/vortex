@@ -271,6 +271,15 @@ pub struct AppState {
     /// true→false. Older clients omit it (false) = no request. See [`laptop_cast`].
     #[serde(default)]
     pub laptop_mirror_req: bool,
+    /// Phone→laptop: which kind of screen the request is for — `Some(true)` a
+    /// second monitor to drag windows onto, `Some(false)` a view of the screen
+    /// the laptop already has.
+    ///
+    /// `None` = the phone did not say (an older client), and the laptop falls
+    /// back to its own saved preference. That is why this is an Option and not a
+    /// plain bool: a missing field must not read as "mirror, definitely".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub laptop_mirror_extend: Option<bool>,
     /// Laptop→phone: present while the laptop IS casting its screen — the
     /// connection params the phone's viewer dials. `None` = not casting. The
     /// media key rides here under the Noise-sealed transport; never log it.
@@ -400,6 +409,7 @@ impl AppState {
             lock_command: None,
             lock_command_seq: 0,
             laptop_mirror_req: false, // laptop is the caster, never the requester
+            laptop_mirror_extend: None, // ditto — the phone picks the kind
             laptop_cast: None,        // filled while actively casting
             camera_req: false,        // filled by the UI when webcam is wanted
             camera_facing: String::new(), // filled by the UI front/back toggle
@@ -570,6 +580,7 @@ mod tests {
             lock_command: Some("lock".into()),
             lock_command_seq: 7,
             laptop_mirror_req: false,
+            laptop_mirror_extend: None,
             laptop_cast: None,
             camera_req: false,
             camera_facing: String::new(),

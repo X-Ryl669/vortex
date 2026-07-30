@@ -100,18 +100,31 @@ export default class VortexLiveExtension extends Extension {
     }
 
     /** Pointer position relative to the virtual monitor's top-left, and whether
-     *  it is actually on it. Virtual monitors are the ones with no physical
-     *  output behind them — Mutter names them `Meta-N`. */
+     *  it is actually on it.
+     *
+     *  Mutter is asked which of its monitors is the virtual one, rather than
+     *  guessing from a name: `Main.layoutManager.monitors` carries only index,
+     *  position, size and scale — no connector — so the older name test read
+     *  `undefined`, skipped every monitor and answered "not on it" forever. That
+     *  is a cursor that never appears on the phone, since this answer is the only
+     *  thing that positions it.
+     *
+     *  The layout is still where the RECT comes from: `get_monitor_geometry` is
+     *  in the same logical coordinates as `get_pointer`, which is the whole
+     *  reason this lives in the shell. */
     GetVirtualPointer() {
         try {
-            const [px, py] = global.get_pointer();
-            const layout = Main.layoutManager.monitors;
-            for (const m of layout) {
-                const conn = m.connector ?? '';
-                if (!conn.startsWith('Meta-')) continue;
-                const on = px >= m.x && px < m.x + m.width &&
-                           py >= m.y && py < m.y + m.height;
-                return [px - m.x, py - m.y, on];
+            const mm = global.backend?.get_monitor_manager?.();
+            const monitors = mm?.get_monitors?.() ?? [];
+            for (const mon of monitors) {
+                if (!mon.is_virtual?.()) continue;
+                const idx = mm.get_monitor_for_connector(mon.get_connector());
+                if (idx < 0) continue;
+                const r = global.display.get_monitor_geometry(idx);
+                const [px, py] = global.get_pointer();
+                const on = px >= r.x && px < r.x + r.width &&
+                           py >= r.y && py < r.y + r.height;
+                return [px - r.x, py - r.y, on];
             }
         } catch (e) {
             logError(e, 'vortex-live: pointer');

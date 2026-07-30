@@ -148,6 +148,11 @@ data class AppState(
      *  (laptop→phone mirror). A level — the laptop starts casting on the
      *  false→true edge (pops its screen-share consent) and stops on true→false. */
     val laptopMirrorReq: Boolean = false,
+    /** Phone→laptop: which kind of screen the request is for — true a second
+     *  monitor to drag windows onto, false a view of the screen the laptop
+     *  already has. Only sent alongside a live request; a laptop that never sees
+     *  it falls back to its own saved preference. */
+    val laptopMirrorExtend: Boolean = false,
     /** Laptop→phone: set while the laptop IS casting — the params this phone's
      *  viewer dials. null = not casting. Carried under the Noise-sealed
      *  transport; the key is never logged. */
@@ -217,7 +222,12 @@ data class AppState(
             obj.put("lock_command", it)
             obj.put("lock_command_seq", lockCommandSeq)
         }
-        if (laptopMirrorReq) obj.put("laptop_mirror_req", true)
+        if (laptopMirrorReq) {
+            obj.put("laptop_mirror_req", true)
+            // Only with a request: on its own it would tell the laptop nothing,
+            // and `false` there must keep meaning "the phone did not say".
+            obj.put("laptop_mirror_extend", laptopMirrorExtend)
+        }
         laptopCast?.let {
             val c = JSONObject()
             c.put("ip", it.ip)
@@ -320,6 +330,7 @@ data class AppState(
                 lockCommand = obj.optString("lock_command", "").takeIf { it.isNotBlank() },
                 lockCommandSeq = obj.optLong("lock_command_seq", 0L),
                 laptopMirrorReq = obj.optBoolean("laptop_mirror_req", false),
+                laptopMirrorExtend = obj.optBoolean("laptop_mirror_extend", false),
                 laptopCast = obj.optJSONObject("laptop_cast")?.let { c ->
                     // ip is unused (the laptop dials us — we're the server); only
                     // port + key matter.
