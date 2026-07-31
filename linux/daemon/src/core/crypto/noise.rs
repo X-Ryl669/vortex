@@ -5,12 +5,14 @@
 use snow::{params::NoiseParams, Builder};
 
 pub const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
-/// Bare IK pattern — kept for the legacy `run_ik_deterministic` test
-/// vector. Production code uses [`NOISE_IK_PSK2`] which mixes the PRS
-/// into the handshake so reconnect remains authenticated even after
-/// long-term static-key compromise.
+/// The reconnect pattern — used by `run_ik_deterministic` for the test
+/// vector AND at runtime. Runtime additionally mixes the Pairwise Reconnect
+/// Secret into the prologue (see
+/// [`crate::core::pairing::reconnect::prologue_with_prs`]), which is what
+/// keeps a reconnect authenticated after a long-term static-key compromise.
+/// That is the goal `Noise_IKpsk2` would serve; the prologue route reaches it
+/// without a pattern the Android-side Noise library does not implement.
 pub const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
-pub const NOISE_IK_PSK2: &str = "Noise_IKpsk2_25519_ChaChaPoly_SHA256";
 
 pub const PROLOGUE_XX: &[u8] = b"vortex/v1/pairing";
 pub const PROLOGUE_IK: &[u8] = b"vortex/v1/reconnect";
