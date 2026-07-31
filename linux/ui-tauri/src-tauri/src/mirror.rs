@@ -1,5 +1,5 @@
-//! Screen-mirror RECEIVER (laptop): decode the phone's HEVC (H.265) video and show it
-//! in a native GStreamer window.
+//! Screen-mirror RECEIVER (laptop): decode the phone's HEVC (H.265) video and
+//! show it in the mirror window.
 //!
 //! All networking + crypto live in the daemon crate
 //! (`core::mirror_session` for the TCP control plane, `core::mirror_udp` for the
@@ -9,9 +9,10 @@
 //! upstream `ecosystem` `mirror_runtime.rs` (the raw-TCP receiver there is
 //! replaced by the daemon's sealed transport here).
 //!
-//! Decoder backends, best-first: NVIDIA `nvh265dec` (full GPU path), VA-API
-//! `vah265dec`, else software `avdec_h265`. XWayland target — glimagesink /
-//! xvimagesink create their own X11 window.
+//! Decoder backends, best-first: NVIDIA `nvh265dec`, VA-API `vah265dec`, else
+//! software `avdec_h265`. All three end in `xvimagesink`, drawn into the window
+//! `mirror_window` owns. XVideo rather than GL is a measured choice — see that
+//! module for the numbers.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -33,19 +34,18 @@ use vortex_l3_daemon::core::{mirror_tcp, mirror_udp};
 static MIRROR_HANDLE: std::sync::Mutex<Option<MirrorHandle>> = std::sync::Mutex::new(None);
 
 /// The live GStreamer pipeline. Held so a UI "Stop sharing" (and `cleanup`) can
-/// set it to Null — which closes glimagesink's window — WITHOUT relying on the
-/// bus EOS cascade or the window's own X button (whose hit-target is misplaced
-/// under fractional display scaling, so clicking it does nothing).
+/// set it to Null without relying on the bus EOS cascade. It must reach Null
+/// BEFORE the mirror window goes away — the sink is drawing into that window.
 static MIRROR_PIPELINE: std::sync::Mutex<Option<gst::Pipeline>> = std::sync::Mutex::new(None);
 
-/// The phone's display name, set when a mirror starts so the GL window can be
-/// retitled from glimagesink's default "OpenGL renderer" to the phone's name.
+/// The phone's display name, set when a mirror starts so the window and its
+/// header can carry it.
 static MIRROR_TITLE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Sender clone of the live session's input channel, published while a mirror
-/// is up so the GStreamer navigation pad-probe (which runs on a GStreamer
-/// thread, far from `spawn_mirror`) can push laptop→phone input packets into
-/// the sealed control plane. Cleared on `stop_mirror`.
+/// is up so the window's input handlers (which run on the GTK thread, far from
+/// `spawn_mirror`) can push laptop→phone packets into the sealed control plane.
+/// Cleared on `stop_mirror`.
 static INPUT_TX: std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>> = std::sync::Mutex::new(None);
 
 /// True while the left mouse button is held down inside the mirror window — a
@@ -60,8 +60,8 @@ static POINTER_DOWN: AtomicBool = AtomicBool::new(false);
 /// watcher can detect "no scroll for a while" without clock math.
 static SCROLL_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The synthetic finger's current position (normalized), accumulated across
-/// notches on BOTH axes — vertical (button 4/5) and horizontal (button 6/7), the
-/// latter driving home-screen page swipes.
+/// notches on BOTH axes — vertical and horizontal, the latter driving
+/// home-screen page swipes.
 static SCROLL_FINGER_X: AtomicI32 = AtomicI32::new(0);
 static SCROLL_FINGER_Y: AtomicI32 = AtomicI32::new(0);
 /// Ensures the scroll idle-watcher thread is spawned exactly once.
@@ -82,18 +82,14 @@ const PINCH_NOTCH: i32 = 1_600;
 const PINCH_MIN: i32 = 800;
 const PINCH_MAX: i32 = 30_000;
 
-/// Normalized units the synthetic finger travels per unit of a real
-/// `mouse-scroll` delta (backends that emit one).
-const SCROLL_GAIN: f64 = 11_000.0;
-
-/// Normalized units the finger travels per discrete vertical notch (button
-/// 4/5). High-res touchpads fire MANY of these per swipe, so keep it small or
+/// Normalized units the finger travels per discrete vertical wheel notch.
+/// High-res touchpads fire MANY of these per swipe, so keep it small or
 /// scrolling races; the scroll-drag accumulates them and the watcher emits
 /// real-touch MOVEs at a steady rate. Positive = finger DOWN. Bumped ~1.6× from
 /// the original 950 so each wheel notch covers more screen (snappier scrolling).
 const NOTCH_STEP: i32 = 1_500;
 
-/// Larger per-notch step for HORIZONTAL notches (button 6/7): a home-screen page
+/// Larger per-notch step for HORIZONTAL notches: a home-screen page
 /// flip needs the finger to cross a big fraction of the screen within one
 /// scroll-drag burst, so each horizontal notch travels further. Positive =
 /// finger RIGHT.
@@ -114,12 +110,13 @@ mod input_proto {
     pub const RECENTS: u8 = 12;
 }
 
-/// Map a sink-space pixel coordinate (0..span) to the normalized 0..=65535
-/// wire range, clamping the letterboxed margins glimagesink reports outside the
-/// active video rectangle.
-fn norm(v: f64, span: u32) -> u16 {
-    let s = span.max(1) as f64;
-    (v / s * 65535.0).round().clamp(0.0, 65535.0) as u16
+/// Scale one `mouse-scroll` delta into finger travel. GDK sends ±1.0 for a full
+/// wheel notch and small fractions for high-resolution touchpad scrolling, so a
+/// whole notch maps to exactly the tuned discrete step (`notch`) and anything
+/// finer scales down from it. The clamp matters: unclamped, a single coarse
+/// delta could fling the finger across the whole screen.
+fn scroll_step(delta: f64, notch: i32) -> i32 {
+    (delta.clamp(-1.0, 1.0) * notch as f64) as i32
 }
 
 /// Enqueue a 5-byte input packet onto the live session's sealed control plane.
@@ -154,71 +151,58 @@ fn send_input(ty: u8, nx: u16, ny: u16) {
     }
 }
 
-/// Translate a single GstNavigation event structure into wire packets. Coords
-/// are already in the sink's display caps space (disp_w×disp_h) — glimagesink
-/// and glcolorscale handle the window→video mapping incl. aspect letterboxing.
-fn handle_nav(s: &gst::StructureRef, disp_w: u32, disp_h: u32) {
-    let event = s.get::<String>("event").unwrap_or_default();
-    let px = || s.get::<f64>("pointer_x").unwrap_or(0.0);
-    let py = || s.get::<f64>("pointer_y").unwrap_or(0.0);
-    match event.as_str() {
-        "mouse-button-press" => {
-            // On X11/XWayland a wheel / two-finger scroll arrives as button
-            // presses — NOT a `mouse-scroll` event: 4 (up) / 5 (down) vertical,
-            // 6 (left) / 7 (right) horizontal. Route them into the scroll-drag;
-            // horizontal drives home-screen page swipes.
-            match s.get::<i32>("button").unwrap_or(0) {
-                1 => {
-                    flush_scroll(); // a click during inertial scroll ends it
-                    flush_pinch();
-                    POINTER_DOWN.store(true, Ordering::Relaxed);
-                    send_input(input_proto::DOWN, norm(px(), disp_w), norm(py(), disp_h));
-                }
-                4 if CTRL_HELD.load(Ordering::Relaxed) => feed_pinch(norm(px(), disp_w), norm(py(), disp_h), 1),
-                5 if CTRL_HELD.load(Ordering::Relaxed) => feed_pinch(norm(px(), disp_w), norm(py(), disp_h), -1),
-                4 => feed_scroll(norm(px(), disp_w), norm(py(), disp_h), 0, NOTCH_STEP),
-                5 => feed_scroll(norm(px(), disp_w), norm(py(), disp_h), 0, -NOTCH_STEP),
-                6 => feed_scroll(norm(px(), disp_w), norm(py(), disp_h), -NOTCH_STEP_X, 0),
-                7 => feed_scroll(norm(px(), disp_w), norm(py(), disp_h), NOTCH_STEP_X, 0),
-                _ => {}
-            }
+/// Mouse and keyboard from the mirror window, already normalized to the video
+/// frame (0..=65535 on both axes — `mirror_window` owns the widget-to-frame
+/// mapping, including the letterbox margins). These used to arrive as
+/// GstNavigation events from the video sink; XVideo draws into a window GTK
+/// owns, so the events now come straight off the widget, which is both fewer
+/// layers and the only way to read a scroll wheel accurately.
+
+/// Left button down/up. A press ends any inertial scroll or pinch first — you
+/// cannot be tapping and flinging at the same moment.
+pub(crate) fn on_button(down: bool, nx: u16, ny: u16) {
+    if down {
+        flush_scroll();
+        flush_pinch();
+        POINTER_DOWN.store(true, Ordering::Relaxed);
+        send_input(input_proto::DOWN, nx, ny);
+    } else if POINTER_DOWN.swap(false, Ordering::Relaxed) {
+        send_input(input_proto::UP, nx, ny);
+    }
+}
+
+/// Pointer motion. Only meaningful while the button is held — a phone has no
+/// hover, so a moving cursor with no finger down is nothing to send.
+pub(crate) fn on_motion(nx: u16, ny: u16) {
+    if POINTER_DOWN.load(Ordering::Relaxed) {
+        send_input(input_proto::MOVE, nx, ny);
+    }
+}
+
+/// Wheel / two-finger scroll. `dx`/`dy` are GDK's deltas: ±1.0 per wheel notch,
+/// smaller fractions from a high-resolution touchpad. GDK's +y means "scrolled
+/// DOWN" and the finger has to travel the other way to move the content that
+/// way, hence the negation; x keeps GDK's sign. Ctrl turns the wheel into a
+/// pinch, the way every desktop app does zoom.
+pub(crate) fn on_scroll(nx: u16, ny: u16, dx: f64, dy: f64) {
+    if CTRL_HELD.load(Ordering::Relaxed) {
+        if dy != 0.0 {
+            feed_pinch(nx, ny, if dy < 0.0 { 1 } else { -1 });
         }
-        "mouse-button-release" if s.get::<i32>("button").unwrap_or(0) == 1 => {
-            if POINTER_DOWN.swap(false, Ordering::Relaxed) {
-                send_input(input_proto::UP, norm(px(), disp_w), norm(py(), disp_h));
-            }
-        }
-        "mouse-move" if POINTER_DOWN.load(Ordering::Relaxed) => {
-            send_input(input_proto::MOVE, norm(px(), disp_w), norm(py(), disp_h));
-        }
-        "mouse-scroll" => {
-            // Some backends DO emit a real scroll event — handle both axes.
-            let dx = s.get::<f64>("delta_pointer_x").unwrap_or(0.0);
-            let dy = s.get::<f64>("delta_pointer_y").unwrap_or(0.0);
-            if dx != 0.0 || dy != 0.0 {
-                feed_scroll(
-                    norm(px(), disp_w),
-                    norm(py(), disp_h),
-                    (dx * SCROLL_GAIN) as i32,
-                    (dy * SCROLL_GAIN) as i32,
-                );
-            }
-        }
-        "key-press" => {
-            let key = s.get::<String>("key").unwrap_or_default();
-            if key == "Control_L" || key == "Control_R" {
-                CTRL_HELD.store(true, Ordering::Relaxed); // wheel → pinch-zoom
-            } else {
-                inject_key(&key);
-            }
-        }
-        "key-release" => {
-            let key = s.get::<String>("key").unwrap_or_default();
-            if key == "Control_L" || key == "Control_R" {
-                CTRL_HELD.store(false, Ordering::Relaxed);
-            }
-        }
-        _ => {}
+        return;
+    }
+    if dx != 0.0 || dy != 0.0 {
+        feed_scroll(nx, ny, scroll_step(dx, NOTCH_STEP_X), scroll_step(-dy, NOTCH_STEP));
+    }
+}
+
+/// A key, named the X11 way ("a", "A", "Return", "BackSpace", "Escape", ...) —
+/// which is exactly what `gdk::keys::Key::name()` gives us.
+pub(crate) fn on_key(down: bool, key: &str) {
+    if key == "Control_L" || key == "Control_R" {
+        CTRL_HELD.store(down, Ordering::Relaxed); // wheel → pinch-zoom
+    } else if down {
+        inject_key(key);
     }
 }
 
@@ -431,31 +415,98 @@ fn ensure_scroll_watcher() {
     });
 }
 
-/// Attach the navigation pad-probe to glimagesink's sink pad. Navigation events
-/// travel UPSTREAM from the sink (which owns the window), so an upstream-event
-/// probe on its sink pad sees every mouse/key the user generates in the mirror
-/// window — no foreign-window X11 grabbing (that crashed; see git log).
-fn attach_input_probe(pipeline: &gst::Pipeline, disp_w: u32, disp_h: u32) {
-    let Some(vsink) = pipeline.by_name("vsink") else {
-        tracing::warn!("mirror: vsink not found — input control disabled");
-        return;
-    };
-    let Some(pad) = vsink.static_pad("sink") else {
-        tracing::warn!("mirror: vsink has no sink pad — input control disabled");
-        return;
-    };
-    POINTER_DOWN.store(false, Ordering::Relaxed);
-    pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_pad, info| {
-        if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
-            if ev.type_() == gst::EventType::Navigation {
-                if let Some(s) = ev.structure() {
-                    handle_nav(s, disp_w, disp_h);
-                }
+/// The pacing grid, retuned to what the phone can SUSTAIN.
+///
+/// "Sustain" is the operative word, learned by measuring: a first attempt moved
+/// the grid to each window's average rate, and it chased — 48, then 24, then 40
+/// — turning the grid itself into a source of unevenness. Jitter went from
+/// 17 ms to 114 ms and the worst gap from 65 ms to 1310 ms. A grid above what
+/// the phone reliably delivers is the whole problem, because every frame the
+/// display waits for and does not get is a visible hitch.
+///
+/// So: judge by the SLOWEST of the recent windows, drop to it at once, and rise
+/// only when every window in the history agrees. Falling behind costs a
+/// duplicated frame nobody sees; running ahead costs a stutter everybody does.
+const PACE_LADDER: [i32; 7] = [24, 30, 40, 48, 60, 90, 120];
+
+/// How many measurement windows must agree before the grid is allowed UP.
+const PACE_RAISE_WINDOWS: usize = 3;
+
+fn pace_grid_for(rate: f64) -> i32 {
+    // The nearest rung at or below the delivery rate, so the grid never asks for
+    // frames the phone is not sending. Never below the slowest rung: under ~24
+    // the picture is choppy regardless and duplicating is the lesser evil.
+    *PACE_LADDER
+        .iter()
+        .rev()
+        .find(|&&g| (g as f64) <= rate + 2.0)
+        .unwrap_or(&PACE_LADDER[0])
+}
+
+/// Decide the next grid from the recent window rates. `None` = leave it alone.
+fn next_pace_grid(current: i32, history: &[f64]) -> Option<i32> {
+    let slowest = history.iter().cloned().fold(f64::INFINITY, f64::min);
+    let want = pace_grid_for(slowest);
+    if want < current {
+        return Some(want); // fall back immediately
+    }
+    if want > current
+        && history.len() >= PACE_RAISE_WINDOWS
+        && history.iter().all(|&r| pace_grid_for(r) >= want)
+    {
+        return Some(want); // every window agrees there is headroom
+    }
+    None
+}
+
+/// Retune the live pipeline's pacing grid. A capsfilter accepts new caps while
+/// PLAYING; the renegotiation ripples back through `videorate`, which starts
+/// resampling onto the new grid.
+fn set_pace_grid(pipeline: &gst::Pipeline, fps: i32) {
+    let Some(pace) = pipeline.by_name("pacecaps") else { return };
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("framerate", gst::Fraction::new(fps, 1))
+        .build();
+    pace.set_property("caps", &caps);
+    tracing::info!(fps, "mirror: pacing grid retuned to the phone's delivery rate");
+}
+
+/// Log how EVEN the displayed frames are, not just how many. Smoothness is a
+/// property of the gaps between frames: 30 fps arriving every 33 ms looks
+/// smooth, 30 fps arriving in bursts of five looks like stutter, and a plain
+/// frame counter cannot tell those apart — which is why tuning this by counting
+/// frames kept going in circles. Reports mean gap, its standard deviation and
+/// the worst gap over each window.
+fn attach_cadence_probe(pipeline: &gst::Pipeline) {
+    let Some(vsink) = pipeline.by_name("vsink") else { return };
+    let Some(pad) = vsink.static_pad("sink") else { return };
+    let state = std::sync::Mutex::new((None::<std::time::Instant>, Vec::<f64>::new()));
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+        let now = std::time::Instant::now();
+        if let Ok(mut g) = state.lock() {
+            if let Some(prev) = g.0.replace(now) {
+                g.1.push(now.duration_since(prev).as_secs_f64() * 1000.0);
+            }
+            if g.1.len() >= 150 {
+                let gaps = std::mem::take(&mut g.1);
+                let n = gaps.len() as f64;
+                let mean = gaps.iter().sum::<f64>() / n;
+                let sd = (gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / n).sqrt();
+                let worst = gaps.iter().cloned().fold(0.0_f64, f64::max);
+                // Debug, not info: at 60 fps this fires every couple of
+                // seconds, which is a tuning instrument, not something a
+                // shipped app should be writing to the user's journal.
+                tracing::debug!(
+                    fps = format!("{:.1}", 1000.0 / mean),
+                    gap_ms = format!("{mean:.1}"),
+                    jitter_ms = format!("{sd:.1}"),
+                    worst_ms = format!("{worst:.0}"),
+                    "mirror: display cadence"
+                );
             }
         }
         gst::PadProbeReturn::Ok
     });
-    tracing::info!("mirror: input control probe attached (mouse/keyboard → phone)");
 }
 
 /// True if the box has any DRM render node. We scan for `renderD*` rather than
@@ -493,78 +544,97 @@ pub fn detect_decoder_backend() -> &'static str {
 /// reference frames). Post-decoder queue: leaky=downstream 1 buffer (always show
 /// the freshest frame). `h265parse config-interval=-1` re-injects VPS/SPS/PPS before
 /// every IDR so a viewer that joined mid-stream recovers at the next keyframe.
-fn pipeline_string_for_backend(backend: &str, disp_w: u32, disp_h: u32) -> String {
-    // Scale the DISPLAYED frame to (disp_w × disp_h) — a portrait size that fits
-    // the screen — so glimagesink's auto-created window opens at that aspect.
-    // Without this the window is born at the full capture size (e.g. 1080×2340);
-    // on a screen shorter than the video (a laptop panel) the WM clamps that
-    // oversized window into a landscape shape and the portrait frame gets black
-    // PILLARBARS on the sides. Scaling to a fitting portrait size keeps the
-    // window the phone's aspect → no bars. Full res is still decoded (crisp);
-    // only the on-screen size is bounded. GL path scales on the GPU
-    // (glcolorscale); software path uses videoscale.
+///
+/// Every backend ends in `xvimagesink`, rendered into the mirror window's own X
+/// window (see `mirror_window`). That choice is measured, not assumed: on this
+/// hybrid-GPU laptop the GL sinks sustain 14-18 fps at 720x1560 while XVideo
+/// sustains 119-135 with nothing dropped, whatever the decoder in front of it.
+/// The reason is that the GL context lives on the Intel display GPU, so every
+/// frame the NVIDIA decoder produces crosses the bus — and even a plain CPU
+/// upload into that context was 21 fps. So: no GL in this pipeline at all, and
+/// no scaling either. XVideo scales into the window for free in hardware, which
+/// is why the caps here stay at the decoded size.
+fn pipeline_string_for_backend(backend: &str, _disp_w: u32, _disp_h: u32) -> String {
+    // The grid is 30, not 60. Measured on this phone (Helio G80), scrcpy itself
+    // sustains 29-40 fps at a QUARTER of our pixel count, so 60 was never on the
+    // table; asking for it only produced an uneven 30.
+    // Retime onto an even 30 fps grid and let the sink honour it. The phone
+    // delivers frames in bursts — measured at the sink, showing each one the
+    // moment it arrived gave a mean gap of 20-44 ms with a standard deviation
+    // of 38-153 ms and single gaps up to 1504 ms, which is what "it freezes"
+    // actually was: plenty of frames, delivered in clumps. Pacing them costs at
+    // most one frame of latency and took the same stream to 17-18 ms deviation
+    // with a worst gap of 65 ms.
+    //
+    // VORTEX_MIRROR_PACE=0 turns it off for anyone who would rather have the
+    // lowest possible touch latency than an even picture.
+    let paced = !std::env::var("VORTEX_MIRROR_PACE").is_ok_and(|v| v == "0");
+    let sink = if paced {
+        "videorate ! capsfilter name=pacecaps caps=video/x-raw,framerate=30/1 ! \
+         gtksink name=vsink sync=true force-aspect-ratio=true"
+    } else {
+        "gtksink name=vsink sync=false force-aspect-ratio=true"
+    };
+    let sink = &sink;
     match backend {
         "nvdec" => format!(
             "appsrc name=src is-live=true format=time block=true max-bytes=1048576 do-timestamp=true \
              caps=video/x-h265,stream-format=byte-stream,alignment=au ! \
              queue max-size-buffers=4 max-size-bytes=4194304 max-size-time=0 ! \
              h265parse name=parser config-interval=-1 ! \
-             nvh265dec ! glupload ! glcolorconvert ! \
-             glcolorscale ! video/x-raw(memory:GLMemory),width={disp_w},height={disp_h} ! \
-             videorate ! video/x-raw(memory:GLMemory),framerate=60/1 ! \
-             queue name=postq max-size-buffers=3 max-size-bytes=0 max-size-time=0 ! \
-             glimagesink name=vsink sync=true force-aspect-ratio=true"
+             nvh265dec ! videoconvert ! \
+             queue name=postq leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! \
+             {sink}"
         ),
         "vaapi" => format!(
             "appsrc name=src is-live=true format=time block=true max-bytes=1048576 do-timestamp=true \
              caps=video/x-h265,stream-format=byte-stream,alignment=au ! \
              queue max-size-buffers=4 max-size-bytes=4194304 max-size-time=0 ! \
              h265parse name=parser config-interval=-1 ! \
-             vah265dec ! videoconvert ! glupload ! glcolorconvert ! \
-             glcolorscale ! video/x-raw(memory:GLMemory),width={disp_w},height={disp_h} ! \
+             vah265dec ! videoconvert ! \
              queue name=postq leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! \
-             glimagesink name=vsink sync=false force-aspect-ratio=true"
+             {sink}"
         ),
         _ => format!(
             "appsrc name=src is-live=true format=time block=true max-bytes=1048576 do-timestamp=true \
              caps=video/x-h265,stream-format=byte-stream,alignment=au ! \
              queue max-size-buffers=4 max-size-bytes=4194304 max-size-time=0 ! \
              h265parse name=parser config-interval=-1 ! \
-             avdec_h265 max-threads=4 ! videoconvert ! videoscale ! \
-             video/x-raw,width={disp_w},height={disp_h} ! \
+             avdec_h265 max-threads=4 ! videoconvert ! \
              queue name=postq leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! \
-             xvimagesink name=vsink sync=false"
+             {sink}"
         ),
     }
 }
 
-/// Pick an on-screen window size: the phone frame (`vw`×`vh`, portrait) scaled to
-/// fit the LARGEST connected monitor — that's the primary/active display the WM
-/// opens a new window on, so the mirror comes out big on a big external screen
-/// (and merely fits a laptop-only setup). Capped so we never upscale past the
-/// decoded resolution; aspect preserved. The window stays resizable — the user
-/// can drag it to any size and the aspect is kept. Falls back to the main
-/// window's monitor, then a 1080p assumption, if the monitor list is unknown.
-fn fit_display_size(app: &AppHandle, vw: u32, vh: u32) -> (u32, u32) {
+/// A phone-sized window, scrcpy-style — in LOGICAL pixels, which is the only
+/// unit that answers "how big does it look".
+///
+/// Two things had this wrong. It sized from the TALLEST connected monitor
+/// (a 5120×2880 desktop panel here) and it used Tauri's PHYSICAL pixels while
+/// GTK sizes windows logically — a third larger at 1.33× scaling. Between them
+/// the window came out taller than the screen; the WM then clamped its height
+/// but not its width, and a window wider than the video's aspect is exactly
+/// where the black side bars came from.
+///
+/// So: the monitor the app is actually on, converted to logical pixels, and
+/// capped three ways — never taller than the stream, never more than 65% of the
+/// screen, and never more than 900 px, which is about the size a real phone
+/// occupies on a desk. Aspect is preserved here and locked by the window's
+/// geometry hints, so resizing can never reintroduce the bars.
+fn window_size(app: &AppHandle, vw: u32, vh: u32) -> (u32, u32) {
     use tauri::Manager;
-    let monitor_h = app
-        .available_monitors()
-        .ok()
-        .and_then(|ms| ms.iter().map(|m| m.size().height).filter(|&h| h > 0).max())
-        .or_else(|| {
-            app.get_webview_window("main")
-                .and_then(|w| w.current_monitor().ok().flatten())
-                .map(|m| m.size().height)
-        })
-        .filter(|&h| h > 0)
-        .unwrap_or(1080);
-    // Leave headroom for the title bar / panel so the window isn't clamped.
-    // No `.min(vh)`: we WANT to upscale a 720p stream to fill the screen (the GL
-    // scaler handles it), otherwise the window shrinks to the decode resolution.
-    let max_h = ((monitor_h * 90) / 100).max(2);
-    let scale = max_h as f64 / vh as f64;
+    let logical_h = app
+        .get_webview_window("main")
+        .and_then(|w| w.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .map(|m| m.size().height as f64 / m.scale_factor())
+        .filter(|h| *h > 0.0)
+        .unwrap_or(900.0);
+    let max_h = (logical_h * 0.65).min(900.0).min(vh as f64).max(240.0);
+    let scale = max_h / vh as f64;
     let mut w = (vw as f64 * scale).round() as u32;
-    let mut h = max_h;
+    let mut h = max_h.round() as u32;
     // Even dimensions (some sinks/scalers dislike odd sizes).
     w &= !1;
     h &= !1;
@@ -584,12 +654,25 @@ fn cleanup_session() {
     }
     POINTER_DOWN.store(false, Ordering::Relaxed);
     SCROLL_ACTIVE.store(false, Ordering::Relaxed);
+    // Pipeline to Null FIRST, then the window: the sink must stop rendering
+    // before the widget it draws into is destroyed.
     stop_pipeline();
+    crate::mirror_window::close();
     // Dropping the handle ends the writer/reader loops (its channel senders go
     // away), which closes the phone-side session.
     if let Ok(mut g) = MIRROR_HANDLE.lock() {
         *g = None;
     }
+}
+
+/// Close-button / WM-close entry point for the mirror window. The teardown is
+/// async (it sends STOP to the phone), so the GTK handler just fires it off and
+/// returns — the window is destroyed by [`stop_mirror`] once the pipeline is
+/// safely at Null.
+pub(crate) fn request_stop() {
+    tauri::async_runtime::spawn(async {
+        stop_mirror().await;
+    });
 }
 
 /// Set the live pipeline to Null (closing glimagesink's window) and forget it.
@@ -601,87 +684,6 @@ fn stop_pipeline() {
     }
 }
 
-/// Retitle glimagesink's auto-created GL window (default "OpenGL renderer") to
-/// the phone's name AND strip its WM decorations (the fractional-scaling-broken
-/// X button). We only change properties on a foreign window — safe, unlike
-/// rendering into one (which crashes on XWayland). Best-effort: retries while
-/// the window comes up, then gives up.
-fn rename_gl_window(title: String) {
-    std::thread::spawn(move || {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, PropMode};
-        use x11rb::wrapper::ConnectionExt as _;
-
-        let Ok((conn, screen)) = x11rb::connect(None) else { return };
-        let root = conn.setup().roots[screen].root;
-
-        fn wm_name(conn: &impl x11rb::connection::Connection, win: u32) -> Option<String> {
-            let r = conn
-                .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)
-                .ok()?
-                .reply()
-                .ok()?;
-            if r.value.is_empty() {
-                return None;
-            }
-            Some(String::from_utf8_lossy(&r.value).to_string())
-        }
-        fn find(conn: &impl x11rb::connection::Connection, win: u32, target: &str) -> Option<u32> {
-            if wm_name(conn, win).as_deref() == Some(target) {
-                return Some(win);
-            }
-            let tree = conn.query_tree(win).ok()?.reply().ok()?;
-            for child in tree.children {
-                if let Some(w) = find(conn, child, target) {
-                    return Some(w);
-                }
-            }
-            None
-        }
-
-        for _ in 0..30 {
-            std::thread::sleep(Duration::from_millis(100));
-            let Some(win) = find(&conn, root, "OpenGL renderer") else { continue };
-            // Strip the server-side title bar + close button. Under fractional
-            // display scaling the WM's X-button hit-target is misplaced — the
-            // user had to click it 8-9× to land it — so we drop the decoration
-            // entirely; the mirror is closed from the app's "Stop sharing"
-            // button. _MOTIF_WM_HINTS: flags=DECORATIONS(2), decorations=0(none);
-            // Mutter applies it live. The window stays movable (Super+drag).
-            if let Some(motif) = conn
-                .intern_atom(false, b"_MOTIF_WM_HINTS")
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|r| r.atom)
-            {
-                let _ = conn.change_property32(
-                    PropMode::REPLACE, win, motif, motif, &[2u32, 0, 0, 0, 0],
-                );
-            }
-            let _ = conn.change_property8(
-                PropMode::REPLACE,
-                win,
-                AtomEnum::WM_NAME,
-                AtomEnum::STRING,
-                title.as_bytes(),
-            );
-            let net = conn.intern_atom(false, b"_NET_WM_NAME").ok().and_then(|c| c.reply().ok());
-            let utf8 = conn.intern_atom(false, b"UTF8_STRING").ok().and_then(|c| c.reply().ok());
-            if let (Some(net), Some(utf8)) = (net, utf8) {
-                let _ = conn.change_property8(
-                    PropMode::REPLACE,
-                    win,
-                    net.atom,
-                    utf8.atom,
-                    title.as_bytes(),
-                );
-            }
-            let _ = conn.flush();
-            return;
-        }
-    });
-}
-
 /// Build + start the GStreamer pipeline; returns `(pipeline, appsrc)`. A bus
 /// thread tears the pipeline down on EOS/Error (and treats the user closing the
 /// window as a clean stop).
@@ -691,13 +693,14 @@ fn spawn_gstreamer_player(
     vw: u32,
     vh: u32,
 ) -> Result<(gst::Pipeline, gst_app::AppSrc), String> {
-    // Force GL windowing onto X11/GLX even on a Wayland session (XWayland).
-    std::env::set_var("GST_GL_WINDOW", "x11");
-    std::env::set_var("GST_GL_API", "opengl");
     gst::init().map_err(|e| format!("gst init: {e}"))?;
 
-    let (disp_w, disp_h) = fit_display_size(app, vw, vh);
-    tracing::info!(vw, vh, disp_w, disp_h, "mirror: display window fit");
+    // Decode at the source size and let XVideo do the one scale into the window.
+    // The pipeline used to rescale to the window size first, so every frame was
+    // resampled twice — pure waste, and it cost sharpness whenever the window
+    // was smaller than the stream.
+    let (disp_w, disp_h) = (vw, vh);
+    tracing::info!(vw, vh, "mirror: decoding at source size, XVideo scales to fit");
     let pipeline_str = pipeline_string_for_backend(backend, disp_w, disp_h);
     let element = gst::parse::launch(&pipeline_str).map_err(|e| format!("gst parse: {e}"))?;
     let pipeline = element
@@ -714,16 +717,12 @@ fn spawn_gstreamer_player(
     appsrc.set_format(gst::Format::Time);
     appsrc.set_max_bytes(4 * 1024 * 1024);
 
-    // Wire laptop→phone input: mouse/keyboard in this window → sealed packets.
-    attach_input_probe(&pipeline, disp_w, disp_h);
+    attach_cadence_probe(&pipeline);
 
-    // Retitle the GL window from "OpenGL renderer" to the phone's name.
-    let title = MIRROR_TITLE
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_else(|| "Phone".to_string());
-    rename_gl_window(title);
+    // Put the sink's widget in our window, which is still showing the logo.
+    // Done while the pipeline is below Playing: a gtk sink whose widget has no
+    // parent when it starts makes a toplevel of its own.
+    crate::mirror_window::attach_video(pipeline.clone());
 
     let bus = pipeline.bus().ok_or_else(|| "gst bus unavailable".to_string())?;
     let app_bus = app.clone();
@@ -791,10 +790,36 @@ fn start_player(
         tracing::info!("mirror: GStreamer pipeline Playing — window should open");
         let _ = app.emit("mirror-player", serde_json::json!({ "message": "mirror window opening" }));
         let mut first = true;
+        // Arrival-rate tracking for the pacing grid. Measured HERE, before the
+        // pipeline, because this is the phone's true delivery rate — after
+        // `videorate` every frame is on the grid by definition, so measuring
+        // there would only ever confirm the grid to itself.
+        let mut window_start = std::time::Instant::now();
+        let mut window_frames = 0u32;
+        let mut grid = 30i32;
+        let mut rates: Vec<f64> = Vec::new();
         while let Some(au) = au_rx.recv().await {
             if first {
                 first = false;
                 tracing::info!(bytes = au.len(), "mirror: first AU → appsrc");
+                // There is a picture now — crossfade the window off the logo.
+                crate::mirror_window::show_video();
+                window_start = std::time::Instant::now();
+            }
+            window_frames += 1;
+            let elapsed = window_start.elapsed().as_secs_f64();
+            if elapsed >= 4.0 {
+                let rate = window_frames as f64 / elapsed;
+                window_frames = 0;
+                window_start = std::time::Instant::now();
+                rates.push(rate);
+                if rates.len() > PACE_RAISE_WINDOWS {
+                    rates.remove(0);
+                }
+                if let Some(want) = next_pace_grid(grid, &rates) {
+                    grid = want;
+                    set_pace_grid(&pipeline, grid);
+                }
             }
             let mut buffer = match gst::Buffer::with_size(au.len()) {
                 Ok(b) => b,
@@ -856,7 +881,12 @@ pub async fn spawn_mirror(
     // needed (the laptop is the connecting side; its firewall allows that).
     let key = mirror_udp::derive_media_key(&handle.handshake_hash);
     let (au_tx, au_rx) = mpsc::channel::<Vec<u8>>(8);
-    tokio::spawn(mirror_tcp::run_tcp_video_receiver(phone_addr.ip(), key, au_tx));
+    tokio::spawn(mirror_tcp::run_tcp_video_receiver(
+        phone_addr.ip(),
+        key,
+        au_tx,
+        Some(handle.keyframe_tx.clone()),
+    ));
 
     let backend = detect_decoder_backend();
     start_player(app, backend, width, height, au_rx);
@@ -892,9 +922,9 @@ pub async fn stop_mirror() {
     }
     POINTER_DOWN.store(false, Ordering::Relaxed);
     SCROLL_ACTIVE.store(false, Ordering::Relaxed);
-    // Close the native window + decoder now (a UI "Stop sharing" must work even
-    // when the window's X button is dead under fractional scaling).
+    // Decoder first, then the window it renders into.
     stop_pipeline();
+    crate::mirror_window::close();
     let handle = MIRROR_HANDLE.lock().ok().and_then(|mut g| g.take());
     if let Some(h) = handle {
         h.stop().await;
@@ -913,6 +943,19 @@ pub async fn stop_mirror() {
 /// that answered TCP, we force one fresh rediscovery and retry before giving
 /// up, emitting a `mirror-player` message either way so the UI never fails
 /// silently.
+/// The frame rate to ask the phone for: its own panel's refresh rate, since a
+/// capture cannot carry frames the display never draws. Asking for more wastes
+/// encoder budget on frames that will not exist; asking for a fixed 60 caps a
+/// 120 Hz phone at half its panel. Falls back to the caller's number when the
+/// phone has not reported one (older build), and never exceeds 120 — beyond
+/// that the encoder and the link cost more than the eye gets back.
+fn requested_fps(fallback: u32) -> u32 {
+    match crate::lan::PEER_DISPLAY_HZ.load(Ordering::Relaxed) {
+        0 => fallback,
+        hz => hz.min(120),
+    }
+}
+
 pub(crate) async fn handle_start_cmd(
     ctx: &crate::worker_ctx::WorkerCtx,
     width: u32,
@@ -920,6 +963,8 @@ pub(crate) async fn handle_start_cmd(
     fps: u32,
     bitrate: u32,
 ) {
+    let fps = requested_fps(fps);
+    tracing::info!(fps, "mirror: frame rate requested from the phone");
     // Tear down any prior session first so repeated clicks don't stack up
     // receivers / leave a half-open phone server.
     stop_mirror().await;
@@ -928,9 +973,16 @@ pub(crate) async fn handle_start_cmd(
         tracing::warn!("start mirror: no trusted peer");
         return;
     };
+    let title = peer.peer_name.clone().unwrap_or_else(|| "Phone".to_string());
     if let Ok(mut g) = MIRROR_TITLE.lock() {
-        *g = Some(peer.peer_name.clone().unwrap_or_else(|| "Phone".to_string()));
+        *g = Some(title.clone());
     }
+    // Put the window up NOW, showing the logo and a spinner. Resolving the
+    // phone's address and running the handshake takes a second or two, and
+    // until this the click produced nothing visible at all. Sized with the same
+    // fit as the video, so nothing jumps when the picture arrives.
+    let (win_w, win_h) = window_size(&ctx.app, width, height);
+    crate::mirror_window::open(title, width, height, win_w as i32, win_h as i32);
     let counter = ctx.peer_store.load_counter(&peer.peer_static_pub).unwrap_or(0);
     let app_c = ctx.app.clone();
     let identity_c = ctx.identity.clone();
@@ -976,6 +1028,11 @@ pub(crate) async fn handle_start_cmd(
             Some(e) => format!("mirror failed: {e}"),
             None => "phone not reachable on LAN".to_string(),
         };
+        // Take the window down with the attempt. It was opened optimistically
+        // at click time, and nothing else closes it on this path — so a failed
+        // start used to leave a window spinning on "Connecting…" forever, which
+        // reads exactly like a mirror that froze.
+        crate::mirror_window::close();
         tracing::warn!("start mirror: {msg}");
         let _ = app_c.emit("mirror-player", serde_json::json!({ "message": msg }));
     });

@@ -176,6 +176,12 @@ data class AppState(
      *  stale DHCP lease — crucially it also rides BLE, when the phone answers
      *  no mDNS at all (multicast lock released). null = Wi-Fi down. */
     val wifiIp: String? = null,
+    /** This device's display refresh rate in Hz, rounded. The laptop asks for a
+     *  mirror frame rate capped by this: a capture can never carry more frames
+     *  per second than the panel produces, so a fixed request either wastes a
+     *  120 Hz panel or asks a 60 Hz one for frames it will never make.
+     *  null = unknown (older build, or no display). */
+    val displayHz: Int? = null,
     val ts: Long = System.currentTimeMillis() / 1000L,
 ) {
     fun toJsonBytes(): ByteArray {
@@ -245,6 +251,7 @@ data class AppState(
             obj.put("camera_offer", c)
         }
         wifiIp?.takeIf { it.isNotBlank() }?.let { obj.put("wifi_ip", it) }
+        displayHz?.takeIf { it > 0 }?.let { obj.put("display_hz", it) }
         obj.put("ts", ts)
         return obj.toString().toByteArray(Charsets.UTF_8)
     }
@@ -345,6 +352,7 @@ data class AppState(
                 cameraReq = obj.optBoolean("camera_req", false),
                 ringSeq = obj.optLong("ring_seq", 0L),
                 wifiIp = obj.optString("wifi_ip", "").takeIf { it.isNotBlank() },
+                displayHz = obj.optInt("display_hz", 0).takeIf { it > 0 },
                 cameraFacing = obj.optString("camera_facing", ""),
                 cameraOffer = obj.optJSONObject("camera_offer")?.let { c ->
                     val port = c.optInt("port", 0)

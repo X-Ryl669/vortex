@@ -82,7 +82,23 @@ pub(crate) fn load_last_peer_ip() {
 /// the only live link — the phone answers no mDNS then (multicast lock
 /// released), so without this hint a stale lease left mirror/cast/camera
 /// dialing a dead address with no way to rediscover.
+/// The phone's display refresh rate, as last reported in its AppState. `0` =
+/// never reported (an older build), where the mirror falls back to its own
+/// conservative default.
+pub(crate) static PEER_DISPLAY_HZ: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 pub(crate) fn note_peer_reported_ip(state: &AppState) {
+    // Same push carries the panel's refresh rate; keep it for the mirror's
+    // frame-rate request. Sanity-bounded: a nonsense value from a strange ROM
+    // must not have us asking an encoder for a thousand frames a second.
+    if let Some(hz) = state.display_hz {
+        if (20..=240).contains(&hz)
+            && crate::lan::PEER_DISPLAY_HZ.swap(hz, std::sync::atomic::Ordering::Relaxed) != hz
+        {
+            tracing::info!(hz, "peer reports its display refresh rate (mirror fps ceiling)");
+        }
+    }
     let Some(s) = state.wifi_ip.as_deref() else { return };
     let Ok(ip) = s.parse::<std::net::IpAddr>() else { return };
     if ip.is_loopback() || ip.is_unspecified() {
@@ -100,11 +116,26 @@ pub(crate) fn note_peer_reported_ip(state: &AppState) {
 /// TCP but wasn't (or no longer was) our phone.
 pub(crate) async fn resolve_peer_addr(fresh: bool) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, SocketAddr};
+    /// Probe with RETRIES, unlike the heartbeat's single 2 s attempt. A phone
+    /// whose Wi-Fi radio is dozing takes longer than that to answer a cold
+    /// connect, and the heartbeat gets away with it because it ticks again in a
+    /// few seconds. This path does not: someone pressed a button, and one
+    /// unlucky probe turned into "phone not reachable on LAN" while the very
+    /// same phone accepted a heartbeat connection twenty seconds later.
     async fn probe(sa: SocketAddr) -> bool {
-        matches!(
-            tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(sa)).await,
-            Ok(Ok(_))
-        )
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(sa))
+                    .await,
+                Ok(Ok(_))
+            ) {
+                return true;
+            }
+        }
+        false
     }
     if wd_active() {
         return Some(SocketAddr::new(IpAddr::from(WIFI_DIRECT_GO_IP), LAN_DEFAULT_PORT));
@@ -142,6 +173,21 @@ pub(crate) async fn resolve_peer_addr(fresh: bool) -> Option<std::net::SocketAdd
         let sa = SocketAddr::new(IpAddr::V4(g), LAN_DEFAULT_PORT);
         if probe(sa).await {
             return Some(sa);
+        }
+    }
+    // Last resort: the cached IP again. mDNS goes quiet whenever the phone
+    // holds no multicast lock (which is most of the time while BLE carries the
+    // link), so a cache primed by the phone's own `wifi_ip` push is often the
+    // only truth there is — worth one more try before telling the user their
+    // phone is unreachable.
+    if !fresh {
+        let cached = *LAST_GOOD_PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ip) = cached {
+            let sa = SocketAddr::new(ip, LAN_DEFAULT_PORT);
+            if probe(sa).await {
+                tracing::info!(%ip, "cached peer IP answered on the second pass");
+                return Some(sa);
+            }
         }
     }
     None

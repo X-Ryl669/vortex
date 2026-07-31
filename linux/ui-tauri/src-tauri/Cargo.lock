@@ -5263,7 +5263,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vortex-l3-daemon"
-version = "1.0.0-beta.4"
+version = "1.0.0-beta.5"
 dependencies = [
  "bluer",
  "chacha20poly1305",
@@ -5290,7 +5290,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-ui-tauri"
-version = "1.0.0-beta.4"
+version = "1.0.0-beta.5"
 dependencies = [
  "arboard",
  "ashpd",
@@ -5298,6 +5298,7 @@ dependencies = [
  "futures",
  "gstreamer",
  "gstreamer-app",
+ "gtk",
  "hex",
  "image",
  "rand",

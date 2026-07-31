@@ -246,6 +246,9 @@ pub fn start(phone_ip: IpAddr, key: [u8; 32], rot: u16) -> Result<(), String> {
         mirror_tcp::CAMERA_VIDEO_PORT,
         key,
         au_tx,
+        // The webcam path has no control plane to ask for an IDR on; a dropped
+        // frame simply resolves at the next scheduled keyframe.
+        None,
     ));
 
     pipeline

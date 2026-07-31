@@ -48,6 +48,7 @@ mod live_activity;
 mod media_remote;
 mod mirror;
 mod mirror_inject;
+mod mirror_window;
 mod notes;
 mod notifications;
 mod pairing;
@@ -216,6 +217,30 @@ pub fn run() {
                 }
             } else if argv.iter().any(|a| a == "--clipboard") {
                 clipboard_window::show_clipboard_window(app);
+            } else if argv.iter().any(|a| a == "--mirror") {
+                // Same request the home screen's "Share screen" button makes.
+                // Having it on the command line means the mirror can be driven
+                // from a script or a shortcut without opening the window — and
+                // it is the only way to exercise the whole path unattended.
+                if let Some(ch) = app.try_state::<ipc::CmdChannel>() {
+                    let _ = ch.0.send(ipc::UiCmd::StartMirror {
+                        width: 720,
+                        height: 1560,
+                        fps: 60,
+                        bitrate: 10_000_000,
+                    });
+                }
+            } else if argv.iter().any(|a| a == "--camera") {
+                // Continuity camera on/off, the same request the "use phone as
+                // webcam" toggle makes. Same reason as `--mirror`: it is the
+                // only way to exercise the path without a hand on the UI.
+                camera::set_camera_request(true);
+            } else if argv.iter().any(|a| a == "--camera-stop") {
+                camera::set_camera_request(false);
+            } else if argv.iter().any(|a| a == "--mirror-stop") {
+                if let Some(ch) = app.try_state::<ipc::CmdChannel>() {
+                    let _ = ch.0.send(ipc::UiCmd::StopMirror);
+                }
             } else if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();

@@ -90,7 +90,25 @@ internal fun VortexStack.buildLocalAppState(): com.vortex.a3.core.appstate.AppSt
         // Our LIVE Wi-Fi IP (re-read on every build, never cached) so the
         // laptop's peer-IP cache tracks DHCP renews even over BLE-only.
         wifiIp = currentWifiIp(),
+        // The panel's refresh rate — the ceiling for any mirror frame rate,
+        // since a capture cannot produce frames the display never draws.
+        displayHz = currentDisplayHz(ctx),
     )
+}
+
+/** This phone's display refresh rate in Hz, rounded. Read per build rather than
+ *  cached: a phone with an adaptive panel reports whatever mode it is in right
+ *  now, and the mirror should track that rather than a number from boot.
+ *  null when the display manager has nothing to say. */
+private fun currentDisplayHz(ctx: android.content.Context): Int? = try {
+    val dm = ctx.getSystemService(android.content.Context.DISPLAY_SERVICE)
+        as? android.hardware.display.DisplayManager
+    dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+        ?.refreshRate
+        ?.takeIf { it > 1f }
+        ?.let { Math.round(it) }
+} catch (_: Throwable) {
+    null
 }
 
 /** This phone's current Wi-Fi IPv4, read live from the interface list — or

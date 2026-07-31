@@ -12,7 +12,6 @@ import {
   Headphones,
   Video,
   MonitorUp,
-  MonitorX,
   Loader2,
   Plus,
   BellRing,
@@ -33,7 +32,6 @@ import {
   primaryPeer,
   primaryPeerState,
   startMirror,
-  stopMirror,
 } from "@/composables/useHome";
 
 const { t } = useI18n();
@@ -164,17 +162,16 @@ const earbudsStatus = computed(() => {
         </div>
         <!-- mt gives the absolute "Experimental" corner badges headroom above -->
         <div v-if="phoneOnline" class="mt-1.5 flex flex-wrap items-center gap-3">
-          <!-- Toggle: while a mirror is live this becomes a reliable "Stop
-               sharing" (the native window's X is dead under fractional scaling). -->
+          <!-- Always "Share screen", never a stop toggle: the mirror window now
+               carries its own close button, and it tears the whole session down.
+               This used to flip to "Stop sharing" because the old native window
+               had no working X of its own. -->
           <button
-            v-if="mirrorActive"
-            class="vx-chip vx-chip--live relative"
-            @click="stopMirror"
+            class="vx-chip relative"
+            :class="{ 'vx-chip--live': mirrorActive }"
+            :disabled="mirrorStarting"
+            @click="startMirror"
           >
-            <MonitorX class="h-3.5 w-3.5" />
-            {{ t("mirror.stop_share") }}
-          </button>
-          <button v-else class="vx-chip relative" :disabled="mirrorStarting" @click="startMirror">
             <Loader2 v-if="mirrorStarting" class="h-3.5 w-3.5 animate-spin" />
             <MonitorUp v-else class="h-3.5 w-3.5" />
             {{ t("mirror.share_screen") }}

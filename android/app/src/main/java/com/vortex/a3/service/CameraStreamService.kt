@@ -63,6 +63,15 @@ class CameraStreamService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Promote FIRST, before any decision that might bail out. The laptop
+        // starts us with startForegroundService(), and Android then requires a
+        // startForeground() within a few seconds no matter what we decide —
+        // every early return below used to skip it, so a missing CAMERA
+        // permission did not merely refuse the stream, it killed the whole app
+        // with RemoteServiceException. Posting the notice costs nothing on the
+        // paths that go on to stream, and `stopSelf()` takes it down again on
+        // the ones that do not.
+        startForegroundNotice()
         if (intent?.action == ACTION_STOP) {
             stopSelf()
             return START_NOT_STICKY
@@ -105,7 +114,6 @@ class CameraStreamService : Service() {
             return START_NOT_STICKY
         }
         wantFront = intent?.getStringExtra(EXTRA_FACING) == "front"
-        startForegroundNotice()
         running = true
         sealer = com.vortex.a3.core.mirror.MirrorTcpSealer(key)
         workerHandler.post { startCamera() }

@@ -181,13 +181,12 @@ async function ensureMirrorListener() {
   mirrorListenerSet = true;
   const { onMirrorPlayer } = await import("@/lib/bridge");
   await onMirrorPlayer((msg) => {
-    if (msg.includes("opening")) mirrorActive.value = true;
-    else if (
-      msg.includes("closed") || msg.includes("EOS") ||
-      msg.includes("error") || msg.includes("failed")
-    ) {
-      mirrorActive.value = false;
-    }
+    // "opening" is the ONE message that means live; everything else the
+    // backend sends is an ending of some kind. Matching stop-words instead
+    // left the button stuck green whenever a message did not happen to
+    // contain one — "mirror stopped" (what closing the window's X emits) and
+    // "phone not reachable on LAN" both slipped through.
+    mirrorActive.value = msg.includes("opening");
   });
 }
 
@@ -207,24 +206,15 @@ export async function startMirror() {
   mirrorStarting.value = true;
   const cfg = { width: 720, height: 1560, fps: 60, bitrate: 10_000_000, transport: "wifi" };
   try {
-    // The phone scales its VirtualDisplay to these dims. 1080-wide (native-ish
-    // for the phone) over HEVC: the codec is ~40% more efficient than H.264, so
-    // 1080p stays crisp without flooding the link. Bitrate here is the CEILING:
-    // the phone runs adaptive bitrate (congestion control) and flexes between
-    // ~0.8 Mbps and this value based on the live Wi-Fi link, so quality drops
-    // instead of the stream freezing. 8 Mbps HEVC@1080p ≈ 13 Mbps H.264 quality
-    // but fits a normal Wi-Fi link with headroom. 30 fps: empirically the
-    // smoothest here. 60 fps (+ a hard encoder-input cap) made the phone produce
-    // frames unevenly and added multi-second stalls, so we keep the known-good
-    // 30 fps. Bitrate is the adaptive-bitrate ceiling.
-    // 720-wide (1.1 MP vs 2.5 MP at 1080p): the phone's HEVC encoder sustains a
-    // steady 30 fps here even during full-screen motion (scrolling), where 1080p
-    // dropped to ~15 fps and stuttered. Still crisp over 8 Mbps. (Adaptive
-    // 720↔1080 by motion is a planned follow-up.)
-    // 720p @ 60 fps. The phone bursts 31-69 fps during motion (plenty of real
-    // frames), and the laptop's `videorate` paces them to a STEADY 60 fps —
-    // dropping the burst excess and repeating the last frame across gaps — so
-    // there are no drops and no freezes. Bumped bitrate feeds the higher rate.
+    // Ask the phone for its best and let the laptop deal with what arrives.
+    // A fixed request is wrong in both directions: measured on this device
+    // (Redmi 9, Helio G80) scrcpy itself only sustains 29-40 fps at a QUARTER of
+    // these pixels, so 60 is not what comes back here — but pinning the request
+    // to 30 would also cap a phone that could do more. The evenness that used to
+    // be missing is now the receiver's job: it measures the real delivery rate
+    // and paces the picture onto a matching grid (see `mirror::pace_grid_for`).
+    // Bitrate is the CEILING: the phone runs adaptive bitrate underneath it, so
+    // quality dips on a weak link instead of the stream freezing.
     await invoke("start_screen_mirror", cfg);
   } catch (e) {
     console.warn("startMirror failed", e);

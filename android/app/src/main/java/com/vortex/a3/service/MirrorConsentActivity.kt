@@ -22,6 +22,15 @@ class MirrorConsentActivity : Activity() {
         super.onCreate(savedInstanceState)
         // We're launching the consent now — drop the full-screen request notif.
         com.vortex.a3.core.mirror.MirrorRequestNotification.clear(this)
+        // Only ask on a FRESH create. A recreated activity — which is what
+        // happens when the system rebuilds this transparent shell around the
+        // system dialog — would otherwise fire a second capture request, and
+        // the user would tap "Start now" only to be asked again. Two or three
+        // prompts per mirror was this, not the laptop sending duplicates: the
+        // laptop opens exactly one session and sends exactly one START.
+        if (savedInstanceState != null) {
+            return
+        }
         try {
             val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             @Suppress("DEPRECATION")

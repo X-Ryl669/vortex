@@ -29,6 +29,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
@@ -75,6 +76,10 @@ class ScreenMirrorService : Service() {
     private var tcpSealer: com.vortex.a3.core.mirror.MirrorTcpSealer? = null
     @Volatile private var clientConnected = false
     private val writeLock = Any()
+
+    /** `System.nanoTime()` at which the in-flight socket write started, 0 when
+     *  none is. Read by the watchdog from another thread. */
+    @Volatile private var writeStartedNs = 0L
 
     private var encoderJob: Job? = null
 
@@ -307,6 +312,7 @@ class ScreenMirrorService : Service() {
                 videoClient = client
                 videoOut = java.io.BufferedOutputStream(client.getOutputStream(), VIDEO_SEND_BUFFER)
                 clientConnected = true
+                startWriteWatchdog()
                 Log.i(TAG, "mirror: laptop video client connected ${client.inetAddress?.hostAddress}")
                 // Push SPS/PPS + an immediate IDR so the decoder locks on at once.
                 codecConfigAnnexB?.let { runCatching { writeFrame(it) } }
@@ -339,14 +345,38 @@ class ScreenMirrorService : Service() {
             // when the link is saturated, so the blocked duration is our
             // congestion signal for adaptive bitrate.
             val t0 = System.nanoTime()
+            writeStartedNs = t0
             out.write(sealed)
             out.flush()
+            writeStartedNs = 0L
             val now = System.nanoTime()
             adaptBlockedNs += now - t0
             maybeAdaptBitrate(now)
         } catch (e: Exception) {
+            writeStartedNs = 0L
             Log.w(TAG, "mirror: video write failed: ${e.message}")
             running = false
+        }
+    }
+
+    /** Java sockets have no write timeout, so a laptop that stops draining
+     *  leaves the sender parked in sendto() forever — the session never ends,
+     *  it just freezes, and any teardown that touches the stream deadlocks
+     *  behind it. This watchdog turns that into a clean disconnect: if one
+     *  write has been in flight longer than [WRITE_STALL_LIMIT_NS], close the
+     *  raw socket, which makes the blocked write throw. Adaptive bitrate still
+     *  owns the ordinary case (short blocks = congestion); this only catches
+     *  the pathological one. */
+    private fun startWriteWatchdog() = scope.launch(Dispatchers.IO) {
+        while (isActive && running) {
+            delay(1_000)
+            val started = writeStartedNs
+            if (started != 0L && System.nanoTime() - started > WRITE_STALL_LIMIT_NS) {
+                Log.w(TAG, "mirror: laptop stopped draining video — dropping the session")
+                running = false
+                try { videoClient?.close() } catch (_: Throwable) {}
+                return@launch
+            }
         }
     }
 
@@ -401,7 +431,16 @@ class ScreenMirrorService : Service() {
         try { projection?.stop() } catch (_: Throwable) {}
         projection = null
         clientConnected = false
-        try { videoOut?.close() } catch (_: Throwable) {}
+        // Drop the buffered stream WITHOUT closing it, and close the raw socket
+        // first. Closing the wrapper would flush, and flush takes the stream's
+        // monitor — which the sender coroutine holds for as long as it sits in
+        // sendto(). When the laptop stops draining the socket that is forever,
+        // so tearing down here parked the MAIN thread and Android killed us
+        // with "Vortex isn't responding" (ANR: onDestroy → FilterOutputStream
+        // .close → BufferedOutputStream.flush, blocked on the send thread).
+        // Socket.close() makes that blocked write throw instead, and the
+        // buffered wrapper owns no OS resource of its own, so letting it go is
+        // enough.
         videoOut = null
         try { videoClient?.close() } catch (_: Throwable) {}
         videoClient = null
@@ -515,6 +554,11 @@ class ScreenMirrorService : Service() {
         private const val ADAPT_BLOCKED_LO = 0.05         // <5% blocked → headroom
         private const val ADAPT_DOWN = 0.75               // back off fast on congestion
         private const val ADAPT_UP = 1.12                 // ramp up gently
+
+        /** One socket write stuck this long means the laptop is not draining at
+         *  all — congestion never looks like this, and no adaptive bitrate can
+         *  fix it. Long enough that a bad Wi-Fi moment is not mistaken for it. */
+        private const val WRITE_STALL_LIMIT_NS = 6_000_000_000L
 
         const val ACTION_START = "com.vortex.a3.action.MIRROR_START"
         const val ACTION_STOP = "com.vortex.a3.action.MIRROR_STOP"

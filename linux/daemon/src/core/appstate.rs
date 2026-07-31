@@ -315,6 +315,14 @@ pub struct AppState {
     /// `None` when the sender has no Wi-Fi up (or is an old build).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wifi_ip: Option<String>,
+    /// The sender's display refresh rate in Hz, rounded. A screen mirror can
+    /// never carry more frames per second than the panel it is capturing
+    /// produces, so this is the only honest ceiling for the frame rate the
+    /// receiver asks for — hardcoding one caps a 120 Hz phone at 60 and asks a
+    /// 60 Hz phone for frames it will never make. `None` on an older build,
+    /// where the receiver falls back to its own conservative default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_hz: Option<u32>,
     /// Sender's local unix timestamp (seconds). The receiver uses this
     /// only as a freshness hint for the UI — clock skew between sides
     /// is fine because security is rooted in the Noise handshake.
@@ -416,6 +424,7 @@ impl AppState {
             camera_offer: None,       // laptop never offers a camera
             ring_seq: 0,              // bumped by the UI's "Ring my phone" tap
             wifi_ip: None,            // phone→laptop only (cached-peer-IP hint)
+            display_hz: None,         // phone→laptop only (mirror frame-rate ceiling)
             ts,
         }
     }
@@ -587,11 +596,13 @@ mod tests {
             camera_offer: None,
             ring_seq: 0,
             wifi_ip: Some("192.168.1.42".into()),
+            display_hz: Some(120),
             ts: 1_700_000_000,
         };
         let json = serde_json::to_vec(&a).unwrap();
         let b: AppState = serde_json::from_slice(&json).unwrap();
         assert_eq!(a.wifi_ip, b.wifi_ip);
+        assert_eq!(a.display_hz, b.display_hz);
         assert_eq!(a.battery, b.battery);
         assert_eq!(a.class, b.class);
         assert_eq!(a.name, b.name);

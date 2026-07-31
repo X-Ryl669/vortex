@@ -4,7 +4,7 @@ members = []
 
 [package]
 name = "vortex-ui-tauri"
-version = "1.0.0-beta.4"
+version = "1.0.0-beta.5"
 license = "GPL-3.0-or-later"
 description = "Vortex Tauri UI"
 edition = "2021"
@@ -52,6 +52,11 @@ image = { version = "0.25.6", default-features = false, features = ["png", "ico"
 # into a native window. Links against the system GStreamer (1.20+).
 gstreamer = "0.23"
 gstreamer-app = "0.23"
+# The mirror window is ours, not the sink's: a GTK3 window with a header bar and
+# a real close button (a WM-drawn one is mis-hit-tested under fractional
+# scaling), hosting gtksink's widget. 0.18 is the version Tauri already links for
+# its own GTK3 shell — keeping them equal is what makes the types match.
+gtk = "0.18"
 # Laptop→phone screen cast (sender): capture the laptop screen via the
 # xdg-desktop-portal ScreenCast portal (Wayland). tokio backend to match our runtime.
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }

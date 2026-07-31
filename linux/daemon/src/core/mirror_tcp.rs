@@ -62,8 +62,9 @@ pub async fn run_tcp_video_receiver(
     phone_ip: IpAddr,
     key: [u8; 32],
     au_tx: mpsc::Sender<Vec<u8>>,
+    keyframe_tx: Option<mpsc::Sender<()>>,
 ) {
-    run_tcp_video_receiver_on(phone_ip, VIDEO_PORT, key, au_tx).await;
+    run_tcp_video_receiver_on(phone_ip, VIDEO_PORT, key, au_tx, keyframe_tx).await;
 }
 
 /// Connect to the phone's video server on `port` (retrying — it only opens
@@ -75,6 +76,7 @@ pub async fn run_tcp_video_receiver_on(
     port: u16,
     key: [u8; 32],
     au_tx: mpsc::Sender<Vec<u8>>,
+    keyframe_tx: Option<mpsc::Sender<()>>,
 ) {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let addr = SocketAddr::new(phone_ip, port);
@@ -105,6 +107,7 @@ pub async fn run_tcp_video_receiver_on(
 
     let mut len_buf = [0u8; 4];
     let mut aus: u64 = 0;
+    let mut dropped: u64 = 0;
     loop {
         if let Err(e) = stream.read_exact(&mut len_buf).await {
             tracing::info!("mirror tcp: video stream ended ({e})");
@@ -139,9 +142,29 @@ pub async fn run_tcp_video_receiver_on(
         if aus % 120 == 0 {
             tracing::info!(aus, "mirror tcp: streaming");
         }
-        if au_tx.send(au).await.is_err() {
-            tracing::warn!("mirror tcp: AU consumer gone — stopping");
-            break;
+        // NEVER await room here. This loop is the only thing draining the
+        // socket, so blocking on a full channel stops reading, the phone's
+        // send buffer fills, and its encoder thread parks in sendto() — which
+        // is how a laptop-side display hiccup turned into a frozen phone and
+        // an ANR when the service was torn down. A live mirror would rather
+        // lose a frame than stall the sender: drop, and ask for an IDR so the
+        // decoder resyncs at once instead of showing garbage until the next
+        // scheduled keyframe.
+        match au_tx.try_send(au) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("mirror tcp: AU consumer gone — stopping");
+                break;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                dropped += 1;
+                if dropped % 30 == 1 {
+                    tracing::warn!(dropped, "mirror tcp: decoder behind — dropping frames");
+                }
+                if let Some(kf) = keyframe_tx.as_ref() {
+                    let _ = kf.try_send(()); // rate-limited on the writer side
+                }
+            }
         }
     }
     tracing::info!(aus, "mirror tcp: video receiver ended");
