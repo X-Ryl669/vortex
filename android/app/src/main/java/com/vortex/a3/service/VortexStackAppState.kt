@@ -249,6 +249,7 @@ internal fun VortexStack.handlePeerAppState(peerPub: ByteArray, state: com.vorte
         title = state.mediaTitle.orEmpty(),
         artist = state.mediaArtist.orEmpty(),
         app = state.mediaApp.orEmpty(),
+        artUrl = state.mediaArtUrl.orEmpty(),
         playing = state.mediaNpPlaying,
     )
 }

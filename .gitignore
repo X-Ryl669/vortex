@@ -69,6 +69,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+# pnpm-lock.yaml is the COMMITTED lockfile. install_linux.sh falls back to
+# `npm install` when pnpm is missing, which drops a package-lock.json beside
+# it — two lockfiles that drift apart and resolve differently. Keep it out.
+package-lock.json
 .pnpm-store/
 
 # ===== Tauri =====

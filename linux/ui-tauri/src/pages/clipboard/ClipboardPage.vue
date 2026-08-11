@@ -40,8 +40,11 @@ interface ClipEntry {
 // height (2-line clamp; the full text is in the preview pane) and image rows
 // a taller one for the thumbnail. Deterministic per kind ⇒ virtualisation
 // stays exact (no DOM measuring, no scroll drift).
-const TEXT_ROW_H = 44;
-const IMG_ROW_H = 56;
+// Sized for a macOS-launcher feel: the panel is now a share of the monitor
+// (Rust picks the height), so rows can breathe instead of packing a fixed
+// 600px window as tightly as possible.
+const TEXT_ROW_H = 52;
+const IMG_ROW_H = 76;
 function rowH(e: ClipEntry | undefined): number {
   return e?.kind === "image" ? IMG_ROW_H : TEXT_ROW_H;
 }
@@ -269,18 +272,30 @@ async function rearm() {
   selected.value = 0;
   filter.value = "";
   resetScroll();
-  // Capture whatever's on the clipboard RIGHT NOW with a fresh connection —
-  // the background watcher's X connection can go stale, so a just-copied
-  // item otherwise only showed after an app restart. This makes the current
-  // clipboard always present the moment the popup opens.
-  await invoke("clipboard_capture_now").catch(() => {});
+  // Paint the stored history FIRST so the panel is usable immediately.
   await refresh();
   selected.value = 0;
   await syncPreview();
   await nextTick();
   resetScroll();
+  focusSearch();
+  // Only THEN capture whatever's on the clipboard right now, with a fresh
+  // connection — the background watcher's X connection can go stale, so a
+  // just-copied item otherwise only showed after an app restart. It emits
+  // `vortex:clipboard` when it finds something new, which refreshes us; it
+  // used to be awaited BEFORE the first paint, putting a blocking arboard
+  // round-trip in front of every open.
+  void invoke("clipboard_capture_now").catch(() => {});
+}
+
+// The caret is a two-part problem: the DOM element must take focus AND the
+// WINDOW must hold the keyboard (forced from X in Rust, which can land after
+// these calls). Retry a few times, and again whenever the window is focused,
+// so the search box is never left dead.
+function focusSearch() {
   inputEl.value?.focus();
   setTimeout(() => inputEl.value?.focus(), 70);
+  setTimeout(() => inputEl.value?.focus(), 220);
 }
 
 // Single keyboard source at the WINDOW level (not on the input) so the
@@ -330,12 +345,14 @@ onMounted(async () => {
   // Keyboard at the window level — single source, any focus. Blur-to-close
   // is handled in Rust (reliable on Wayland).
   window.addEventListener("keydown", onKey);
+  window.addEventListener("focus", focusSearch);
   unlisten = await listen("vortex:clipboard", refresh);
   // Kept as a backup trigger; the eval path above is the reliable one.
   unshown = await listen("vortex:clipboard-shown", rearm);
 });
 onUnmounted(() => {
   window.removeEventListener("keydown", onKey);
+  window.removeEventListener("focus", focusSearch);
   unlisten?.();
   unshown?.();
 });
@@ -358,7 +375,7 @@ onUnmounted(() => {
       </header>
 
       <div class="px-4 pt-3 pb-2 shrink-0 border-b border-border/50">
-        <div class="flex items-center gap-2 h-9 px-3 rounded-lg border border-border bg-card">
+        <div class="flex items-center gap-2 h-10 px-3 rounded-lg border border-border bg-card">
           <Search class="h-4 w-4 text-muted-foreground/70 shrink-0" />
           <input
             ref="inputEl"
@@ -385,7 +402,7 @@ onUnmounted(() => {
             :style="{ height: rowH(e) + 'px' }"
           >
             <button
-              class="group h-full w-full text-left rounded-lg border bg-card px-2.5 relative overflow-hidden flex items-center"
+              class="group h-full w-full text-left rounded-lg border bg-card px-3 relative overflow-hidden flex items-center"
               :class="i === selected
                 ? 'border-primary ring-1 ring-primary/60 bg-accent'
                 : 'border-border hover:bg-accent/60'"
@@ -398,7 +415,7 @@ onUnmounted(() => {
               <div v-if="e.kind === 'image' && e.path" class="flex items-center gap-2.5 w-full">
                 <img
                   :src="convertFileSrc(e.path)"
-                  class="rounded object-contain max-h-[40px] max-w-[72px] w-auto h-auto shrink-0 border border-border/50 bg-background"
+                  class="rounded object-contain max-h-[58px] max-w-[104px] w-auto h-auto shrink-0 border border-border/50 bg-background"
                   loading="lazy"
                 />
                 <span class="text-[12px] text-muted-foreground flex items-center gap-1.5">

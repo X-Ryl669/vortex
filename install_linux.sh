@@ -197,14 +197,38 @@ if command -v gnome-shell >/dev/null 2>&1 \
   GNOME_EXT_DST="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$GNOME_EXT_UUID"
   mkdir -p "$GNOME_EXT_DST"
   install -m644 "$GNOME_EXT_SRC"/metadata.json "$GNOME_EXT_SRC"/extension.js "$GNOME_EXT_SRC"/stylesheet.css "$GNOME_EXT_DST/"
-  # Enable it. On X11 this takes effect immediately; on a Wayland session a
-  # FIRST-EVER install is only loaded after the next login (the enable is
-  # queued, so it just works from then on). gnome-extensions may be absent on a
-  # minimal GNOME, so guard it.
-  if command -v gnome-extensions >/dev/null 2>&1; then
-    gnome-extensions enable "$GNOME_EXT_UUID" >/dev/null 2>&1 \
-      && echo "▶ GNOME pill extension installed + enabled." \
-      || echo "ℹ GNOME pill extension installed; log out/in once, then it auto-enables."
+  # Enable it. On X11 this takes effect immediately. On a Wayland session a
+  # FIRST-EVER install is invisible to the ALREADY-RUNNING shell, so
+  # `gnome-extensions enable` fails with "does not exist" — and, crucially, it
+  # is a D-Bus call into that shell, so a failure writes NOTHING to dconf and
+  # nothing is queued. Falling back to writing org.gnome.shell enabled-extensions
+  # ourselves is what actually makes it come up enabled after the next login;
+  # without it the extension sits installed-but-off forever and the daemon stays
+  # on its tray fallback. gnome-extensions may be absent on a minimal GNOME, so
+  # guard it and let the gsettings path carry the install on its own.
+  if command -v gnome-extensions >/dev/null 2>&1 \
+     && gnome-extensions enable "$GNOME_EXT_UUID" >/dev/null 2>&1; then
+    echo "▶ GNOME pill extension installed + enabled."
+  elif command -v gsettings >/dev/null 2>&1; then
+    # Append to the list only when absent — re-running the installer must not
+    # grow a duplicate entry. python3 keeps the GVariant list quoting correct.
+    if gsettings get org.gnome.shell enabled-extensions | grep -q "'$GNOME_EXT_UUID'"; then
+      echo "ℹ GNOME pill extension updated; already queued to enable — log out/in once."
+    elif python3 - "$GNOME_EXT_UUID" <<'PY' 2>/dev/null
+import subprocess, sys, ast
+uuid = sys.argv[1]
+cur = subprocess.check_output(
+    ["gsettings", "get", "org.gnome.shell", "enabled-extensions"], text=True).strip()
+lst = ast.literal_eval(cur.replace("@as ", "", 1))
+lst.append(uuid)
+subprocess.check_call(["gsettings", "set", "org.gnome.shell", "enabled-extensions",
+                       "[" + ", ".join("'%s'" % e for e in lst) + "]"])
+PY
+    then
+      echo "▶ GNOME pill extension installed and marked enabled — log out/in once to see the pill."
+    else
+      echo "ℹ GNOME pill extension installed; enable it with: gnome-extensions enable $GNOME_EXT_UUID"
+    fi
   else
     echo "ℹ GNOME pill extension installed (enable with: gnome-extensions enable $GNOME_EXT_UUID)."
   fi

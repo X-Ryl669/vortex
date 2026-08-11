@@ -159,8 +159,14 @@ pub async fn connect_audio(adapter: &Adapter, mac: &str) -> Result<(), SwitchErr
     // NOTE: validated only against single-point hardware so far (the
     // fall-through case); the multipoint branch is reasoned from the BlueZ
     // link-state semantics and needs a real multipoint device to confirm.
-    if audio_active(adapter, addr).await {
-        let _ = force_card_to_a2dp(mac).await;
+    // `audio_active` alone is NOT enough to take this shortcut: it is true for
+    // an HFP-only link too (the headset profile publishes its own `bluez_*`
+    // sink). Taking the fast path on that made buds left on `headset-head-unit`
+    // by a call hand-off permanently sticky — every connect returned "already
+    // live" and nothing ever put them back on A2DP. Require a real A2DP
+    // profile; otherwise fall through to the full drop+reconnect below, which
+    // is exactly what repairs the profile.
+    if audio_active(adapter, addr).await && ensure_card_on_a2dp(adapter, addr, mac).await {
         info!(%addr, "A2DP already live (multipoint/reclaim) — fast route, no reconnect");
         return Ok(());
     }
@@ -232,16 +238,22 @@ pub async fn connect_audio(adapter: &Adapter, mac: &str) -> Result<(), SwitchErr
         let t_wait_start = tokio::time::Instant::now();
         if wait_audio_connected(adapter, addr, CONNECT_SETTLE).await {
             let wait_ms = t_wait_start.elapsed().as_millis();
-            let connect_ms = t_attempt.elapsed().as_millis();
-            info!(
-                %addr,
-                connect_ms,
-                bluez_ms,
-                wait_ms,
-                a2dp_busy,
-                "A2DP connected"
-            );
-            return Ok(());
+            // A live sink is not proof A2DP won — see `ensure_card_on_a2dp`.
+            // Claiming success here while the card sat on HFP is what made the
+            // buds play for a moment and then go silent.
+            if ensure_card_on_a2dp(adapter, addr, mac).await {
+                let connect_ms = t_attempt.elapsed().as_millis();
+                info!(
+                    %addr,
+                    connect_ms,
+                    bluez_ms,
+                    wait_ms,
+                    a2dp_busy,
+                    "A2DP connected"
+                );
+                return Ok(());
+            }
+            warn!(%addr, "audio sink is up but the card would not take an A2DP profile");
         }
     }
     let mut last_err: Option<SwitchError> = match a2dp {
@@ -437,19 +449,241 @@ pub async fn audio_active(adapter: &Adapter, addr: Address) -> bool {
 /// and the first A2DP connect attempt lands cleanly — mirrors the old
 /// ecosystem's `set_audio_a2dp_profile` step.
 async fn force_card_to_a2dp(mac: &str) -> bool {
-    let card = format!("bluez_card.{}", mac.replace(':', "_"));
-    for profile in ["a2dp-sink", "a2dp_sink", "a2dp-sink-aac"] {
+    let card = card_name(mac);
+    // Prefer the a2dp profile names the card ACTUALLY offers (codec-suffixed
+    // variants differ per device and PipeWire version: `a2dp-sink-sbc_xq`,
+    // `a2dp-sink-ldac`, `a2dp-sink-aptx_hd`, …). The hard-coded trio below is
+    // only a fallback for the window where the card list can't be read.
+    let mut candidates = card_a2dp_profiles(mac).await;
+    for fallback in ["a2dp-sink", "a2dp_sink", "a2dp-sink-aac"] {
+        if !candidates.iter().any(|p| p == fallback) {
+            candidates.push(fallback.to_string());
+        }
+    }
+    for profile in candidates {
         let res = tokio::process::Command::new("pactl")
-            .args(["set-card-profile", &card, profile])
+            .args(["set-card-profile", &card, &profile])
             .output()
             .await;
         if let Ok(o) = res {
             if o.status.success() {
-                debug!(%card, profile, "card pushed to A2DP");
+                debug!(%card, %profile, "card pushed to A2DP");
                 return true;
             }
         }
     }
+    false
+}
+
+fn card_name(mac: &str) -> String {
+    format!("bluez_card.{}", mac.replace(':', "_"))
+}
+
+/// The `pactl list cards` block for this MAC, as raw lines. Empty when the
+/// card doesn't exist (buds disconnected, or PipeWire not up yet).
+async fn card_block(mac: &str) -> Vec<String> {
+    let Ok(out) = tokio::process::Command::new("pactl")
+        .args(["list", "cards"])
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let want = card_name(mac);
+    let mut block = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Each card's section starts at `Card #N`; the name lands a few lines in.
+        if trimmed.starts_with("Card #") {
+            if inside {
+                break;
+            }
+            continue;
+        }
+        if let Some(name) = trimmed.strip_prefix("Name: ") {
+            inside = name.trim() == want;
+            if inside {
+                continue;
+            }
+        }
+        if inside {
+            block.push(line.to_string());
+        }
+    }
+    block
+}
+
+/// The card profile currently selected for these buds, e.g. `a2dp-sink` or
+/// `headset-head-unit`. `None` when the card doesn't exist.
+async fn card_active_profile(mac: &str) -> Option<String> {
+    parse_active_profile(&card_block(mac).await)
+}
+
+fn parse_active_profile(block: &[String]) -> Option<String> {
+    block.iter().find_map(|l| {
+        l.trim()
+            .strip_prefix("Active Profile: ")
+            .map(|p| p.trim().to_string())
+    })
+}
+
+/// Every SELECTABLE `a2dp-*` profile this card offers, best codec first.
+/// Empty means PipeWire has no A2DP endpoint for the device — no amount of
+/// `set-card-profile` will help.
+///
+/// Ordered by the card's own `priority:` field, descending, because `pactl`
+/// lists profiles in neither priority nor codec order: on FreeBuds SE 3 it
+/// prints `a2dp-sink-sbc` (132), `a2dp-sink-sbc_xq` (131), `a2dp-sink`
+/// (AAC, 133). Taking the list order would pin the user to SBC while AAC was
+/// available — a silent quality downgrade every time we repaired the profile.
+/// `available: no` profiles are dropped: they cannot be selected.
+async fn card_a2dp_profiles(mac: &str) -> Vec<String> {
+    parse_a2dp_profiles(&card_block(mac).await)
+}
+
+fn parse_a2dp_profiles(block: &[String]) -> Vec<String> {
+    let mut found: Vec<(i64, String)> = block
+        .iter()
+        .filter_map(|l| {
+            // Profile lines look like
+            //   `\t\ta2dp-sink: High Fidelity Playback (A2DP Sink, codec AAC) \
+            //    (sinks: 1, sources: 1, priority: 133, available: yes)`
+            // Port lines share the `name: description` shape, so require the
+            // a2dp prefix rather than relying on position in the block.
+            let t = l.trim();
+            let name = t.split(':').next()?.trim();
+            if !(name.starts_with("a2dp-") || name.starts_with("a2dp_")) {
+                return None;
+            }
+            if field_of(t, "available: ").is_some_and(|v| v == "no") {
+                return None;
+            }
+            let priority = field_of(t, "priority: ")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            Some((priority, name.to_string()))
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Pull `key`'s value out of a `pactl` trailer like
+/// `(sinks: 1, sources: 1, priority: 133, available: yes)`.
+fn field_of(line: &str, key: &str) -> Option<String> {
+    let rest = line.split(key).nth(1)?;
+    let end = rest
+        .find([',', ')'])
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim().to_string())
+}
+
+/// True when the buds' card is on an A2DP profile *right now* — the real
+/// "media audio works" signal, as opposed to [`audio_active`], which only
+/// says a `bluez_*` sink exists (HFP exposes one too).
+pub async fn a2dp_card_active(mac: &str) -> bool {
+    card_active_profile(mac)
+        .await
+        .is_some_and(|p| p.starts_with("a2dp"))
+}
+
+/// Poll until the card reports an A2DP profile, or the timeout elapses.
+/// `set-card-profile` returns before PipeWire has rebuilt the sink.
+async fn settle_until_a2dp(mac: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if a2dp_card_active(mac).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(CARD_PROFILE_POLL).await;
+    }
+}
+
+/// Whether BlueZ says this device supports the A2DP sink role at all. Buds
+/// that only ever do HFP (some headsets) legitimately have no A2DP profile,
+/// and must not be dragged through the recovery path below.
+async fn device_advertises_a2dp(adapter: &Adapter, addr: Address) -> bool {
+    let Ok(device) = adapter.device(addr) else { return false };
+    device
+        .uuids()
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|set| set.contains(&A2DP_SINK_UUID))
+}
+
+/// Make sure media audio really is on A2DP, and repair it when it isn't.
+///
+/// **Why this exists.** `audio_active` — and therefore
+/// [`wait_audio_connected`] — is satisfied by ANY `bluez_*` sink, and the HFP
+/// profile publishes one (mono, 16 kHz, riding SCO). So a call hand-off that
+/// left the card on `headset-head-unit` was reported as `"A2DP connected"`,
+/// the user heard telephone-quality audio that cut out with the SCO link, and
+/// every later connect took the multipoint fast path and returned "already
+/// live" — so it never recovered on its own. Live-observed on FreeBuds SE 3
+/// after a call plus a wireplumber restart: the card was left offering only
+/// `off` / `headset-head-unit-cvsd` / `headset-head-unit` while BlueZ still
+/// advertised the A2DP Sink UUID.
+///
+/// Three escalating steps: select an A2DP profile if the card offers one;
+/// if the card offers NONE but the device advertises A2DP, PipeWire lost the
+/// endpoint (classic aftermath of a wireplumber restart while connected), so
+/// recycle the ACL link once to force a re-probe; then re-select.
+async fn ensure_card_on_a2dp(adapter: &Adapter, addr: Address, mac: &str) -> bool {
+    if a2dp_card_active(mac).await {
+        return true;
+    }
+
+    // Step 1 — the card offers A2DP, we're just parked on headset.
+    if !card_a2dp_profiles(mac).await.is_empty() {
+        if force_card_to_a2dp(mac).await && settle_until_a2dp(mac, CARD_PROFILE_SETTLE).await {
+            info!(%mac, "card moved off the headset profile onto A2DP");
+            return true;
+        }
+    }
+
+    // Step 2 — no A2DP profile on the card at all.
+    if !device_advertises_a2dp(adapter, addr).await {
+        debug!(%mac, "device advertises no A2DP sink — HFP-only buds");
+        return false;
+    }
+    // Resolve BEFORE the macro: an `.await` inside `warn!` args holds the
+    // non-Send `format_args!` temporary across the yield, which makes the whole
+    // `connect_audio` future non-Send and fails the orchestrator's Box::pin.
+    let active_now = card_active_profile(mac).await;
+    warn!(
+        %mac,
+        active = ?active_now,
+        "buds are connected but their PipeWire card exposes no A2DP profile \
+         (lost endpoint) — recycling the link to force a re-probe"
+    );
+    if let Ok(device) = adapter.device(addr) {
+        match device.disconnect().await {
+            Ok(()) | Err(_) => {}
+        }
+        let _ = wait_audio_disconnected(adapter, addr, DISCONNECT_TIMEOUT).await;
+        sleep(RECYCLE_PAUSE).await;
+        let _ = tokio::time::timeout(PROFILE_CONNECT_TIMEOUT, device.connect()).await;
+        let _ = wait_audio_connected(adapter, addr, CONNECT_SETTLE).await;
+    }
+
+    // Step 3 — re-select on the rebuilt card.
+    if settle_until_a2dp(mac, CARD_PROFILE_SETTLE).await
+        || (force_card_to_a2dp(mac).await && settle_until_a2dp(mac, CARD_PROFILE_SETTLE).await)
+    {
+        info!(%mac, "A2DP endpoint recovered after the link recycle");
+        return true;
+    }
+    warn!(
+        %mac,
+        "A2DP still unavailable after a link recycle — PipeWire needs a \
+         `systemctl --user restart wireplumber` to rebuild this card"
+    );
     false
 }
 
@@ -549,6 +783,22 @@ const CONNECT_SETTLE: Duration = Duration::from_millis(4000);
 /// retryable failure instead of freezing the switch flow in `Connecting`.
 const PROFILE_CONNECT_TIMEOUT: Duration = Duration::from_millis(6000);
 
+/// How long to wait for PipeWire to actually apply a card-profile switch.
+/// `pactl set-card-profile` returns as soon as the request is accepted; the
+/// sink is torn down and rebuilt on the session manager's own schedule, so
+/// reading the profile back immediately can still show the old one.
+const CARD_PROFILE_SETTLE: Duration = Duration::from_millis(1500);
+
+/// Re-read interval while waiting out [`CARD_PROFILE_SETTLE`]. Each probe
+/// forks `pactl list cards`, so this is deliberately coarser than
+/// [`POLL_INTERVAL`] — the profile flip is a ~100 ms event, not a ~10 ms one.
+const CARD_PROFILE_POLL: Duration = Duration::from_millis(120);
+
+/// Settle gap between the disconnect and reconnect of the A2DP-endpoint
+/// recovery in [`ensure_card_on_a2dp`]. Reconnecting the instant the ACL
+/// drops tends to race BlueZ's own teardown and land back on HFP.
+const RECYCLE_PAUSE: Duration = Duration::from_millis(600);
+
 /// How many times to retry the A2DP connect on a transient ACL error
 /// (br-connection-create-socket etc.) before falling through to HFP.
 const A2DP_TRANSIENT_RETRIES: u8 = 2;
@@ -584,6 +834,104 @@ mod tests {
             HFP_AG_UUID.to_string(),
             "0000111f-0000-1000-8000-00805f9b34fb"
         );
+    }
+
+    /// Real `pactl list cards` block for HUAWEI FreeBuds SE 3, captured on
+    /// Fedora 44 / PipeWire 1.6.8 right after the A2DP endpoint came back.
+    /// Note the profile order: SBC (132) and SBC-XQ (131) are printed BEFORE
+    /// AAC (133), which is exactly the trap the priority sort exists for.
+    fn healthy_card_block() -> Vec<String> {
+        [
+            "\tProfiles:",
+            "\t\toff: Off (sinks: 0, sources: 0, priority: 0, available: yes)",
+            "\t\ta2dp-sink-sbc: High Fidelity Playback (A2DP Sink, codec SBC) (sinks: 1, sources: 1, priority: 132, available: yes)",
+            "\t\ta2dp-sink-sbc_xq: High Fidelity Playback (A2DP Sink, codec SBC-XQ) (sinks: 1, sources: 1, priority: 131, available: yes)",
+            "\t\ta2dp-sink: High Fidelity Playback (A2DP Sink, codec AAC) (sinks: 1, sources: 1, priority: 133, available: yes)",
+            "\t\theadset-head-unit-cvsd: Headset Head Unit (HSP/HFP, codec CVSD) (sinks: 1, sources: 1, priority: 5, available: yes)",
+            "\t\theadset-head-unit: Headset Head Unit (HSP/HFP, codec MSBC) (sinks: 1, sources: 1, priority: 6, available: yes)",
+            "\tActive Profile: a2dp-sink",
+            "\tPorts:",
+            "\t\theadset-output: Headphones (type: Headset, priority: 0, latency offset: 0 usec, available)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// The SAME buds after a call hand-off plus a wireplumber restart: BlueZ
+    /// still advertises A2DP Sink, but PipeWire's card offers only headset
+    /// profiles. This is the state that got logged as "A2DP connected".
+    fn lost_endpoint_card_block() -> Vec<String> {
+        [
+            "\tProfiles:",
+            "\t\toff: Off (sinks: 0, sources: 0, priority: 0, available: yes)",
+            "\t\theadset-head-unit-cvsd: Headset Head Unit (HSP/HFP, codec CVSD) (sinks: 1, sources: 1, priority: 2, available: yes)",
+            "\t\theadset-head-unit: Headset Head Unit (HSP/HFP, codec MSBC) (sinks: 1, sources: 1, priority: 3, available: yes)",
+            "\tActive Profile: headset-head-unit",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn a2dp_profiles_are_ordered_best_codec_first() {
+        // AAC (133) must win even though pactl printed the SBC variants first.
+        assert_eq!(
+            parse_a2dp_profiles(&healthy_card_block()),
+            vec!["a2dp-sink", "a2dp-sink-sbc", "a2dp-sink-sbc_xq"]
+        );
+    }
+
+    #[test]
+    fn headset_and_port_lines_are_not_mistaken_for_a2dp() {
+        // Ports share the `name: description (…)` shape as profiles, and the
+        // `Active Profile:` line does too — none may leak into the list.
+        let profiles = parse_a2dp_profiles(&healthy_card_block());
+        assert!(profiles.iter().all(|p| p.starts_with("a2dp")));
+    }
+
+    #[test]
+    fn lost_endpoint_card_offers_no_a2dp() {
+        // The signal `ensure_card_on_a2dp` escalates on: nothing to select,
+        // so pushing the profile is pointless and the link must be recycled.
+        assert!(parse_a2dp_profiles(&lost_endpoint_card_block()).is_empty());
+        assert_eq!(
+            parse_active_profile(&lost_endpoint_card_block()).as_deref(),
+            Some("headset-head-unit")
+        );
+    }
+
+    #[test]
+    fn active_profile_distinguishes_a2dp_from_headset() {
+        // The exact check behind `a2dp_card_active` — the predicate that
+        // replaced "a bluez_* sink exists", which HFP also satisfies.
+        let healthy = parse_active_profile(&healthy_card_block()).unwrap();
+        let broken = parse_active_profile(&lost_endpoint_card_block()).unwrap();
+        assert!(healthy.starts_with("a2dp"));
+        assert!(!broken.starts_with("a2dp"));
+    }
+
+    #[test]
+    fn unavailable_profiles_are_skipped() {
+        // An `available: no` profile cannot be selected; offering it would
+        // make force_card_to_a2dp burn a pactl call on a guaranteed failure.
+        let block: Vec<String> = [
+            "\t\ta2dp-sink: High Fidelity Playback (A2DP Sink, codec AAC) (sinks: 1, sources: 1, priority: 133, available: no)",
+            "\t\ta2dp-sink-sbc: High Fidelity Playback (A2DP Sink, codec SBC) (sinks: 1, sources: 1, priority: 132, available: yes)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(parse_a2dp_profiles(&block), vec!["a2dp-sink-sbc"]);
+    }
+
+    #[test]
+    fn field_of_reads_pactl_trailers() {
+        let line = "a2dp-sink: Playback (sinks: 1, sources: 1, priority: 133, available: yes)";
+        assert_eq!(field_of(line, "priority: ").as_deref(), Some("133"));
+        assert_eq!(field_of(line, "available: ").as_deref(), Some("yes"));
+        assert_eq!(field_of(line, "nonexistent: "), None);
     }
 
     #[test]

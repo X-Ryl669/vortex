@@ -18,6 +18,7 @@ pub(crate) async fn fill_now_playing(state: &mut vortex_l3_daemon::core::appstat
         state.media_title = np.title;
         state.media_artist = np.artist;
         state.media_app = np.app;
+        state.media_art_url = np.art_url;
         state.media_np_playing = np.playing;
     }
 }

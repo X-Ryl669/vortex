@@ -810,16 +810,29 @@ pub async fn write_clipboard(
         let total = chunks.len();
         for payload in chunks {
             let mut ct = vec![0u8; payload.len() + 16];
-            let n = {
+            // Hold the lock ACROSS the write, exactly like the single-frame
+            // writers (see write_state). Sealing under the lock but writing
+            // outside it lets a concurrent writer — the 12 s state heartbeat,
+            // a mirrored notification — seal a HIGHER nonce and reach the wire
+            // FIRST. The phone's receive cipher then desyncs for every later
+            // frame, which showed up live as bursts of "resynced past dropped
+            // BLE frame(s)" and a listener stuck >5 s on the transport lock
+            // right after a long clipboard copy. Sealing order and wire order
+            // have to be one critical section.
+            {
                 let mut t = transport.lock().await;
-                t.write_message(&payload, &mut ct)
-                    .map_err(|e| format!("clipboard-text write_message: {e}"))?
-            };
-            ct.truncate(n);
-            let wire = Frame::new(ty::CLIPBOARD_TEXT, 0, ct).encode();
-            write_framed(char, &wire)
-                .await
-                .map_err(|e| format!("BLE write CLIPBOARD_TEXT to AUDIO_SIGNAL: {e}"))?;
+                let n = t
+                    .write_message(&payload, &mut ct)
+                    .map_err(|e| format!("clipboard-text write_message: {e}"))?;
+                ct.truncate(n);
+                let wire = Frame::new(ty::CLIPBOARD_TEXT, 0, ct).encode();
+                write_framed(char, &wire)
+                    .await
+                    .map_err(|e| format!("BLE write CLIPBOARD_TEXT to AUDIO_SIGNAL: {e}"))?;
+            }
+            // Pace OUTSIDE the lock so other writers can interleave BETWEEN
+            // chunks — each chunk is atomic, which is all the nonce discipline
+            // needs, and holding across the sleep would stall the listener.
             tokio::time::sleep(Duration::from_millis(12)).await;
         }
         debug!(
@@ -859,18 +872,24 @@ pub async fn write_clipboard_image(
     let total = chunks.len();
     for payload in chunks {
         let mut ct = vec![0u8; payload.len() + 16];
-        // Lock per chunk (not across the whole image) so the seal path can
-        // interleave other frames; nonce order is still preserved per write.
-        let n = {
+        // Lock per chunk (not across the whole image) so other writers can
+        // interleave BETWEEN chunks — but the seal and the write of one chunk
+        // must stay inside a single critical section. The old code dropped the
+        // lock after sealing and claimed "nonce order is still preserved per
+        // write", which does not hold with a concurrent writer: it can seal a
+        // later nonce and hit the wire first, permanently desyncing the phone's
+        // receive cipher. Same fix as the CLIPBOARD_TEXT loop above.
+        {
             let mut t = transport.lock().await;
-            t.write_message(&payload, &mut ct)
-                .map_err(|e| format!("clipboard-image write_message: {e}"))?
-        };
-        ct.truncate(n);
-        let wire = Frame::new(ty::CLIPBOARD_IMAGE, 0, ct).encode();
-        write_framed(char, &wire)
-            .await
-            .map_err(|e| format!("BLE write CLIPBOARD_IMAGE to AUDIO_SIGNAL: {e}"))?;
+            let n = t
+                .write_message(&payload, &mut ct)
+                .map_err(|e| format!("clipboard-image write_message: {e}"))?;
+            ct.truncate(n);
+            let wire = Frame::new(ty::CLIPBOARD_IMAGE, 0, ct).encode();
+            write_framed(char, &wire)
+                .await
+                .map_err(|e| format!("BLE write CLIPBOARD_IMAGE to AUDIO_SIGNAL: {e}"))?;
+        }
         // Pace so the BLE stack doesn't drop notifies under the chunk storm.
         tokio::time::sleep(Duration::from_millis(12)).await;
     }

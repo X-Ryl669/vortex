@@ -103,6 +103,10 @@ data class AppState(
     val mediaArtist: String? = null,
     /** Laptop→phone now-playing display: player name (e.g. "Spotify"). */
     val mediaApp: String? = null,
+    /** Laptop→phone now-playing display: http(s) cover art for the media card.
+     *  THIS phone fetches it (the laptop only names it), so the laptop drops
+     *  `file://` art at the source. Null/empty = no art. */
+    val mediaArtUrl: String? = null,
     /** Laptop→phone now-playing display: the RAW MPRIS playing state for the
      *  notification's ⏸/▶ — distinct from [mediaPlaying], the smart-switch's
      *  handoff-aware advisory. */
@@ -212,6 +216,7 @@ data class AppState(
         mediaTitle?.takeIf { it.isNotEmpty() }?.let { obj.put("media_title", it) }
         mediaArtist?.takeIf { it.isNotEmpty() }?.let { obj.put("media_artist", it) }
         mediaApp?.takeIf { it.isNotEmpty() }?.let { obj.put("media_app", it) }
+        mediaArtUrl?.takeIf { it.isNotEmpty() }?.let { obj.put("media_art_url", it) }
         if (mediaNpPlaying) obj.put("media_np_playing", true)
         mediaControl?.takeIf { it.isNotEmpty() }?.let {
             obj.put("media_control", it)
@@ -318,6 +323,7 @@ data class AppState(
                 mediaTitle = obj.optString("media_title", "").takeIf { it.isNotBlank() },
                 mediaArtist = obj.optString("media_artist", "").takeIf { it.isNotBlank() },
                 mediaApp = obj.optString("media_app", "").takeIf { it.isNotBlank() },
+                mediaArtUrl = obj.optString("media_art_url", "").takeIf { it.isNotBlank() },
                 mediaNpPlaying = obj.optBoolean("media_np_playing", false),
                 mediaControl = obj.optString("media_control", "").takeIf { it.isNotBlank() },
                 mediaControlSeq = obj.optLong("media_control_seq", 0L),

@@ -207,6 +207,13 @@ pub struct AppState {
     /// e.g. "Spotify") — the notification's subtitle on the phone.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub media_app: String,
+    /// Laptop→phone now-playing display: cover-art URL for the phone's media
+    /// card (the art the system draws behind the title). Always http(s) — the
+    /// PHONE fetches it, so a `file://` art path on the laptop is useless and
+    /// gets dropped at the source. Empty = no art, the card falls back to the
+    /// Vortex logo.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_art_url: String,
     /// Laptop→phone now-playing display: the RAW MPRIS playing state for
     /// the phone notification's ⏸/▶. Distinct from `media_playing`, which
     /// is the smart-switch's handoff-aware advisory (false while the buds
@@ -404,6 +411,7 @@ impl AppState {
             media_title: String::new(),  // filled by the heartbeat builders
             media_artist: String::new(), // (lan.rs / ble.rs) from MPRIS
             media_app: String::new(),
+            media_art_url: String::new(),
             media_np_playing: false,
             media_control: String::new(), // phone→laptop only
             media_control_seq: 0,
@@ -578,6 +586,7 @@ mod tests {
             media_title: "Bohemian Rhapsody".into(),
             media_artist: "Queen".into(),
             media_app: "Spotify".into(),
+            media_art_url: "https://i.scdn.co/image/ab67616d0000b273".into(),
             media_np_playing: true,
             media_control: "media_play_pause".into(),
             media_control_seq: 3,
@@ -619,6 +628,7 @@ mod tests {
         assert_eq!(a.media_title, b.media_title);
         assert_eq!(a.media_artist, b.media_artist);
         assert_eq!(a.media_app, b.media_app);
+        assert_eq!(a.media_art_url, b.media_art_url);
         assert_eq!(a.media_control, b.media_control);
         assert_eq!(a.media_control_seq, b.media_control_seq);
     }

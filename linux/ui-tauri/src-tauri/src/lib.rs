@@ -309,6 +309,19 @@ pub fn run() {
             // run_worker — it needs the worker's tokio runtime.
             if std::env::args().any(|a| a == "--clipboard") {
                 clipboard_window::show_clipboard_window(app.handle());
+            } else {
+                // Otherwise build it hidden NOW, so the first Super+V of the
+                // session is a show rather than a window build + webview boot +
+                // Vue mount with the user watching. Deferred a moment so it
+                // doesn't compete with the main window's own first paint.
+                let h = app.handle().clone();
+                thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_secs(3));
+                    let inner = h.clone();
+                    let _ = h.run_on_main_thread(move || {
+                        clipboard_window::prewarm(&inner);
+                    });
+                });
             }
 
             Ok(())

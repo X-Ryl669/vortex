@@ -336,6 +336,9 @@ pub struct NowPlaying {
     pub artist: String,
     /// The player's human name (MPRIS `Identity`, e.g. "Spotify").
     pub app: String,
+    /// http(s) cover art the PHONE fetches for its media card. See
+    /// [`art_url_of`] for where it comes from; empty when there is none.
+    pub art_url: String,
     pub playing: bool,
 }
 
@@ -351,7 +354,7 @@ pub async fn now_playing(conn: &Connection) -> Option<NowPlaying> {
         if !playing && best.is_some() {
             continue; // already have a paused candidate; only playing beats it
         }
-        let (title, artist) = player_metadata(conn, p).await;
+        let (title, artist, art_url) = player_metadata(conn, p).await;
         if title.is_empty() {
             continue;
         }
@@ -359,6 +362,7 @@ pub async fn now_playing(conn: &Connection) -> Option<NowPlaying> {
             title,
             artist,
             app: player_identity(conn, p).await,
+            art_url,
             playing,
         };
         if playing {
@@ -369,9 +373,11 @@ pub async fn now_playing(conn: &Connection) -> Option<NowPlaying> {
     best
 }
 
-/// `xesam:title` + first `xesam:artist` off the player's `Metadata` property.
-/// Empty strings on any error — the caller treats no-title as "nothing to show".
-async fn player_metadata(conn: &Connection, bus_name: &str) -> (String, String) {
+/// `xesam:title` + first `xesam:artist` + cover art off the player's
+/// `Metadata` property. Empty strings on any error — the caller treats
+/// no-title as "nothing to show".
+async fn player_metadata(conn: &Connection, bus_name: &str) -> (String, String, String) {
+    const NONE: (String, String, String) = (String::new(), String::new(), String::new());
     let Ok(proxy) = Proxy::new(
         conn,
         bus_name,
@@ -380,28 +386,82 @@ async fn player_metadata(conn: &Connection, bus_name: &str) -> (String, String) 
     )
     .await
     else {
-        return (String::new(), String::new());
+        return NONE;
     };
     let Ok(value) = proxy
         .call::<_, _, OwnedValue>("Get", &("org.mpris.MediaPlayer2.Player", "Metadata"))
         .await
     else {
-        return (String::new(), String::new());
+        return NONE;
     };
     let Ok(dict) = <std::collections::HashMap<String, OwnedValue>>::try_from(value) else {
-        return (String::new(), String::new());
+        return NONE;
     };
-    let title = dict
-        .get("xesam:title")
-        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_default();
+    let str_of = |key: &str| -> String {
+        dict.get(key)
+            .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
+            .unwrap_or_default()
+    };
+    let title = str_of("xesam:title");
     // `xesam:artist` is `as` (array of strings) per the MPRIS spec.
     let artist = dict
         .get("xesam:artist")
         .and_then(|v| Vec::<String>::try_from(v.try_clone().ok()?).ok())
         .and_then(|a| a.into_iter().find(|s| !s.is_empty()))
         .unwrap_or_default();
-    (title.trim().to_string(), artist.trim().to_string())
+    let art = art_url_of(&str_of("mpris:artUrl"), &str_of("xesam:url"));
+    (title.trim().to_string(), artist.trim().to_string(), art)
+}
+
+/// Pick the cover art the phone can actually fetch.
+///
+/// `mpris:artUrl` is the spec answer and Spotify/Chromium publish a usable
+/// https one. It is skipped when it points at a `file://` path or a `data:`
+/// blob: this URL travels to the PHONE, which can neither read the laptop's
+/// disk nor be handed a megabyte of base64 on the heartbeat.
+///
+/// Firefox publishes NO artUrl at all for a YouTube tab (live-checked
+/// 2026-08-10: its Metadata carries only trackid/title/album/artist/url/
+/// length), so fall back to deriving the video's own thumbnail from
+/// `xesam:url` — that's what makes a YouTube tab look like the phone's own
+/// YouTube media card instead of a blank square.
+fn art_url_of(art_url: &str, page_url: &str) -> String {
+    if art_url.starts_with("http://") || art_url.starts_with("https://") {
+        return art_url.to_string();
+    }
+    youtube_thumb(page_url).unwrap_or_default()
+}
+
+/// `https://i.ytimg.com/vi/<id>/hqdefault.jpg` for a YouTube watch / shorts /
+/// youtu.be link. None for anything else.
+fn youtube_thumb(page_url: &str) -> Option<String> {
+    let rest = page_url
+        .strip_prefix("https://")
+        .or_else(|| page_url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/')?;
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let id = match host {
+        "youtu.be" => path.split(['?', '&', '/']).next()?,
+        "youtube.com" | "m.youtube.com" | "music.youtube.com" => {
+            if let Some(short) = path.strip_prefix("shorts/") {
+                short.split(['?', '&', '/']).next()?
+            } else {
+                // watch?v=<id>&… — the v param is not always first.
+                path.split_once('?')?
+                    .1
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("v="))?
+            }
+        }
+        _ => return None,
+    };
+    // A YouTube id is 11 url-safe chars; anything else means we mis-parsed and
+    // would hand the phone a 404.
+    if id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))
+    } else {
+        None
+    }
 }
 
 /// The player's human-readable name (MPRIS `Identity` on the base
@@ -480,8 +540,20 @@ pub(crate) async fn list_mpris_players(conn: &Connection) -> zbus::Result<Vec<St
     let names: Vec<String> = proxy.call("ListNames", &()).await?;
     Ok(names
         .into_iter()
-        .filter(|n| n.starts_with("org.mpris.MediaPlayer2."))
+        .filter(|n| n.starts_with("org.mpris.MediaPlayer2.") && !is_mpris_proxy(n))
         .collect())
+}
+
+/// True for MPRIS buses that are a PROXY of another player rather than a
+/// player of their own.
+///
+/// `playerctld` re-publishes whatever is currently active — same metadata,
+/// same `Identity` — so the same Firefox tab appears on the bus twice. Left
+/// in, the call-handoff path pauses that one player through both names and
+/// resumes it twice, and `now_playing` can pick the proxy (whose properties
+/// silently swap to a DIFFERENT player the moment the user starts one).
+fn is_mpris_proxy(bus_name: &str) -> bool {
+    bus_name == "org.mpris.MediaPlayer2.playerctld"
 }
 
 pub(crate) async fn player_is_playing(conn: &Connection, bus_name: &str) -> zbus::Result<bool> {
@@ -525,6 +597,39 @@ async fn call_player_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn art_url_prefers_a_real_http_art_url() {
+        let art = "https://i.scdn.co/image/abc";
+        assert_eq!(art_url_of(art, "https://youtu.be/aaaaaaaaaaa"), art);
+    }
+
+    #[test]
+    fn art_url_rejects_art_the_phone_cannot_fetch() {
+        // file:// lives on the LAPTOP's disk; data: would be megabytes of
+        // base64 on the heartbeat. Both fall through to the page URL.
+        assert_eq!(art_url_of("file:///tmp/cover.png", ""), "");
+        assert_eq!(art_url_of("data:image/png;base64,iVBOR", ""), "");
+    }
+
+    #[test]
+    fn youtube_thumb_covers_the_shapes_a_browser_publishes() {
+        let want = Some("https://i.ytimg.com/vi/u3SgSdVOFQw/hqdefault.jpg".to_string());
+        // The exact URL Firefox published in the live check.
+        assert_eq!(youtube_thumb("https://www.youtube.com/watch?v=u3SgSdVOFQw"), want);
+        assert_eq!(youtube_thumb("https://m.youtube.com/watch?t=42&v=u3SgSdVOFQw"), want);
+        assert_eq!(youtube_thumb("https://youtu.be/u3SgSdVOFQw?t=42"), want);
+        assert_eq!(youtube_thumb("https://www.youtube.com/shorts/u3SgSdVOFQw"), want);
+    }
+
+    #[test]
+    fn youtube_thumb_declines_what_it_did_not_parse() {
+        assert_eq!(youtube_thumb("https://vimeo.com/watch?v=u3SgSdVOFQw"), None);
+        assert_eq!(youtube_thumb("https://www.youtube.com/feed/subscriptions"), None);
+        // A short/long id means we mis-parsed — better no art than a 404.
+        assert_eq!(youtube_thumb("https://www.youtube.com/watch?v=abc"), None);
+        assert_eq!(youtube_thumb("file:///home/u/song.mp3"), None);
+    }
 
     #[tokio::test]
     async fn idle_initial_state() {
