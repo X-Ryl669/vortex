@@ -64,6 +64,38 @@ fn set_error(msg: Option<String>) {
     }
 }
 
+/// Push the sealed stream to the phone, and tear the cast down if that gives up.
+///
+/// `run_tcp_video_client` returns either because `au_rx` closed (the normal stop
+/// path) or because it exhausted its ~60 s of connect retries — the phone's
+/// viewer never came up, or went away for good. The pipeline and the portal
+/// session live in a DIFFERENT task, so nothing used to act on that: the capture
+/// kept running with nobody watching, and for an extend cast KWin kept the
+/// virtual output in the desktop layout — a phantom 1920x1080 screen with no
+/// viewer behind it, which windows can be dragged into and lost. Observed
+/// exactly that after a viewer was closed: `kscreen-doctor` still listed
+/// `Virtual-virtual-xdp-kde-…` at 2058,0 until the whole app was killed.
+///
+/// Give-up on the transport therefore has to mean give-up on the cast — which
+/// also releases the compositor's output and, via `CAST_ERROR`, tells the phone
+/// why instead of leaving it on a black screen.
+fn spawn_video_sender(
+    phone_ip: std::net::IpAddr,
+    key: [u8; 32],
+    au_rx: mpsc::Receiver<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx).await;
+        // On the normal stop path `stop()` has already taken CAST, so this is
+        // only reached with a live handle when the transport gave up by itself.
+        if CAST.lock().map(|g| g.is_some()).unwrap_or(false) {
+            tracing::warn!("laptop-cast: phone viewer unreachable — stopping the cast");
+            set_error(Some("the phone's viewer stopped responding".to_string()));
+            stop();
+        }
+    });
+}
+
 /// Edge-tracker for the phone's `laptop_mirror_req` level: we act only on the
 /// false→true (start) and true→false (stop) transitions, ignoring the repeats
 /// that arrive on every heartbeat.
@@ -311,7 +343,7 @@ async fn start_portal(
     );
 
     // Push the sealed stream to the phone (we dial it — the phone is the server).
-    tokio::spawn(mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx));
+    spawn_video_sender(phone_ip, key, au_rx);
 
     pipeline
         .set_state(gst::State::Playing)
@@ -327,9 +359,15 @@ async fn start_portal(
     }
     let bus = pipeline.bus();
     tokio::spawn(async move {
-        // Keep these alive until teardown: dropping `fd`/`session` closes the
-        // PipeWire stream and the portal session; `proxy` backs the session.
-        let _keep = (proxy, session, fd);
+        // Keep these alive until teardown. `fd` closing does end the PipeWire
+        // stream, but the SESSION must be closed explicitly — ashpd 0.9's
+        // `Session` has `close()` and no `Drop` that calls it, so merely dropping
+        // it leaves the portal session open until our whole D-Bus connection goes
+        // away. For an extend cast that means the compositor keeps the virtual
+        // output: a phantom 1920x1080 screen stayed in the KDE display layout
+        // after the cast stopped, and only disappeared when the app was killed.
+        // See the explicit `close()` at the end of this task.
+        let _keep = (proxy, fd);
         let mut stop_rx = stop_rx;
         loop {
             // Drain any pending bus messages WITHOUT blocking the async runtime
@@ -375,7 +413,14 @@ async fn start_portal(
         if let Ok(mut g) = CAST_OFFER.lock() {
             *g = None;
         }
-        tracing::info!("laptop-cast: stopped (capture + portal released)");
+        // Hand the session back to the compositor. Pipeline-to-Null stops the
+        // capture but leaves the SOURCE allocated — for `SourceType::Virtual`
+        // that is a whole output still sitting in the user's display layout,
+        // which windows can be dragged into and lost.
+        if let Err(e) = session.close().await {
+            tracing::warn!("laptop-cast: portal session close failed: {e}");
+        }
+        tracing::info!("laptop-cast: stopped (capture + portal session closed)");
     });
 
     Ok(())
@@ -492,7 +537,7 @@ async fn start_extend(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), S
             .build(),
     );
 
-    tokio::spawn(mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx));
+    spawn_video_sender(phone_ip, key, au_rx);
     pipeline
         .set_state(gst::State::Playing)
         .map_err(|e| format!("pipeline play: {e}"))?;
