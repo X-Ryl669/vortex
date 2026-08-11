@@ -43,6 +43,27 @@ static CAST: Mutex<Option<CastHandle>> = Mutex::new(None);
 /// AppState, so the phone knows where to dial. `None` when not casting.
 static CAST_OFFER: Mutex<Option<LaptopCast>> = Mutex::new(None);
 
+/// Why the last cast attempt failed, for the phone to show and act on.
+///
+/// Without this the phone cannot tell "starting…" from "never going to work":
+/// it re-asserts `laptop_mirror_req` on every heartbeat, we fail again, and the
+/// only trace is a WARN in a log the user is not reading. Its request stays
+/// latched, `requestView` early-returns on `requestActive`, and further taps do
+/// nothing — the UI wedges until the app is force-stopped. The laptop already
+/// knows the exact reason and has a sealed channel to say it on, so it does.
+static CAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// The failure reason to ship in the next AppState push, if any.
+pub(crate) fn current_error() -> Option<String> {
+    CAST_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
+fn set_error(msg: Option<String>) {
+    if let Ok(mut g) = CAST_ERROR.lock() {
+        *g = msg;
+    }
+}
+
 /// Edge-tracker for the phone's `laptop_mirror_req` level: we act only on the
 /// false→true (start) and true→false (stop) transitions, ignoring the repeats
 /// that arrive on every heartbeat.
@@ -120,12 +141,16 @@ pub fn dispatch_request(req: bool, extend: Option<bool>) {
                 key: hex::encode(key), // key material — logged nowhere
             });
         }
+        // A fresh attempt is not the previous attempt's failure: clear the
+        // reason so the phone isn't shown a stale one while this one runs.
+        set_error(None);
         tokio::spawn(async move {
             if let Err(e) = start(phone_ip, key, extend).await {
                 tracing::warn!("laptop-cast: start failed: {e}");
                 if let Ok(mut g) = CAST_OFFER.lock() {
                     *g = None;
                 }
+                set_error(Some(e));
                 REQ_WANTED.store(false, Ordering::SeqCst);
             }
         });
@@ -136,6 +161,10 @@ pub fn dispatch_request(req: bool, extend: Option<bool>) {
         if let Ok(mut g) = CAST_OFFER.lock() {
             *g = None;
         }
+        // The phone has stopped asking, so it has either seen the reason or no
+        // longer cares. Keeping it would re-report an old failure against the
+        // next request the moment it is made.
+        set_error(None);
     }
 }
 
@@ -156,14 +185,45 @@ pub async fn start(
     stop();
 
     // Extend mode swaps the SOURCE, nothing else: instead of a view of a screen
-    // that already exists, we ask Mutter for a brand-new monitor and capture
-    // that. Everything downstream — encode, seal, transport, the phone's viewer
-    // — is identical, which is the whole reason this fits here rather than in a
+    // that already exists we ask for a brand-new monitor and capture that.
+    // Everything downstream — encode, seal, transport, the phone's viewer — is
+    // identical, which is the whole reason this fits here rather than in a
     // module of its own.
     if extend.unwrap_or_else(extend_enabled) {
-        return start_extend(phone_ip, key).await;
+        // Mutter first: it is the tuned path (and it rides its own cursor
+        // overlay, because Mutter will not composite a pointer into a virtual
+        // monitor). But `org.gnome.Mutter.ScreenCast` is GNOME's private API, so
+        // on any other compositor it fails instantly with ServiceUnknown — and
+        // the ScreenCast portal's `Virtual` source is the cross-desktop
+        // equivalent, which KWin implements (its portal advertises it in
+        // AvailableSourceTypes). Falling back keeps "second screen" working off
+        // GNOME instead of failing with nothing on screen to say why.
+        match start_extend(phone_ip, key).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "laptop-cast: Mutter virtual monitor unavailable ({e}); \
+                     trying the ScreenCast portal's Virtual source instead"
+                );
+                return start_portal(phone_ip, key, SourceType::Virtual).await;
+            }
+        }
     }
+    start_portal(phone_ip, key, SourceType::Monitor).await
+}
 
+/// Capture `source` through the ScreenCast portal and serve it sealed on
+/// [`mirror_tcp::LAPTOP_VIDEO_PORT`].
+///
+/// `SourceType::Monitor` is a view of a screen that already exists (mirror);
+/// `SourceType::Virtual` asks the compositor to materialise a NEW one (extend).
+/// Everything after the source selection is identical, which is why both kinds
+/// share this body.
+async fn start_portal(
+    phone_ip: std::net::IpAddr,
+    key: [u8; 32],
+    source: SourceType,
+) -> Result<(), String> {
     // ---- Portal: open a ScreenCast session and get the PipeWire node + fd. ----
     let proxy = Screencast::new()
         .await
@@ -176,7 +236,7 @@ pub async fn start(
         .select_sources(
             &session,
             CursorMode::Embedded,
-            SourceType::Monitor.into(),
+            source.into(),
             false,
             None,
             PersistMode::DoNot,
