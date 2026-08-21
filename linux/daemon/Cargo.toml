@@ -41,7 +41,22 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 uuid = "1"
 thiserror = "1"
 bluer = { version = "0.17", features = ["bluetoothd"] }
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "signal"] }
+# The feature list must name everything we actually use. It used to stop at
+# "signal" and still built, because bluer/secret-service/zbus pulled the rest in
+# and Cargo unified the features — so moving those behind a target gate (below)
+# turned ~100 "module `sync` is private" errors loose on the Windows target.
+# Nothing here is platform-bound; the omission just wasn't visible with one OS.
+tokio = { version = "1", features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "signal",
+    "sync",      # mpsc/oneshot/Mutex/Notify/OnceCell, ~14 modules
+    "net",       # the LAN TCP transport
+    "io-util",   # AsyncReadExt/AsyncWriteExt over that transport
+    "process",   # spawning helpers (pactl, loginctl, xdg-user-dir)
+] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
