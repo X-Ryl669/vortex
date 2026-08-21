@@ -25,7 +25,8 @@ use vortex_l3_daemon::core::pairing::reconnect::run_ik_initiator;
 use vortex_l3_daemon::core::platform::linux::LinuxGattLink;
 use vortex_l3_daemon::core::storage::{
     load_or_generate,
-    peers::{PeerStore, SecretServicePeerStore, TrustedPeer},
+    peers::{PeerStore, TrustedPeer},
+    peers_secret_service::SecretServicePeerStore,
     secret_service::SecretServiceIdentityStore,
     IdentityStore, InMemoryIdentityStore,
 };

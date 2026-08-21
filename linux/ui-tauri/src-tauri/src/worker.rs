@@ -9,10 +9,20 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
 use vortex_l3_daemon::core::identity::Platform;
-use vortex_l3_daemon::core::storage::peers::{PeerStore, SecretServicePeerStore};
+use vortex_l3_daemon::core::storage::peers::PeerStore;
+#[cfg(target_os = "linux")]
+use vortex_l3_daemon::core::storage::peers_secret_service::SecretServicePeerStore;
+// The secure-storage backend, chosen at compile time. Same two traits either
+// way — Secret Service over D-Bus, or Credential Manager via CredWriteW.
+#[cfg(target_os = "linux")]
 use vortex_l3_daemon::core::storage::secret_service::SecretServiceIdentityStore;
+#[cfg(target_os = "windows")]
+use vortex_l3_daemon::core::storage::windows_credentials::{
+    WindowsIdentityStore, WindowsPeerStore,
+};
 use vortex_l3_daemon::core::storage::{load_or_generate, IdentityStore, InMemoryIdentityStore};
 
+#[cfg(target_os = "linux")]
 use crate::ble::run_ble_persistent_loop;
 use crate::call::spawn_consumer as spawn_call_consumer;
 use crate::call_log::spawn_consumer as spawn_call_log_consumer;
