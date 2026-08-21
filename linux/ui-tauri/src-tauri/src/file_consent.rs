@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-use vortex_l3_daemon::core::notification_display;
 
 /// Auto-accept incoming file batches instead of asking. OFF unless the user
 /// turns it on: this removes a consent gate, so it can only ever be a
@@ -111,7 +110,7 @@ pub(crate) async fn request(label: &str, count: usize, total: u64) -> bool {
         ("fc:accept".to_string(), "Accept".to_string()),
         ("fc:decline".to_string(), "Decline".to_string()),
     ];
-    let id = match notification_display::show_call_banner(&title, &body, "vortex", &actions, 0, true).await
+    let id = match crate::notify::show_banner(&title, &body, "vortex", &actions, 0, true).await
     {
         Ok(id) => id,
         Err(e) => {
@@ -130,14 +129,14 @@ pub(crate) async fn request(label: &str, count: usize, total: u64) -> bool {
     if let Ok(mut g) = registry().lock() {
         g.remove(&id);
     }
-    let _ = notification_display::close(id).await;
+    let _ = crate::notify::close(id).await;
     decision
 }
 
 /// Spawn-once router: forward `fc:*` ActionInvoked clicks to their waiter.
 pub(crate) async fn watch() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
-    tokio::spawn(notification_display::watch_actions(tx));
+    crate::notify::watch_actions(tx);
     while let Some((id, key)) = rx.recv().await {
         let accept = match key.as_str() {
             "fc:accept" => true,

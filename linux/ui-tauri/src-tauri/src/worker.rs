@@ -32,9 +32,11 @@ use crate::lan::{self, load_last_peer_ip, try_lan_reconnect};
 use crate::live_activity::spawn_consumer as spawn_live_consumer;
 use crate::sms::{self, spawn_consumer as spawn_sms_consumer};
 use crate::{
-    cmd_earbuds, cmd_pairing, earbuds, notifications, worker_ctx, BLE_RETRY_NUDGE, CALL_MIRROR_TX,
-    CALL_WRITER, SYNC_NUDGE,
+    notifications, worker_ctx, BLE_RETRY_NUDGE, CALL_MIRROR_TX, CALL_WRITER, SYNC_NUDGE,
 };
+// The UI commands that need a radio or an audio device.
+#[cfg(target_os = "linux")]
+use crate::{cmd_earbuds, cmd_pairing, earbuds};
 
 #[tauri::command]
 pub fn start_scan(state: State<'_, CmdChannel>) -> Result<(), String> {
@@ -95,6 +97,12 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // event so the UI can render a banner instead of silently
         // downgrading to an in-memory identity that would persist
         // nothing across restarts.
+        #[cfg(target_os = "windows")]
+        let id_store: Box<dyn IdentityStore> = Box::new(WindowsIdentityStore);
+        // Credential Manager needs no connection and cannot be "locked", so
+        // there is no unavailable case to report and no keyring to unlock — the
+        // fallback below is a Secret Service concern.
+        #[cfg(target_os = "linux")]
         let id_store: Box<dyn IdentityStore> = match SecretServiceIdentityStore::new() {
             Ok(s) => Box::new(s),
             Err(err) => {
@@ -113,7 +121,14 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 }
             }
         };
-        let identity = match load_or_generate(&*id_store, Platform::Linux) {
+        // The platform byte in the identity record is what the phone shows as
+        // the peer's device class, so it must name the machine we are actually
+        // running on.
+        #[cfg(target_os = "linux")]
+        let platform = Platform::Linux;
+        #[cfg(target_os = "windows")]
+        let platform = Platform::Windows;
+        let identity = match load_or_generate(&*id_store, platform) {
             Ok(id) => id,
             Err(err) => {
                 tracing::error!("FATAL: identity init failed: {err}");
@@ -123,6 +138,9 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         let _ = app.emit("vortex:identity", IdentityInfo { ready: true });
 
         // Peer store.
+        #[cfg(target_os = "windows")]
+        let peer_store: Arc<dyn PeerStore> = Arc::new(WindowsPeerStore);
+        #[cfg(target_os = "linux")]
         let peer_store: Arc<dyn PeerStore> = match SecretServicePeerStore::new() {
             Ok(s) => Arc::new(s),
             Err(err) => {
@@ -144,7 +162,11 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
             crate::arbiter::claim(&only.peer_static_pub);
         }
 
-        // BLE adapter.
+        // BLE adapter. BlueZ-specific: a `Session`, a default adapter, and a
+        // pairing agent registered for the worker's lifetime. The Windows BLE
+        // path needs none of this — WinRT resolves the radio per call — so it
+        // is gated as a block rather than abstracted.
+        #[cfg(target_os = "linux")]
         let session = match bluer::Session::new().await {
             Ok(s) => s,
             Err(err) => {
@@ -152,6 +174,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 return;
             }
         };
+        #[cfg(target_os = "linux")]
         let adapter = match session.default_adapter().await {
             Ok(a) => a,
             Err(err) => {
@@ -159,6 +182,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 return;
             }
         };
+        #[cfg(target_os = "linux")]
         let _ = adapter.set_powered(true).await;
 
         // ----- BlueZ pairing agent (BT bond, Just Works) -----
@@ -175,6 +199,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // the worker's lifetime; dropping it unregisters the agent and
         // BlueZ falls back to its default (which on a typical desktop
         // session would prompt the user).
+        #[cfg(target_os = "linux")]
         let _agent_handle = match session
             .register_agent(bluer::agent::Agent {
                 request_default: false,
@@ -203,6 +228,9 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // The whole audio/earbuds wiring (orchestrator + race-for-first-
         // success sender, smart-follow watcher, media runtime, resume
         // watcher, switch-state bridge) lives in earbuds::setup_audio.
+        // The whole audio/earbuds wiring is Linux-only; elsewhere the
+        // heartbeat gets an empty `AudioServices` and the features are absent.
+        #[cfg(target_os = "linux")]
         let earbuds::AudioSetup {
             session_writers,
             ble_audio_writers,
@@ -361,10 +389,37 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
             }));
         }
 
+        // The one place the platform difference in the heartbeat's handles
+        // lives: populated on Linux, an empty stand-in elsewhere. A closure so
+        // both the heartbeat and the mDNS-wake path below build a fresh bundle
+        // without repeating the cfg.
+        #[cfg(target_os = "linux")]
+        let audio_services = || lan::AudioServices {
+            switch_orchestrator: Some(switch_orchestrator.clone()),
+            session_writers: Some(session_writers.clone()),
+            media_store: Some(media_store.clone()),
+            shared_adapter: Some(adapter.clone()),
+            media_watch: Some(media_watch.clone()),
+            media_in_call: Some(media_in_call.clone()),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let audio_services = || lan::AudioServices;
+
         // (1) Heartbeat: tick every 12 s, OR immediately when notified.
         //     Either way, a single Mutex serializes with the mDNS-wake
         //     and manual paths.
-        lan::spawn_heartbeat(app.clone(), identity.clone(), peer_store.clone(), auto_lock.clone(), switch_orchestrator.clone(), session_writers.clone(), media_store.clone(), last_call_phase.clone(), media_watch.clone(), media_in_call.clone(), adapter.clone(), last_reconnect_at.clone(), sync_nudge.clone(), ble_audio_writers.clone());
+        lan::spawn_heartbeat(
+            app.clone(),
+            identity.clone(),
+            peer_store.clone(),
+            auto_lock.clone(),
+            last_call_phase.clone(),
+            audio_services(),
+            last_reconnect_at.clone(),
+            sync_nudge.clone(),
+            #[cfg(target_os = "linux")]
+            ble_audio_writers.clone(),
+        );
 
         // Power watcher: edge-detect the laptop's charging flag + battery
         // level from sysfs every 2 s and, on a real change, nudge the
@@ -375,9 +430,15 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // Locked-hint watcher: pushes fresh state to the phone the moment
         // the lock screen flips (remote command or local Super+L), so the
         // phone's lock icon doesn't sit stale until the next beat.
+        #[cfg(target_os = "linux")]
         lan::spawn_locked_watch(sync_nudge.clone());
 
         // Proximity auto-lock/unlock (both toggles opt-in, Settings page).
+        // Presence comes from the BLE-audio session map and needs a BlueZ
+        // adapter to act on, so it rides with the Linux BLE path for now — the
+        // `SessionControl` half of it (lock, and "can we unlock?") is already
+        // portable.
+        #[cfg(target_os = "linux")]
         crate::proximity::spawn_proximity_watch(
             ble_audio_writers.clone(),
             adapter.clone(),
@@ -400,6 +461,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // Inquiry that hogs the single radio and starved every LE connect
         // to ~10 s (root-caused via btmon). We never use BR/EDR discovery
         // for Vortex; the earbuds picker re-asserts Auto for its own scan.
+        #[cfg(target_os = "linux")]
         if let Err(e) = adapter
             .set_discovery_filter(bluer::DiscoveryFilter {
                 transport: bluer::DiscoveryTransport::Le,
@@ -417,6 +479,56 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         //      AUDIO_OP frames (notably call-start) reach us in ~200 ms
         //      instead of waiting for the 12 s LAN heartbeat. Runs only
         //      when a trusted peer exists; restarts itself on disconnect.
+        // The portable BLE link, over the platform seam. Same job as the BlueZ
+        // loop below — connect, IK, publish writers, pump the event stream —
+        // without any BlueZ specifics. See `ble_portable` for why both exist.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let central = vortex_l3_daemon::core::platform::windows::ble::central();
+            let identity_c = identity.clone();
+            let peer_store_c = peer_store.clone();
+            let sinks = crate::ble_portable::BleSinks {
+                state: ble_state_tx.clone(),
+                notif: ble_notif_tx.clone(),
+                live: ble_live_tx.clone(),
+                icon: ble_icon_tx.clone(),
+                call: ble_call_tx.clone(),
+                contacts: ble_contacts_tx.clone(),
+                call_log: ble_call_log_tx.clone(),
+                sms: ble_sms_tx.clone(),
+                sms_thread: ble_sms_thread_tx.clone(),
+                clipboard: ble_clipboard_tx.clone(),
+                clipboard_image: ble_clipboard_image_tx.clone(),
+                clipboard_offer: ble_clipboard_offer_tx.clone(),
+                handoff: ble_handoff_tx.clone(),
+                raw: ble_notes_tx.clone(),
+            };
+            let writers = crate::ble_portable::BleWriterSlots {
+                notif: ble_notif_writer.clone(),
+                clipboard: ble_clipboard_writer.clone(),
+                clipboard_image: ble_clipboard_image_writer.clone(),
+                call: ble_call_writer.clone(),
+                sealed: ble_sealed_writer.clone(),
+            };
+            let nudge = ble_retry_nudge.clone();
+            tokio::spawn(async move {
+                crate::ble_portable::run_portable_ble_loop(
+                    central,
+                    identity_c,
+                    peer_store_c,
+                    sinks,
+                    writers,
+                    nudge,
+                )
+                .await;
+            });
+        }
+
+        // The BlueZ loop: everything the seam version above does, plus the
+        // BlueZ-specific self-healing (adapter power-cycle, `remove_device` to
+        // force a re-resolve, last-RPA learning) that has no counterpart off
+        // Linux.
+        #[cfg(target_os = "linux")]
         {
             let ble_adapter = adapter.clone();
             let ble_identity = identity.clone();
@@ -489,13 +601,20 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
             let auto_identity = identity.clone();
             let auto_peer_store = peer_store.clone();
             let auto_lock_clone = auto_lock.clone();
-            let auto_orch = switch_orchestrator.clone();
-            let auto_writers = session_writers.clone();
-            let auto_media = media_store.clone();
             let auto_last_phase = last_call_phase.clone();
+            #[cfg(target_os = "linux")]
+            let auto_orch = switch_orchestrator.clone();
+            #[cfg(target_os = "linux")]
+            let auto_writers = session_writers.clone();
+            #[cfg(target_os = "linux")]
+            let auto_media = media_store.clone();
+            #[cfg(target_os = "linux")]
             let auto_media_watch = media_watch.clone();
+            #[cfg(target_os = "linux")]
             let auto_media_in_call = media_in_call.clone();
+            #[cfg(target_os = "linux")]
             let auto_adapter = adapter.clone();
+            #[cfg(target_os = "linux")]
             let auto_ble_writers = ble_audio_writers.clone();
             let mdns_last_reconnect = last_reconnect_at.clone();
             tokio::spawn(async move {
@@ -530,19 +649,30 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                     };
                     if have_trust {
                         tracing::info!("mDNS wake-up: triggering immediate reconnect");
+                        #[cfg(target_os = "linux")]
                         let ble_live = !auto_ble_writers.lock().await.is_empty();
+                        #[cfg(not(target_os = "linux"))]
+                        let ble_live = false;
                         let _ = try_lan_reconnect(
                             &auto_app,
                             &auto_identity,
                             auto_peer_store.clone(),
-                            Some(auto_orch.clone()),
-                            Some(auto_writers.clone()),
-                            Some(auto_media.clone()),
                             Some(auto_last_phase.clone()),
                             ble_live,
-                            Some(auto_adapter.clone()),
-                            Some(auto_media_watch.clone()),
-                            Some(auto_media_in_call.clone()),
+                            {
+                                #[cfg(target_os = "linux")]
+                                let a = lan::AudioServices {
+                                    switch_orchestrator: Some(auto_orch.clone()),
+                                    session_writers: Some(auto_writers.clone()),
+                                    media_store: Some(auto_media.clone()),
+                                    shared_adapter: Some(auto_adapter.clone()),
+                                    media_watch: Some(auto_media_watch.clone()),
+                                    media_in_call: Some(auto_media_in_call.clone()),
+                                };
+                                #[cfg(not(target_os = "linux"))]
+                                let a = lan::AudioServices;
+                                a
+                            },
                         )
                         .await;
                         *mdns_last_reconnect.lock().await =
@@ -561,10 +691,13 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // abort+await this first.
         let ctx = worker_ctx::WorkerCtx {
             app: app.clone(),
+            #[cfg(target_os = "linux")]
             adapter: adapter.clone(),
             identity: identity.clone(),
             peer_store: peer_store.clone(),
+            #[cfg(target_os = "linux")]
             switch_orchestrator: switch_orchestrator.clone(),
+            #[cfg(target_os = "linux")]
             session_writers: session_writers.clone(),
         };
         let mut active_scan: Option<tokio::task::JoinHandle<()>> = None;
@@ -578,28 +711,69 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
             // handler (cmd_pairing / cmd_earbuds / mirror) so run_worker stays
             // small as features are added.
             match cmd {
+                #[cfg(target_os = "linux")]
                 UiCmd::Scan => cmd_pairing::scan(&ctx, &mut active_scan),
+                #[cfg(target_os = "linux")]
                 UiCmd::Pair(addr_str) => cmd_pairing::pair(&ctx, addr_str, &mut active_scan).await,
+                #[cfg(target_os = "linux")]
                 UiCmd::ForgetPeer(hex_str) => cmd_pairing::forget_peer(&ctx, hex_str).await,
+                #[cfg(target_os = "linux")]
                 UiCmd::ForgetAll => cmd_pairing::forget_all(&ctx).await,
+                // `switch_peer` runs a discovery, so it needs the BlueZ
+                // adapter; the other two are a peer-store read and an arbiter
+                // flip, which work anywhere.
+                #[cfg(target_os = "linux")]
                 UiCmd::SwitchPeer => cmd_pairing::switch_peer(&ctx),
                 UiCmd::CancelSwitch => cmd_pairing::cancel_switch(&ctx).await,
                 UiCmd::ActivatePeer(hex_str) => {
                     cmd_pairing::activate_peer(&ctx, hex_str).await
                 }
+                #[cfg(target_os = "linux")]
                 UiCmd::RefreshState => cmd_earbuds::refresh_state(&ctx).await,
+                #[cfg(target_os = "linux")]
                 UiCmd::RefreshLocalEarbuds => cmd_earbuds::refresh_local_earbuds(&ctx).await,
+                #[cfg(target_os = "linux")]
                 UiCmd::RequestEarbudsSwitch { peer_static_pub, mac } => {
                     cmd_earbuds::request_switch(&ctx, peer_static_pub, mac).await
                 }
+                #[cfg(target_os = "linux")]
                 UiCmd::SendEarbudsClaim { peer_static_pub, mac } => {
                     cmd_earbuds::send_claim(&ctx, peer_static_pub, mac).await
                 }
+                #[cfg(target_os = "linux")]
                 UiCmd::ToggleEarbuds => cmd_earbuds::toggle_earbuds(&ctx).await,
+                #[cfg(target_os = "linux")]
                 UiCmd::StartMirror { width, height, fps, bitrate } => {
                     crate::mirror::handle_start_cmd(&ctx, width, height, fps, bitrate).await
                 }
+                #[cfg(target_os = "linux")]
                 UiCmd::StopMirror => crate::mirror::handle_stop_cmd(),
+                // The mirror commands cannot be constructed off Linux (the UI
+                // paths that send them are gated too), but the enum is shared.
+                // The commands whose handlers need a radio, an audio device or a
+                // capture pipeline. The UI paths that send them are gated too,
+                // so reaching here means something new started sending one —
+                // logged rather than silently ignored.
+                // Pairing over the seam: scan for a pairable phone, then the
+                // same XX handshake and trust save the Linux path uses. The
+                // address the UI sends is ignored — see `pair_by_scan`.
+                #[cfg(not(target_os = "linux"))]
+                UiCmd::Pair(_addr) => {
+                    let central = vortex_l3_daemon::core::platform::windows::ble::central();
+                    if let Err(e) = crate::ble_portable::pair_by_scan(
+                        &ctx.app,
+                        central,
+                        &ctx.identity,
+                        ctx.peer_store.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!("pairing failed: {e}");
+                        let _ = ctx.app.emit("vortex:pairing_error", e);
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                _ => tracing::warn!("UI command has no handler on this platform; ignoring"),
             }
         }
     });

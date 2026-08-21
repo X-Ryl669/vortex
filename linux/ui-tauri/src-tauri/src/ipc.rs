@@ -189,7 +189,7 @@ pub(crate) fn get_peer_states() -> Vec<PeerStateDto> {
     // connected. Tying the freshness to peer-contact makes the indicator track
     // the live LINK, not the last state change; a genuine disconnect stops the
     // beat, contact goes stale, and the card falls to Offline as before.
-    let in_contact = crate::ble::peer_contact_age_ms() < CONTACT_FRESH_MS;
+    let in_contact = crate::presence::peer_contact_age_ms() < CONTACT_FRESH_MS;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -234,6 +234,9 @@ pub(crate) struct CmdChannel(pub(crate) Sender<UiCmd>);
 /// tagged JSON shape the Vue side expects (`{ kind: "...", ... }`).
 /// Keeping the wire format Vue-side-friendly here means the UI never
 /// has to deal with serde-tagged variant decoding manually.
+/// Only meaningful where the earbuds hand-off exists — the DTO describes that
+/// state machine, and its type is the machine's own enum.
+#[cfg(target_os = "linux")]
 pub(crate) fn switch_state_dto(
     s: &vortex_l3_daemon::core::audio_orchestrator::SwitchState,
 ) -> serde_json::Value {

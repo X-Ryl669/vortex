@@ -55,7 +55,7 @@ pub(crate) fn spawn_consumer(
         while let Some(ev) = rx.recv().await {
             // A handoff frame is proof of live phone contact (the 25s heartbeat
             // keeps this fresh while a page is up) → gates the disconnect-clear.
-            crate::ble::touch_peer_contact();
+            crate::presence::touch_peer_contact();
             if ev.url.is_empty() {
                 if let Ok(mut g) = CURRENT_URL.lock() {
                     g.clear();

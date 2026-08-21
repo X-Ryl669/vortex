@@ -372,6 +372,6 @@ async fn fire_reminder(it: &Item) {
         text: "Reminder".to_string(),
         ..Default::default()
     };
-    let _ = vortex_l3_daemon::core::notification_display::show(&notif, 0).await;
+    let _ = crate::notify::show_mirror(&notif, 0).await;
     tracing::info!("notes: fired todo reminder");
 }

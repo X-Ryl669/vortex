@@ -21,42 +21,6 @@ use crate::NotifWriter;
 /// retries before the invisible self-heal kicks in.
 const CONNECT_WEDGE_THRESHOLD: u32 = 6;
 
-/// Early-wake for the BLE state heartbeat (the 12s loop inside the
-/// persistent session). `notify_one` stores a permit, so a nudge that
-/// fires while the heartbeat is mid-write still takes effect on the
-/// next `notified().await` instead of being lost. Used by the
-/// locked-hint watcher so the phone's lock icon updates in ~1s.
-pub(crate) fn state_nudge() -> &'static tokio::sync::Notify {
-    static NUDGE: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
-    NUDGE.get_or_init(tokio::sync::Notify::new)
-}
-
-/// Epoch-ms of the last PROOF the phone was nearby: a token-validated
-/// trusted-presence advertisement or a live-session event. The proximity
-/// watcher treats "no BLE session AND this stale" as the phone having
-/// left (advertisements keep this fresh during RPA-churn reconnects, so
-/// a flapping session alone never reads as absence).
-pub(crate) static LAST_PRESENCE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn touch_presence() {
-    LAST_PRESENCE_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Epoch-ms of the last AppState/frame received over ANY transport (BLE OR
-/// LAN). Distinct from [`LAST_PRESENCE_MS`] (BLE-only, feeds proximity auto-
-/// lock): this answers "are we in LIVE CONTACT with the phone right now?" and
-/// is used to clear mirror pills (call / handoff) the instant we go fully
-/// offline — their buttons (Accept / Mute / open) are dead without a link, so a
-/// lingering pill is misleading. Touched by both the BLE STATE consumer and the
-/// LAN heartbeat.
-pub(crate) static LAST_PEER_CONTACT_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn touch_peer_contact() {
-    LAST_PEER_CONTACT_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Last BLE address we completed a Noise IK exchange with, per peer.
 ///
 /// Recorded only *after* IK succeeds, so the address is positively tied to
@@ -89,22 +53,6 @@ pub(crate) fn take_peer_addr(peer_pub: &[u8; 32]) -> Option<bluer::Address> {
         .lock()
         .ok()
         .and_then(|mut g| g.as_mut().and_then(|m| m.remove(peer_pub)))
-}
-
-/// Ms since we last heard from the phone over any transport (huge if never).
-pub(crate) fn peer_contact_age_ms() -> u64 {
-    let last = LAST_PEER_CONTACT_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 {
-        return u64::MAX;
-    }
-    now_ms().saturating_sub(last)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Find the first trusted-presence advertiser on-air whose 8-byte
@@ -324,7 +272,7 @@ pub(crate) async fn find_trusted_presence_peer(
     scan.abort();
     let _ = scan.await;
     if res.is_some() {
-        touch_presence();
+        crate::presence::touch_presence();
     }
     // Belt-and-braces: also wait until the adapter actually reports
     // not-discovering before the caller connects (StopDiscovery is async
@@ -440,7 +388,7 @@ async fn monitor_presence_wait(
                 Some(MonitorEvent::DeviceFound(id)) => {
                     if validate_presence_candidate(adapter, peers, id.device).await {
                         tracing::info!(addr = %id.device, "presence monitor: trusted peer on air");
-                        touch_presence();
+                        crate::presence::touch_presence();
                         return PresenceWait::Found(id.device);
                     }
                     // A Vortex advertiser that didn't validate: usually the
@@ -993,7 +941,7 @@ pub(crate) async fn run_ble_persistent_loop(
             peer = %hex::encode(&peer.peer_static_pub[..4]),
             "P2.13: BLE audio-signal session established"
         );
-        touch_presence();
+        crate::presence::touch_presence();
 
         // Bump counter off the hot path — D-Bus to libsecret can stall
         // for hundreds of ms when contended with the BLE adapter's
@@ -1177,7 +1125,7 @@ pub(crate) async fn run_ble_persistent_loop(
                             // keeps the proximity watcher's presence fresh while
                             // connected (the advertisement monitor only runs
                             // between sessions).
-                            touch_presence();
+                            crate::presence::touch_presence();
                             // It ALSO proves the BLE link is live, so it counts
                             // as peer contact — the liveness signal that gates
                             // the disconnect-clear of mirror pills. Without this,
@@ -1187,7 +1135,7 @@ pub(crate) async fn run_ble_persistent_loop(
                             // threshold → the call/handoff pill was falsely
                             // cleared and flickered every ~30s. This 12s beat
                             // keeps it fresh whenever the link is genuinely up.
-                            touch_peer_contact();
+                            crate::presence::touch_peer_contact();
                             if first {
                                 tracing::info!(
                                     earbuds = ?state.earbuds,
@@ -1233,7 +1181,7 @@ pub(crate) async fn run_ble_persistent_loop(
                     // updates in ~1s instead of waiting out the 12s beat.
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(12)) => {}
-                        _ = state_nudge().notified() => {}
+                        _ = crate::presence::state_nudge().notified() => {}
                     }
                 }
             });

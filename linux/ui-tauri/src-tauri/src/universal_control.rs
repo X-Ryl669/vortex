@@ -29,10 +29,25 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+// The Linux capture stack: the input-capture portal places the edge barrier and
+// libei delivers the relative pointer/keyboard once the cursor crosses it.
+//
+// TODO(windows): `core::platform::InputCapture` is the seam for this, and its
+// Windows half (a low-level hook plus ClipCursor) is already written. What is
+// left is splitting `capture_loop` below: its first ~270 lines are portal and
+// libei setup, its `match ev` arms translate `EiEvent` into the same four
+// concepts `InputEvent` models, and the remaining ~350 lines — touch mapping,
+// rotation, the abandon gesture, scroll accumulation — are platform-neutral and
+// worth testing. Same shape as the `audio_signal` split: narrow rind, big core.
+#[cfg(target_os = "linux")]
 use ashpd::desktop::input_capture::{Barrier, Capabilities, InputCapture};
+#[cfg(target_os = "linux")]
 use futures::StreamExt;
+#[cfg(target_os = "linux")]
 use reis::ei::{self, button::ButtonState, keyboard::KeyState};
+#[cfg(target_os = "linux")]
 use reis::event::{DeviceCapability, EiEvent};
+#[cfg(target_os = "linux")]
 use reis::tokio::{EiConvertEventStream, EiEventStream};
 
 /// A capture session is live (loop running). Prevents double-starts.
@@ -267,6 +282,16 @@ pub(crate) async fn uc_start(app: tauri::AppHandle) -> Result<(), String> {
 /// `require_injector` separates a switch flipped by hand — where an unreachable
 /// phone is worth saying out loud immediately — from a restore at launch, where
 /// it is not yet worth mentioning.
+#[cfg(not(target_os = "linux"))]
+fn arm(_app: tauri::AppHandle, _require_injector: bool) -> Result<(), String> {
+    // Everything downstream of capture works here — the injector talks to the
+    // phone over adb and the gesture logic is platform-neutral. It is the edge
+    // capture itself that is not wired to `platform::InputCapture` yet, so
+    // arming would produce a session that never sees a pointer.
+    Err("no_capture_backend".into())
+}
+
+#[cfg(target_os = "linux")]
 fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
@@ -339,6 +364,7 @@ pub(crate) fn uc_running() -> bool {
     RUNNING.load(Ordering::SeqCst)
 }
 
+#[cfg(target_os = "linux")]
 async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     let (edge, seg) = placement();
     // The phone's bounds. We only ever send relative deltas, so without them we
@@ -1308,10 +1334,14 @@ fn edge_name(edge: Edge) -> &'static str {
 // The portal can't hide the laptop cursor; the GNOME extension does it with
 // Mutter's inhibit_cursor_visibility(), watching `CursorHidden` here.
 
+/// Owns `org.vortex.UniversalControl1` so the GNOME extension can inhibit the
+/// laptop pointer while captured. GNOME-specific by construction.
+#[cfg(target_os = "linux")]
 struct UcDbus {
     cursor_hidden: bool,
 }
 
+#[cfg(target_os = "linux")]
 #[zbus::interface(name = "org.vortex.UniversalControl1")]
 impl UcDbus {
     #[zbus(property)]
@@ -1334,6 +1364,10 @@ fn set_cursor(hidden: bool) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn ensure_cursor_publisher() {}
+
+#[cfg(target_os = "linux")]
 /// Start the cursor-hide D-Bus publisher on the CURRENT (main) Tokio runtime.
 /// Idempotent. Owns `org.vortex.UniversalControl` (property `CursorHidden`) and
 /// emits PropertiesChanged on each toggle; the GNOME extension reacts with

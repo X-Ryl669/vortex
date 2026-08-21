@@ -274,13 +274,45 @@ pub(crate) fn default_gateway_v4() -> Option<std::net::Ipv4Addr> {
     }
     None
 }
+/// The handles the heartbeat needs for the features that only exist on Linux:
+/// the earbuds hand-off (orchestrator + LAN session writers), MPRIS media state,
+/// the smart-follow watcher, and the shared BlueZ adapter.
+///
+/// Bundled into one parameter so the signature is IDENTICAL on both platforms —
+/// the alternative was six `#[cfg]`-ed parameters and a matching split at every
+/// call site. Off Linux this is a zero-sized stand-in with no fields, so every
+/// place that reaches for a handle has to say `#[cfg(target_os = "linux")]`,
+/// which is exactly the audit trail we want.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(crate) struct AudioServices {
+    pub switch_orchestrator:
+        Option<Arc<vortex_l3_daemon::core::audio_orchestrator::SwitchOrchestrator>>,
+    pub session_writers: Option<vortex_l3_daemon::core::audio_lan_session::SessionWriterMap>,
+    pub media_store: Option<vortex_l3_daemon::core::media_runtime::MediaStateStore>,
+    /// Shared bluer adapter from the worker. Reused rather than creating a
+    /// `bluer::Session` per heartbeat — the per-tick session creation
+    /// accumulated D-Bus connections and was what hung Tauri after a few call
+    /// cycles (the blocking pool exhausted waiting on libsecret/bluez).
+    pub shared_adapter: Option<bluer::Adapter>,
+    /// Phase 3 — smart audio-follow shared state. `playing` is published on the
+    /// outgoing heartbeat; `peer_playing` tracks the peer's last-seen value so
+    /// the buds-release fires on the peer's not-playing → playing edge.
+    pub media_watch: Option<Arc<vortex_l3_daemon::core::media_watch::MediaWatch>>,
+    /// Updated from `call_phase` so the laptop watcher suppresses grabs during
+    /// a call.
+    pub media_in_call: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// See the Linux definition: no audio, media or BlueZ handles exist here.
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone)]
+pub(crate) struct AudioServices;
+
 pub(crate) async fn try_lan_reconnect(
     app: &AppHandle,
     identity: &IdentityRecord,
     peer_store: Arc<dyn PeerStore>,
-    switch_orchestrator: Option<Arc<vortex_l3_daemon::core::audio_orchestrator::SwitchOrchestrator>>,
-    session_writers: Option<vortex_l3_daemon::core::audio_lan_session::SessionWriterMap>,
-    media_store: Option<vortex_l3_daemon::core::media_runtime::MediaStateStore>,
     // Tracks the last call_phase seen on the heartbeat so we only
     // react to transitions (e.g. `None` → `ringing`), not every
     // repeated tick of the same value.
@@ -293,20 +325,22 @@ pub(crate) async fn try_lan_reconnect(
     // nobody to grab them, orphaning them off both sides. LAN call_phase
     // is strictly the BLE-down fallback.
     ble_live: bool,
-    // Shared bluer adapter from the worker. Reuse instead of calling
-    // `bluer::Session::new()` per heartbeat — the per-tick session
-    // creation accumulated D-Bus connections and was the cause of
-    // Tauri hanging after a few call cycles (the runtime's blocking
-    // pool would exhaust waiting on libsecret/bluez D-Bus calls).
-    shared_adapter: Option<bluer::Adapter>,
-    // Phase 3 — smart audio-follow shared state. `media_watch.playing`
-    // is published on the outgoing heartbeat; `media_watch.peer_playing`
-    // tracks the peer's last-seen value so we fire the buds-release on
-    // the peer's not-playing → playing edge. `media_in_call` is updated
-    // from call_phase so the laptop watcher suppresses grabs during a call.
-    media_watch: Option<Arc<vortex_l3_daemon::core::media_watch::MediaWatch>>,
-    media_in_call: Option<Arc<std::sync::atomic::AtomicBool>>,
+    audio: AudioServices,
 ) -> Result<Option<AppState>, String> {
+    // Destructured so the body below keeps referring to the same names it
+    // always has; on Windows there is nothing to destructure and every use is
+    // behind a cfg.
+    #[cfg(target_os = "linux")]
+    let AudioServices {
+        switch_orchestrator,
+        session_writers,
+        media_store,
+        shared_adapter,
+        media_watch,
+        media_in_call,
+    } = audio;
+    #[cfg(not(target_os = "linux"))]
+    let AudioServices = audio;
     let mut peers = peer_store
         .list()
         .map_err(|e| format!("list: {e}"))?;
@@ -443,6 +477,7 @@ pub(crate) async fn try_lan_reconnect(
     // Reuse the worker's adapter — creating a fresh `bluer::Session`
     // per heartbeat leaks D-Bus connections and eventually wedges the
     // tokio runtime.
+    #[cfg(target_os = "linux")]
     if let Some(adapter) = shared_adapter.as_ref() {
         local_state.earbuds =
             vortex_l3_daemon::core::earbuds::scan_local_earbuds(adapter).await;
@@ -457,9 +492,10 @@ pub(crate) async fn try_lan_reconnect(
     if let Ok(mut g) = crate::notifications::PENDING_NOTIF_INVOKE.lock() {
         local_state.notif_invoke = g.take();
     }
-    // Lock-screen state for the phone's remote-lock button (logind
-    // LockedHint; one cheap D-Bus property read per heartbeat).
-    local_state.locked = vortex_l3_daemon::core::session_lock::locked_hint().await;
+    // Lock-screen state for the phone's remote-lock button. Through the seam:
+    // logind's LockedHint on Linux, WTSSessionInfoEx on Windows — one cheap
+    // query per heartbeat either way, and `None` where the platform won't say.
+    local_state.locked = vortex_l3_daemon::core::platform::session().is_locked().await;
     // Laptop→phone screen-cast offer (where to dial + the key) while casting.
     local_state.laptop_cast = crate::laptop_cast::current_offer();
     local_state.laptop_cast_error = crate::laptop_cast::current_error();
@@ -477,6 +513,7 @@ pub(crate) async fn try_lan_reconnect(
     // watcher wants the phone to take the buds back, set
     // audio_claim_request so the phone grabs them and resumes its paused
     // media (swap-to-false so a single heartbeat carries the flag).
+    #[cfg(target_os = "linux")] // the smart-follow watcher
     if let Some(mw) = media_watch.as_ref() {
         use std::sync::atomic::Ordering;
         local_state.media_playing = mw.playing.load(Ordering::Relaxed);
@@ -763,6 +800,7 @@ pub(crate) async fn try_lan_reconnect(
                     // call end) drives the claim half of that flow,
                     // so we don't need to launch a separate session
                     // here — we just track the transition.
+                    #[cfg(target_os = "linux")] // MPRIS pause-for-call
                     if let (Some(last_mu), Some(store)) =
                         (last_call_phase.as_ref(), media_store.as_ref())
                     {
@@ -784,6 +822,7 @@ pub(crate) async fn try_lan_reconnect(
                             // Keep the laptop media-watcher's call gate
                             // current so it suppresses auto-grabs during a
                             // call (calls outrank media).
+                            #[cfg(target_os = "linux")] // the media watcher call gate
                             if let Some(ic) = media_in_call.as_ref() {
                                 ic.store(in_call, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -814,6 +853,7 @@ pub(crate) async fn try_lan_reconnect(
                                 // runtime after a handful of calls.
                                 if let (Some(saved), Some(adapter)) = (
                                     vortex_l3_daemon::core::earbuds_store::load(),
+                                    #[cfg(target_os = "linux")] // the BlueZ audio release
                                     shared_adapter.clone(),
                                 ) {
                                     let mac = saved.address;
@@ -846,6 +886,7 @@ pub(crate) async fn try_lan_reconnect(
                     // once we drop the ACL). Only release if we're NOT
                     // ourselves playing — don't yank the buds out of an
                     // active laptop session — and we currently hold them.
+                    #[cfg(target_os = "linux")] // the peer-media buds release
                     if let Some(mw) = media_watch.as_ref() {
                         use std::sync::atomic::Ordering;
                         let peer_now = s.media_playing;
@@ -908,6 +949,7 @@ pub(crate) async fn try_lan_reconnect(
                         {
                             if let (Some(saved), Some(adapter)) = (
                                 vortex_l3_daemon::core::earbuds_store::load(),
+                                #[cfg(target_os = "linux")] // the BlueZ audio release
                                 shared_adapter.clone(),
                             ) {
                                 let mac = saved.address;
@@ -928,6 +970,7 @@ pub(crate) async fn try_lan_reconnect(
                         }
                     }
 
+                    #[cfg(target_os = "linux")] // the earbuds claim hand-off
                     if s.audio_claim_request {
                         let already_busy = switch_orchestrator
                             .as_ref()
@@ -1008,7 +1051,7 @@ pub(crate) async fn try_lan_reconnect(
                     crate::proximity::note_phone_unlocked(state.unlocked);
                     // A LAN sync proves we're in live contact (any-transport) —
                     // gates the disconnect-clear of mirror pills.
-                    crate::ble::touch_peer_contact();
+                    crate::presence::touch_peer_contact();
                     let dto = app_state_to_dto(hex::encode(peer.peer_static_pub), state);
                     let _ = app.emit("vortex:peer_state", dto);
                 }
@@ -1037,12 +1080,19 @@ pub(crate) async fn try_lan_reconnect(
 /// or a local Super+L — so the phone's lock icon tracks reality in ~1s
 /// instead of going stale until the next periodic beat (the staleness
 /// made a fresh "lock" tap look like an unlock and prompt for biometrics).
+/// Nudge the heartbeats the instant the session locks or unlocks.
+///
+/// Linux-only: this is a logind signal subscription, and the Windows equivalent
+/// (`WTSRegisterSessionNotification`) needs a window to receive its messages.
+/// Losing it costs only latency — `local_state.locked` is still read from the
+/// seam on every heartbeat, so the phone's view is correct within a tick.
+#[cfg(target_os = "linux")]
 pub(crate) fn spawn_locked_watch(sync_nudge: std::sync::Arc<tokio::sync::Notify>) {
     tokio::spawn(async move {
         let res = vortex_l3_daemon::core::session_lock::watch_locked_hint(move |locked| {
             tracing::info!(locked, "session LockedHint changed; nudging state heartbeats");
             sync_nudge.notify_waiters();
-            crate::ble::state_nudge().notify_one();
+            crate::presence::state_nudge().notify_one();
         })
         .await;
         if let Err(e) = res {
@@ -1086,28 +1136,22 @@ pub(crate) fn spawn_heartbeat(
     identity: IdentityRecord,
     peer_store: std::sync::Arc<dyn PeerStore>,
     auto_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-    switch_orchestrator: std::sync::Arc<vortex_l3_daemon::core::audio_orchestrator::SwitchOrchestrator>,
-    session_writers: vortex_l3_daemon::core::audio_lan_session::SessionWriterMap,
-    media_store: vortex_l3_daemon::core::media_runtime::MediaStateStore,
     last_call_phase: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
-    media_watch: std::sync::Arc<vortex_l3_daemon::core::media_watch::MediaWatch>,
-    media_in_call: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    adapter: bluer::Adapter,
+    audio: AudioServices,
     last_reconnect_at: std::sync::Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     sync_nudge: std::sync::Arc<tokio::sync::Notify>,
+    // Non-empty means the persistent BLE link is live, which is what the
+    // adaptive cadence keys off. Linux-only: there is no BLE-audio session map
+    // elsewhere, and the cadence there treats the link as down.
+    #[cfg(target_os = "linux")]
     ble_audio_writers: vortex_l3_daemon::core::audio_lan_session::SessionWriterMap,
 ) {
             let auto_app = app.clone();
             let auto_identity = identity.clone();
             let auto_peer_store = peer_store.clone();
             let auto_lock_clone = auto_lock.clone();
-            let auto_orch = switch_orchestrator.clone();
-            let auto_writers = session_writers.clone();
-            let auto_media = media_store.clone();
+            let auto_audio = audio.clone();
             let auto_last_phase = last_call_phase.clone();
-            let auto_media_watch = media_watch.clone();
-            let auto_media_in_call = media_in_call.clone();
-            let auto_adapter = adapter.clone();
             let auto_last_reconnect = last_reconnect_at.clone();
             let auto_nudge = sync_nudge.clone();
             // Shared with the BLE persistent loop: it inserts a writer here
@@ -1115,6 +1159,7 @@ pub(crate) fn spawn_heartbeat(
             // non-empty map means "BLE link is live". The heartbeat uses
             // that to back off (BLE already provides liveness + the fast
             // call-signal path).
+            #[cfg(target_os = "linux")]
             let auto_ble_writers = ble_audio_writers.clone();
             tokio::spawn(async move {
                 let mut consec_lan_fail = 0u32;
@@ -1141,20 +1186,18 @@ pub(crate) fn spawn_heartbeat(
                         };
                         let mut synced = false;
                         if have_trust {
+                            #[cfg(target_os = "linux")]
                             let ble_live = !auto_ble_writers.lock().await.is_empty();
+                            #[cfg(not(target_os = "linux"))]
+                            let ble_live = false;
                             synced = matches!(
                                 try_lan_reconnect(
                                     &auto_app,
                                     &auto_identity,
                                     auto_peer_store.clone(),
-                                    Some(auto_orch.clone()),
-                                    Some(auto_writers.clone()),
-                                    Some(auto_media.clone()),
                                     Some(auto_last_phase.clone()),
                                     ble_live,
-                                    Some(auto_adapter.clone()),
-                                    Some(auto_media_watch.clone()),
-                                    Some(auto_media_in_call.clone()),
+                                    auto_audio.clone(),
                                 )
                                 .await,
                                 Ok(Some(_))
@@ -1237,7 +1280,12 @@ pub(crate) fn spawn_heartbeat(
                         } else {
                             Duration::from_secs(12)
                         }
-                    } else if auto_ble_writers.lock().await.is_empty() {
+                    } else if {
+                        #[cfg(target_os = "linux")]
+                        { auto_ble_writers.lock().await.is_empty() }
+                        #[cfg(not(target_os = "linux"))]
+                        { true }
+                    } {
                         Duration::from_secs(12)
                     } else {
                         Duration::from_secs(240)

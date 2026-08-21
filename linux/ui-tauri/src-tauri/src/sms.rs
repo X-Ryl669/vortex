@@ -89,7 +89,7 @@ fn offer_login_code(known: &[SmsMessage], incoming: &[SmsMessage]) {
         })) else {
             return;
         };
-        let _ = vortex_l3_daemon::core::notification_display::show(&n, 0).await;
+        let _ = crate::notify::show_mirror(&n, 0).await;
     });
 }
 

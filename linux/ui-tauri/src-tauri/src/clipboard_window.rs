@@ -88,6 +88,13 @@ fn panel_geometry(app: &AppHandle) -> (f64, f64, f64) {
 /// window asynchronously and X refuses `SetInputFocus` on a window that is not
 /// yet viewable, and Mutter can take focus back a beat after it is granted. So
 /// ask, then VERIFY with `GetInputFocus`, and keep at it until X agrees.
+/// Nothing to force where there is no X server: the popup is a normal top-level
+/// window and the platform's own focus rules apply. The Linux version exists
+/// because Mutter grants focus and then takes it back a beat later.
+#[cfg(not(target_os = "linux"))]
+fn force_x11_focus() {}
+
+#[cfg(target_os = "linux")]
 fn force_x11_focus() {
     std::thread::spawn(|| {
         use x11rb::connection::Connection;

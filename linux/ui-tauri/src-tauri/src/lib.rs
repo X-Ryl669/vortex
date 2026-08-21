@@ -10,6 +10,14 @@
 //! this file is just the composition root: module declarations, the
 //! cross-cutting statics, the re-export block, and `run()`.
 
+// A port in progress: on Windows the Linux-only paths are gated out, which
+// leaves ~110 helpers, constants and statics unreachable there. They are all
+// still live on Linux, so deleting or per-item-gating them would be churn that
+// has to be undone as the Windows side fills in. Silence them as a group
+// instead, and REMOVE this once the port stops moving — otherwise it hides
+// genuinely dead Windows code.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_variables, unused_imports))]
+
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,10 +27,40 @@ use tokio::sync::oneshot;
 
 use vortex_l3_daemon::core::pairing::handshake::LocalDecision;
 
+// The BLE transport and everything that drives it. Gated together with the
+// persistent loop in `worker`: `BleCentral`/`GattLink` make the protocol side
+// portable, but this orchestration is still BlueZ-shaped. See the TODO at the
+// loop's spawn site.
+#[cfg(target_os = "linux")]
 mod ble;
+// The same link, over the seam. Used where there is no BlueZ loop.
+#[cfg(not(target_os = "linux"))]
+mod ble_portable;
 mod call;
 mod call_log;
+// ── Linux-only subsystems ─────────────────────────────────────────────────
+// Screen mirror / cast / camera (GStreamer + GTK3 + the ScreenCast portal) and
+// the earbuds audio hand-off (PulseAudio + BlueZ) have no Windows
+// implementation. Gated as whole modules rather than cfg'd internally: there is
+// no partial version of "decode H.264 into a GTK widget", and pretending
+// otherwise would leave a Windows build full of functions that always error.
+//
+// The features simply do not exist on Windows for now. Everything else — pair,
+// reconnect, notifications, clipboard, file transfer, Universal Control — does.
+#[cfg(target_os = "linux")]
 mod camera;
+// Elsewhere, the same command names resolve to the "unsupported" module, so the
+// `generate_handler!` list below stays single-sourced.
+#[cfg(not(target_os = "linux"))]
+mod platform_unsupported;
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as camera;
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as proximity;
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as earbuds;
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as laptop_cast;
 mod clipboard;
 mod clipboard_hotkey;
 mod clipboard_window;
@@ -31,35 +69,48 @@ mod transfers;
 mod transfers_out;
 mod worker_transfers;
 mod worker_ctx;
+#[cfg(target_os = "linux")]
 mod cmd_pairing;
+#[cfg(target_os = "linux")]
 mod cmd_earbuds;
 mod share;
 mod file_consent;
 mod contacts;
 mod desktop_apps;
+#[cfg(target_os = "linux")]
 mod earbuds;
 mod handoff;
 mod ipc;
 mod lan;
+#[cfg(target_os = "linux")]
 mod laptop_cast;
 mod lan_wifi_direct;
 mod lan_state;
 mod live_activity;
 mod media_remote;
+#[cfg(target_os = "linux")]
 mod mirror;
 mod arbiter;
+// NOT gated with the rest of the mirror: this is the laptop→phone injection
+// path — an adb-forwarded socket to a uinput helper ON THE PHONE. Pure std plus
+// `adb`, no GStreamer and no GTK, and Universal Control sends through it too.
 mod mirror_inject;
 mod peer_cache;
 mod peer_handoff;
+#[cfg(target_os = "linux")]
 mod mirror_window;
 mod notes;
 mod notifications;
+mod notify;
+mod presence;
 mod pairing;
+#[cfg(target_os = "linux")]
 mod proximity;
 mod ring;
 mod sms;
 mod tray;
 mod universal_control;
+#[cfg(target_os = "linux")]
 mod virtual_display;
 mod voice_settings;
 mod worker;
@@ -93,6 +144,11 @@ pub(crate) type SealedWriter = Arc<
 /// itself lives inside the worker task; this is just a handle to its
 /// AtomicBool. `OnceLock` because it's set exactly once and read-only
 /// thereafter (the AtomicBool inside is what mutates).
+/// Linux-only: the watcher is MPRIS, so there is nothing to hold a handle to
+/// elsewhere. Its readers are the earbuds module (gated with it) and the
+/// smart-switch setting adopted from the phone's heartbeat, which skips the
+/// adoption rather than inventing a local value.
+#[cfg(target_os = "linux")]
 pub(crate) static MEDIA_WATCH: std::sync::OnceLock<
     Arc<vortex_l3_daemon::core::media_watch::MediaWatch>,
 > = std::sync::OnceLock::new();
