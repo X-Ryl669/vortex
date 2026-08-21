@@ -53,12 +53,16 @@ use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristic, GattClientCharacteristicConfigurationDescriptorValue,
     GattCommunicationStatus, GattValueChangedEventArgs, GattWriteOption,
 };
-use windows::Devices::Bluetooth::{BluetoothAdapter, BluetoothConnectionStatus, BluetoothLEDevice};
+use windows::Devices::Bluetooth::{
+    BluetoothAdapter, BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice,
+};
 use windows::Devices::Enumeration::DeviceInformation;
 use windows::Foundation::TypedEventHandler;
 use windows::Storage::Streams::{DataReader, DataWriter};
 
-use crate::core::platform::{BleCentral, BoxFuture, GattLink, PeerAddr, Uuid128};
+use super::ensure_winrt;
+use crate::core::ble::{decode_service_data_128, AdvPayload, AD_TYPE_SERVICE_DATA_128};
+use crate::core::platform::{AdvCandidate, BleCentral, BoxFuture, GattLink, PeerAddr, Uuid128};
 
 /// Turn our platform-neutral [`Uuid128`] into the WinRT GUID. Both treat the
 /// value as the big-endian UUID form, so this is a reinterpretation, not a
@@ -74,34 +78,6 @@ fn err(context: &str, e: windows::core::Error) -> String {
     format!("{context}: {} ({})", e.message(), e.code().0)
 }
 
-/// Join the multithreaded apartment on this thread, once.
-///
-/// WinRT activation fails with `CO_E_NOTINITIALIZED` on a thread that has not
-/// initialized an apartment, and the daemon's threads are plain tokio workers
-/// that never do. This compiles fine without it and then fails on the very
-/// first call — the sort of thing only a real Windows run surfaces.
-///
-/// `S_FALSE` (already initialized) and `RPC_E_CHANGED_MODE` (this thread is
-/// already in an STA — the UI thread, say) are both fine: in either case the
-/// thread has an apartment, which is all we need.
-fn ensure_winrt() {
-    use std::cell::Cell;
-    use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
-    thread_local! {
-        static JOINED: Cell<bool> = const { Cell::new(false) };
-    }
-    JOINED.with(|j| {
-        if j.get() {
-            return;
-        }
-        // SAFETY: no arguments to get wrong; the failure modes above are the
-        // documented benign ones and everything else means WinRT is unusable
-        // here, which the next call will report with real context.
-        let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
-        j.set(true);
-    });
-}
-
 pub struct WindowsBleCentral;
 
 impl BleCentral for WindowsBleCentral {
@@ -110,17 +86,17 @@ impl BleCentral for WindowsBleCentral {
     /// Active scanning on purpose: the phone puts its service UUID in the
     /// advertisement, but a passive scan on Windows can miss the scan-response
     /// payload where a crowded advert spills it.
-    fn scan_for_peer(&self, timeout_ms: u64) -> BoxFuture<Result<Option<PeerAddr>, String>> {
-        let wanted = guid(crate::core::ble::VORTEX_SERVICE_UUID.as_u128());
+    fn scan_for_peer(&self, timeout_ms: u64) -> BoxFuture<Result<Option<AdvCandidate>, String>> {
         // The watcher is not agile either, and unlike the write path it has to
         // stay alive for the whole scan — so it gets a thread of its own and
         // never crosses an await. Only the address comes back, over a channel.
         // This also gives the COM object consistent thread affinity, which a
         // non-agile object is entitled to expect.
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<Option<u64>, String>>();
+        let (done_tx, done_rx) =
+            tokio::sync::oneshot::channel::<Result<Option<(u64, AdvPayload, i16)>, String>>();
         std::thread::spawn(move || {
             ensure_winrt();
-            let outcome = (|| -> Result<Option<u64>, String> {
+            let outcome = (|| -> Result<Option<(u64, AdvPayload, i16)>, String> {
                 let watcher = BluetoothLEAdvertisementWatcher::new()
                     .map_err(|e| err("advertisement watcher", e))?;
                 watcher
@@ -130,7 +106,7 @@ impl BleCentral for WindowsBleCentral {
                 // `recv_timeout` gives us the scan deadline for free. The
                 // sender sits behind a Mutex because WinRT may invoke the
                 // handler from any thread, so it must be Sync as well as Send.
-                let (hit_tx, hit_rx) = std::sync::mpsc::channel::<u64>();
+                let (hit_tx, hit_rx) = std::sync::mpsc::channel::<(u64, AdvPayload, i16)>();
                 let hit_tx = std::sync::Mutex::new(hit_tx);
                 let handler = TypedEventHandler::<
                     BluetoothLEAdvertisementWatcher,
@@ -140,12 +116,27 @@ impl BleCentral for WindowsBleCentral {
                     // sender into the same error path as any WinRT failure.
                     let args = args.ok()?;
                     let addr = args.BluetoothAddress()?;
-                    for u in args.Advertisement()?.ServiceUuids()? {
-                        if u == wanted {
+                    let rssi = args.RawSignalStrengthInDBm().unwrap_or(0);
+
+                    // Matching `ServiceUuids` would only say "a Vortex phone is
+                    // nearby"; the pairing and reconnect flows need the PAYLOAD,
+                    // which rides in the service-data section. So walk the raw
+                    // AD sections and let the protocol layer decide — same
+                    // §5.2 filter both platforms use.
+                    for section in args.Advertisement()?.DataSections()? {
+                        if section.DataType()? != AD_TYPE_SERVICE_DATA_128 {
+                            continue;
+                        }
+                        let buffer = section.Data()?;
+                        let len = buffer.Length()? as usize;
+                        let reader = DataReader::FromBuffer(&buffer)?;
+                        let mut bytes = vec![0u8; len];
+                        reader.ReadBytes(&mut bytes)?;
+                        if let Some(payload) = decode_service_data_128(&bytes) {
                             // A closed channel means we already have our
-                            // answer; dropping this address is right then.
+                            // answer; dropping this advert is right then.
                             if let Ok(g) = hit_tx.lock() {
-                                let _ = g.send(addr);
+                                let _ = g.send((addr, payload, rssi));
                             }
                             break;
                         }
@@ -172,7 +163,11 @@ impl BleCentral for WindowsBleCentral {
 
         Box::pin(async move {
             match done_rx.await {
-                Ok(Ok(hit)) => Ok(hit.map(PeerAddr::from_u48)),
+                Ok(Ok(hit)) => Ok(hit.map(|(addr, payload, rssi)| AdvCandidate {
+                    addr: PeerAddr::from_u48(addr),
+                    payload,
+                    rssi: Some(rssi),
+                })),
                 Ok(Err(e)) => Err(e),
                 // The scan thread died without reporting. Treat it as "no peer
                 // seen" rather than a hard error: the caller retries anyway,
@@ -237,6 +232,7 @@ impl BleCentral for WindowsBleCentral {
             }
 
             Ok(Box::new(WindowsGattLink {
+                addr,
                 device,
                 chars,
                 subscriptions: Mutex::new(Vec::new()),
@@ -306,6 +302,9 @@ impl BleCentral for WindowsBleCentral {
 /// tokens need a lock, because unsubscribing happens on a different thread from
 /// the one that subscribed.
 pub struct WindowsGattLink {
+    /// Kept from the connect call rather than re-read from the device: the
+    /// property read can fail, and a link always knows who it dialled.
+    addr: PeerAddr,
     device: BluetoothLEDevice,
     chars: HashMap<Uuid128, GattCharacteristic>,
     subscriptions: Mutex<Vec<(GattCharacteristic, i64)>>,
@@ -368,6 +367,35 @@ impl GattLink for WindowsGattLink {
                 return Err(format!("gatt write failed: status {status:?}"));
             }
             Ok(())
+        })
+    }
+
+    fn read(&self, char_uuid: Uuid128) -> BoxFuture<Result<Vec<u8>, String>> {
+        let c = self.characteristic(char_uuid);
+        Box::pin(async move {
+            ensure_winrt();
+            let c = c?;
+            // Uncached: the capability read happens at connect time and must
+            // reflect the peer we are talking to now, not whatever Windows
+            // cached from a previous session with an older phone build.
+            let op = c
+                .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)
+                .map_err(|e| err("ReadValueWithCacheModeAsync", e))?;
+            let result = op.await.map_err(|e| err("read await", e))?;
+            let status = result.Status().map_err(|e| err("read status", e))?;
+            if status != GattCommunicationStatus::Success {
+                return Err(format!("gatt read failed: status {status:?}"));
+            }
+            // The buffer is non-agile, but there is no await left after this
+            // point, so it never has to be `Send`.
+            let buffer = result.Value().map_err(|e| err("read value", e))?;
+            let len = buffer.Length().map_err(|e| err("buffer length", e))? as usize;
+            let reader = DataReader::FromBuffer(&buffer).map_err(|e| err("DataReader", e))?;
+            let mut bytes = vec![0u8; len];
+            reader
+                .ReadBytes(&mut bytes)
+                .map_err(|e| err("DataReader.ReadBytes", e))?;
+            Ok(bytes)
         })
     }
 
@@ -454,11 +482,25 @@ impl GattLink for WindowsGattLink {
         })
     }
 
-    fn is_connected(&self) -> bool {
-        self.device
+    fn peer(&self) -> PeerAddr {
+        self.addr
+    }
+
+    /// Resolved at connect time, so this is a local lookup — a peer that
+    /// predates the audio-signal characteristic simply doesn't have it.
+    fn has(&self, char_uuid: Uuid128) -> bool {
+        self.chars.contains_key(&char_uuid)
+    }
+
+    /// A property read, not a round trip — but async to match the trait, which
+    /// Linux needs because BlueZ answers over D-Bus.
+    fn is_connected(&self) -> BoxFuture<bool> {
+        let connected = self
+            .device
             .ConnectionStatus()
             .map(|s| s == BluetoothConnectionStatus::Connected)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        Box::pin(async move { connected })
     }
 }
 

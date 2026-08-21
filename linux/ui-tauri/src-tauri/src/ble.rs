@@ -8,6 +8,7 @@ use vortex_l3_daemon::core::ble::client::VortexClient;
 use vortex_l3_daemon::core::ble::scanner::run_filtered_scan;
 use vortex_l3_daemon::core::identity::IdentityRecord;
 use vortex_l3_daemon::core::pairing::reconnect::run_ik_initiator;
+use vortex_l3_daemon::core::platform::linux::{LinuxAudioHandoff, LinuxGattLink};
 use vortex_l3_daemon::core::storage::peers::PeerStore;
 
 use crate::NotifWriter;
@@ -931,8 +932,12 @@ pub(crate) async fn run_ble_persistent_loop(
             .unwrap_or(0)
         };
         tracing::info!("P2.13: BLE IK starting");
+        // Same client, presented through the seam — the IK flow is
+        // platform-neutral now and the audio-signal work below still uses
+        // `client` directly for its characteristic.
+        let link = LinuxGattLink::from_client(adapter.clone(), &client);
         let outcome = match run_ik_initiator(
-            &client,
+            &link,
             &identity.static_priv.0,
             &peer.peer_static_pub,
             &peer.prs,
@@ -1011,13 +1016,18 @@ pub(crate) async fn run_ble_persistent_loop(
         // subscription, but bluer characteristics are reference-
         // counted under the hood so the writer's clone is safe.
         let client_arc = Arc::new(client);
+        // The same live connection, presented through the seam: `audio_signal`
+        // speaks `&dyn GattLink` now, so every writer below and the listener
+        // itself take this. `client_arc` stays for the address and the typed
+        // helpers around it.
+        let link_arc = Arc::new(LinuxGattLink::from_client(adapter.clone(), &client_arc));
         let writer_transport = transport.clone();
-        let writer_client = client_arc.clone();
+        let writer_link = link_arc.clone();
         let writer_fn: SessionWriter = Arc::new(move |frame: AudioOpFrame| {
             let transport = writer_transport.clone();
-            let client = writer_client.clone();
+            let link = writer_link.clone();
             Box::pin(async move {
-                audio_signal::write_audio_op(&client, transport, frame).await
+                audio_signal::write_audio_op(&*link, transport, frame).await
             })
         });
         {
@@ -1032,12 +1042,12 @@ pub(crate) async fn run_ble_persistent_loop(
         // the capture consumer can push desktop notifications to the phone.
         {
             let nw_transport = transport.clone();
-            let nw_client = client_arc.clone();
+            let nw_client = link_arc.clone();
             let writer: NotifWriter = Arc::new(move |notif| {
                 let transport = nw_transport.clone();
-                let client = nw_client.clone();
+                let link = nw_client.clone();
                 Box::pin(async move {
-                    audio_signal::write_notification(&client, transport, &notif).await
+                    audio_signal::write_notification(&*link, transport, &notif).await
                 })
             });
             *notif_writer.lock().await = Some(writer);
@@ -1047,12 +1057,12 @@ pub(crate) async fn run_ble_persistent_loop(
         // clipboard sync consumer can push copied text to the phone.
         {
             let cw_transport = transport.clone();
-            let cw_client = client_arc.clone();
+            let cw_link = link_arc.clone();
             let writer: crate::ClipboardWriter = Arc::new(move |clip| {
                 let transport = cw_transport.clone();
-                let client = cw_client.clone();
+                let link = cw_link.clone();
                 Box::pin(async move {
-                    audio_signal::write_clipboard(&client, transport, &clip).await
+                    audio_signal::write_clipboard(&*link, transport, &clip).await
                 })
             });
             *clipboard_writer.lock().await = Some(writer);
@@ -1062,12 +1072,12 @@ pub(crate) async fn run_ble_persistent_loop(
         // live link so the sync consumer can push a copied image to the phone.
         {
             let cw_transport = transport.clone();
-            let cw_client = client_arc.clone();
+            let cw_link = link_arc.clone();
             let writer: crate::ClipboardImageWriter = Arc::new(move |png| {
                 let transport = cw_transport.clone();
-                let client = cw_client.clone();
+                let link = cw_link.clone();
                 Box::pin(async move {
-                    audio_signal::write_clipboard_image(&client, transport, &png).await
+                    audio_signal::write_clipboard_image(&*link, transport, &png).await
                 })
             });
             *clipboard_image_writer.lock().await = Some(writer);
@@ -1077,12 +1087,12 @@ pub(crate) async fn run_ble_persistent_loop(
         // the call-banner consumer can answer/decline/end/mute via BLE.
         {
             let cw_transport = transport.clone();
-            let cw_client = client_arc.clone();
+            let cw_link = link_arc.clone();
             let writer: crate::CallWriter = Arc::new(move |ctrl| {
                 let transport = cw_transport.clone();
-                let client = cw_client.clone();
+                let link = cw_link.clone();
                 Box::pin(async move {
-                    audio_signal::write_call_control(&client, transport, &ctrl).await
+                    audio_signal::write_call_control(&*link, transport, &ctrl).await
                 })
             });
             *call_writer.lock().await = Some(writer);
@@ -1092,12 +1102,12 @@ pub(crate) async fn run_ble_persistent_loop(
         // feature (e.g. notes) can send a `(ty, payload)` frame to the phone.
         {
             let sw_transport = transport.clone();
-            let sw_client = client_arc.clone();
+            let sw_client = link_arc.clone();
             let writer: crate::SealedWriter = Arc::new(move |ty, payload| {
                 let transport = sw_transport.clone();
-                let client = sw_client.clone();
+                let link = sw_client.clone();
                 Box::pin(async move {
-                    audio_signal::write_sealed(&client, transport, ty, &payload).await
+                    audio_signal::write_sealed(&*link, transport, ty, &payload).await
                 })
             });
             *sealed_writer.lock().await = Some(writer);
@@ -1111,7 +1121,10 @@ pub(crate) async fn run_ble_persistent_loop(
         // enough — it must repeat. Exits when the session drops (write fails);
         // the next session re-arms it. Symmetric to the phone's repeated pushes.
         {
-            let st_client = client_arc.clone();
+            let st_link = link_arc.clone();
+            // Kept as a bluer address: `remove_device` is a BlueZ call, and
+            // round-tripping it through the seam's PeerAddr would buy nothing.
+            let st_addr = client_arc.address;
             let st_transport = transport.clone();
             let st_adapter = adapter.clone();
             tokio::spawn(async move {
@@ -1156,7 +1169,7 @@ pub(crate) async fn run_ble_persistent_loop(
                     // notification — must ride the BLE STATE path too so the
                     // notification works on a BLE-only link (AP isolation).
                     crate::media_remote::fill_now_playing(&mut state).await;
-                    match audio_signal::write_state(&st_client, st_transport.clone(), &state).await
+                    match audio_signal::write_state(&*st_link, st_transport.clone(), &state).await
                     {
                         Ok(()) => {
                             consecutive_fail = 0;
@@ -1207,7 +1220,7 @@ pub(crate) async fn run_ble_persistent_loop(
                                 // remove_device is idempotent with the listener's
                                 // own cleanup (the loser just gets "Does Not
                                 // Exist"). Cuts reconnect to ~5s on a real drop.
-                                let _ = st_adapter.remove_device(st_client.address).await;
+                                let _ = st_adapter.remove_device(st_addr).await;
                                 break;
                             }
                             tracing::debug!("BLE state write failed (#{consecutive_fail}); retrying: {e}");
@@ -1270,11 +1283,15 @@ pub(crate) async fn run_ble_persistent_loop(
 
         // Step 5 — subscribe + dispatch. Returns on disconnect.
         let _ = audio_signal::run_listener(
-            &client_arc,
+            &*link_arc,
             transport,
             peer.peer_static_pub,
-            switch_orchestrator.clone(),
-            media_store.clone(),
+            // The one frame type that needs the local audio stack, behind the
+            // seam. `Some` here because this IS the platform that has one.
+            Some(Arc::new(LinuxAudioHandoff::new(
+                switch_orchestrator.clone(),
+                media_store.clone(),
+            ))),
             Some(state_tx.clone()),
             Some(notif_tx.clone()),
             Some(live_tx.clone()),

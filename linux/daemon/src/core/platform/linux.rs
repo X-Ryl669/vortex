@@ -224,3 +224,317 @@ XDG_DOCUMENTS_DIR="$HOME/Documents"
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// BLE central over BlueZ
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use super::{AdvCandidate, AudioHandoff, BleCentral, GattLink, PeerAddr, Uuid128};
+use crate::core::ble::client::VortexClient;
+use crate::core::ble::{
+    AUDIO_SIGNAL_UUID, CAPABILITY_UUID, PAIRING_CONTROL_UUID, RECONNECT_CONTROL_UUID,
+};
+
+/// BlueZ-backed [`BleCentral`]. Wraps the existing [`VortexClient`] and scanner
+/// rather than reimplementing them: everything hard-won about connecting to a
+/// dual-mode phone (see the bearer-selection comment in `ble::client`) stays in
+/// one place, and this file only adapts the shapes.
+pub struct LinuxBleCentral {
+    adapter: bluer::Adapter,
+}
+
+impl LinuxBleCentral {
+    /// Takes the process's shared adapter — see the note on [`BleCentral`] for
+    /// why this is passed in rather than acquired here.
+    pub fn new(adapter: bluer::Adapter) -> Self {
+        Self { adapter }
+    }
+}
+
+impl BleCentral for LinuxBleCentral {
+    /// First Vortex advertisement seen, or `None` on timeout.
+    ///
+    /// `run_filtered_scan` never returns on its own — it is meant to be driven
+    /// until dropped — so it races against the deadline and the first hit.
+    fn scan_for_peer(&self, timeout_ms: u64) -> BoxFuture<Result<Option<AdvCandidate>, String>> {
+        let adapter = self.adapter.clone();
+        Box::pin(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AdvCandidate>();
+            let scan = crate::core::ble::scanner::run_filtered_scan(adapter, move |c| {
+                // The scanner has already run the §5.2 filter, so the payload
+                // it hands over is valid — pass it through rather than
+                // re-deriving anything from the address.
+                let _ = tx.send(AdvCandidate {
+                    addr: PeerAddr(c.address.0),
+                    payload: c.payload,
+                    rssi: c.rssi,
+                });
+            });
+            tokio::select! {
+                // Dropping `scan` here stops the discovery, which is the
+                // documented way to end it.
+                Some(found) = rx.recv() => Ok(Some(found)),
+                r = scan => match r {
+                    // It only returns on error; a clean return means the
+                    // discovery ended without a candidate.
+                    Ok(()) => Ok(None),
+                    Err(e) => Err(format!("scan: {e}")),
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => Ok(None),
+            }
+        })
+    }
+
+    fn connect(&self, addr: PeerAddr) -> BoxFuture<Result<Box<dyn GattLink>, String>> {
+        let adapter = self.adapter.clone();
+        Box::pin(async move {
+            let address = bluer::Address::new(addr.0);
+            let client = VortexClient::connect(&adapter, address)
+                .await
+                .map_err(|e| format!("connect {address}: {e}"))?;
+            Ok(Box::new(LinuxGattLink::from_client(adapter, &client)) as Box<dyn GattLink>)
+        })
+    }
+
+    /// Paired devices known to the adapter.
+    ///
+    /// A device that fails to answer `is_paired` is skipped rather than
+    /// failing the list: one stale record must not hide the rest.
+    fn bonded(&self) -> BoxFuture<Result<Vec<PeerAddr>, String>> {
+        let adapter = self.adapter.clone();
+        Box::pin(async move {
+            let addrs = adapter
+                .device_addresses()
+                .await
+                .map_err(|e| format!("device_addresses: {e}"))?;
+            let mut out = Vec::new();
+            for a in addrs {
+                let Ok(dev) = adapter.device(a) else { continue };
+                if dev.is_paired().await.unwrap_or(false) {
+                    out.push(PeerAddr(a.0));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn adapter_ready(&self) -> BoxFuture<bool> {
+        let adapter = self.adapter.clone();
+        Box::pin(async move { adapter.is_powered().await.unwrap_or(false) })
+    }
+}
+
+/// An open BlueZ GATT link: the characteristics a [`VortexClient`] resolved,
+/// plus the adapter and address needed to answer "are we still connected?".
+///
+/// Holds the characteristics rather than the client so that [`Self::from_client`]
+/// can BORROW a client the caller keeps using. bluer's handles are cheap clones
+/// of D-Bus paths, and the existing call sites (pairing, the BLE loop) still
+/// want their `VortexClient` for the typed helpers after the handshake.
+pub struct LinuxGattLink {
+    adapter: bluer::Adapter,
+    address: bluer::Address,
+    capability: bluer::gatt::remote::Characteristic,
+    pairing_control: bluer::gatt::remote::Characteristic,
+    reconnect_control: bluer::gatt::remote::Characteristic,
+    /// `None` on phone builds before P2.13 — see [`GattLink::has`].
+    audio_signal: Option<bluer::gatt::remote::Characteristic>,
+    /// One forwarding task per subscription, aborted on disconnect. bluer hands
+    /// back a Stream; the seam hands out a channel, so something has to pump.
+    ///
+    /// `Arc` because the returned futures are `'static` (the trait's `BoxFuture`
+    /// carries no lifetime), so they cannot borrow from `&self` — they get a
+    /// handle instead.
+    notify_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl LinuxGattLink {
+    /// Present an already-connected [`VortexClient`] as a [`GattLink`].
+    ///
+    /// This is the migration path: the pairing and reconnect flows move onto
+    /// `&dyn GattLink` while their callers keep the connect logic they have —
+    /// all the dual-mode bearer handling in `ble::client` — and simply wrap it
+    /// here. No second connect, no behaviour change.
+    pub fn from_client(adapter: bluer::Adapter, client: &VortexClient) -> Self {
+        Self {
+            adapter,
+            address: client.address,
+            capability: client.capability.clone(),
+            pairing_control: client.pairing_control.clone(),
+            reconnect_control: client.reconnect_control.clone(),
+            audio_signal: client.audio_signal.clone(),
+            notify_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl LinuxGattLink {
+    /// Resolve a UUID to the characteristic the client already discovered.
+    ///
+    /// A match rather than a map because the set is fixed by the spec (§10.1)
+    /// and `audio_signal` is optional — an absent one has to read as "not on
+    /// this peer", not as a lookup bug.
+    fn characteristic(
+        &self,
+        uuid: Uuid128,
+    ) -> Result<&bluer::gatt::remote::Characteristic, String> {
+        let u = uuid::Uuid::from_u128(uuid);
+        if u == CAPABILITY_UUID {
+            Ok(&self.capability)
+        } else if u == PAIRING_CONTROL_UUID {
+            Ok(&self.pairing_control)
+        } else if u == RECONNECT_CONTROL_UUID {
+            Ok(&self.reconnect_control)
+        } else if u == AUDIO_SIGNAL_UUID {
+            self.audio_signal
+                .as_ref()
+                .ok_or_else(|| "audio-signal characteristic absent on this peer".to_string())
+        } else {
+            Err(format!("{u} is not a vortex characteristic"))
+        }
+    }
+}
+
+impl GattLink for LinuxGattLink {
+    fn write(
+        &self,
+        char_uuid: Uuid128,
+        data: &[u8],
+        with_response: bool,
+    ) -> BoxFuture<Result<(), String>> {
+        let c = self.characteristic(char_uuid).cloned();
+        let bytes = data.to_vec();
+        Box::pin(async move {
+            let c = c?;
+            let req = bluer::gatt::remote::CharacteristicWriteRequest {
+                offset: 0,
+                op_type: if with_response {
+                    bluer::gatt::WriteOp::Request
+                } else {
+                    bluer::gatt::WriteOp::Command
+                },
+                prepare_authorize: false,
+                ..Default::default()
+            };
+            c.write_ext(&bytes, &req)
+                .await
+                .map_err(|e| format!("gatt write: {e}"))
+        })
+    }
+
+    fn read(&self, char_uuid: Uuid128) -> BoxFuture<Result<Vec<u8>, String>> {
+        let c = self.characteristic(char_uuid).cloned();
+        Box::pin(async move { c?.read().await.map_err(|e| format!("gatt read: {e}")) })
+    }
+
+    fn subscribe(
+        &self,
+        char_uuid: Uuid128,
+        tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) -> BoxFuture<Result<(), String>> {
+        let c = self.characteristic(char_uuid).cloned();
+        let tasks = Arc::clone(&self.notify_tasks);
+        Box::pin(async move {
+            let c = c?;
+            let stream = c.notify().await.map_err(|e| format!("gatt notify: {e}"))?;
+            let handle = tokio::spawn(async move {
+                use futures::StreamExt;
+                let mut stream = std::pin::pin!(stream);
+                while let Some(bytes) = stream.next().await {
+                    if tx.send(bytes).is_err() {
+                        break; // consumer gone
+                    }
+                }
+            });
+            if let Ok(mut g) = tasks.lock() {
+                g.push(handle);
+            }
+            Ok(())
+        })
+    }
+
+    fn peer(&self) -> PeerAddr {
+        PeerAddr(self.address.0)
+    }
+
+    fn has(&self, char_uuid: Uuid128) -> bool {
+        self.characteristic(char_uuid).is_ok()
+    }
+
+    /// Stop forwarding notifications and let the link go.
+    ///
+    /// Deliberately does NOT call `Device::disconnect()`. On a dual-mode phone
+    /// that tears down every bearer, including the A2DP/HFP link if the phone
+    /// is also paired as an audio device — so a "close this GATT link" would
+    /// cut the user's music. BlueZ drops the LE link once the handles go, which
+    /// is what the pre-seam code relied on too.
+    fn disconnect(&self) -> BoxFuture<Result<(), String>> {
+        let taken: Vec<tokio::task::JoinHandle<()>> = self
+            .notify_tasks
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        Box::pin(async move {
+            for t in taken {
+                t.abort();
+            }
+            Ok(())
+        })
+    }
+
+    fn is_connected(&self) -> BoxFuture<bool> {
+        let adapter = self.adapter.clone();
+        let address = self.address;
+        Box::pin(async move {
+            match adapter.device(address) {
+                Ok(d) => d.is_connected().await.unwrap_or(false),
+                Err(_) => false,
+            }
+        })
+    }
+}
+
+/// Linux audio handoff: the PulseAudio/BlueZ switch orchestrator plus the MPRIS
+/// store the fast-path pause needs. Both already existed; this only presents
+/// them to the (platform-neutral) BLE event stream.
+pub struct LinuxAudioHandoff {
+    orchestrator: Arc<crate::core::audio_orchestrator::SwitchOrchestrator>,
+    media_store: crate::core::media_runtime::MediaStateStore,
+}
+
+impl LinuxAudioHandoff {
+    pub fn new(
+        orchestrator: Arc<crate::core::audio_orchestrator::SwitchOrchestrator>,
+        media_store: crate::core::media_runtime::MediaStateStore,
+    ) -> Self {
+        Self {
+            orchestrator,
+            media_store,
+        }
+    }
+}
+
+impl AudioHandoff for LinuxAudioHandoff {
+    fn pause_for_call(&self) -> BoxFuture<()> {
+        let store = self.media_store.clone();
+        Box::pin(async move {
+            let paused = crate::core::media_runtime::pause_playing_for_call(&store).await;
+            if !paused.is_empty() {
+                tracing::info!(?paused, "BLE fast-path: paused MPRIS for call");
+            }
+        })
+    }
+
+    fn on_incoming(
+        &self,
+        peer: [u8; 32],
+        frame: crate::core::audio_op::AudioOpFrame,
+    ) -> BoxFuture<()> {
+        let orch = Arc::clone(&self.orchestrator);
+        Box::pin(async move {
+            let _ = orch.on_incoming(peer, frame).await;
+        })
+    }
+}
