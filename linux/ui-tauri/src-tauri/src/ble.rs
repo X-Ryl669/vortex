@@ -27,98 +27,6 @@ use crate::NotifWriter;
 /// a wedged controller.
 const CONNECT_WEDGE_THRESHOLD: u32 = 6;
 
-/// Early-wake for the BLE state heartbeat (the 12s loop inside the
-/// persistent session). `notify_one` stores a permit, so a nudge that
-/// fires while the heartbeat is mid-write still takes effect on the
-/// next `notified().await` instead of being lost. Used by the
-/// locked-hint watcher so the phone's lock icon updates in ~1s.
-pub(crate) fn state_nudge() -> &'static tokio::sync::Notify {
-    static NUDGE: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
-    NUDGE.get_or_init(tokio::sync::Notify::new)
-}
-
-/// Epoch-ms of the last PROOF the phone was nearby: a token-validated
-/// trusted-presence advertisement or a live-session event. The proximity
-/// watcher treats "no BLE session AND this stale" as the phone having
-/// left (advertisements keep this fresh during RPA-churn reconnects, so
-/// a flapping session alone never reads as absence).
-pub(crate) static LAST_PRESENCE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn touch_presence() {
-    LAST_PRESENCE_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Epoch-ms of the last AppState/frame received over ANY transport (BLE OR
-/// LAN). Distinct from [`LAST_PRESENCE_MS`] (BLE-only, feeds proximity auto-
-/// lock): this answers "are we in LIVE CONTACT with the phone right now?" and
-/// is used to clear mirror pills (call / handoff) the instant we go fully
-/// offline — their buttons (Accept / Mute / open) are dead without a link, so a
-/// lingering pill is misleading. Touched by both the BLE STATE consumer and the
-/// LAN heartbeat.
-pub(crate) static LAST_PEER_CONTACT_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn touch_peer_contact() {
-    LAST_PEER_CONTACT_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The RPA of the BLE session that is live right now, so the app can hand the
-/// link back on its way out. `None` between sessions.
-///
-/// Everything else about teardown was already handled — the loop disconnects
-/// and forgets the device whenever the listener returns. What was missing is
-/// that a PROCESS EXIT never reaches that code: the loop dies with the process
-/// and BlueZ, which owns the connection independently of us, keeps it open.
-/// The phone's GATT server therefore still sees a connected peer, holds its
-/// RPA and stops advertising in a way a scan can find — so the freshly started
-/// app scans, backs off 15s → 60s, and never reconnects. Measured on this
-/// machine: BLE dead for six minutes after a restart, with LAN quietly
-/// covering for it. Clearing the entry by hand and letting it reconnect took
-/// eleven seconds.
-static SESSION_ADDR: std::sync::Mutex<Option<bluer::Address>> =
-    std::sync::Mutex::new(None);
-
-fn note_session_addr(addr: Option<bluer::Address>) {
-    if let Ok(mut g) = SESSION_ADDR.lock() {
-        *g = addr;
-    }
-}
-
-/// Hand the BLE link back before the process goes away.
-///
-/// Synchronous and hard-bounded, because it runs from Tauri's `RunEvent::Exit`
-/// on the main thread: an exit that hangs on D-Bus is worse than one that
-/// leaves a stale entry. Its own runtime rather than the worker's, which may
-/// already be shutting down by the time this runs.
-pub(crate) fn shutdown_link_blocking() {
-    let Some(addr) = SESSION_ADDR.lock().ok().and_then(|g| *g) else {
-        return; // no live session — nothing to hand back
-    };
-    tracing::info!(%addr, "shutting down — dropping the BLE link so the phone re-advertises");
-    let worker = std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-            return;
-        };
-        rt.block_on(async move {
-            let Ok(session) = bluer::Session::new().await else { return };
-            let Ok(adapter) = session.default_adapter().await else { return };
-            // Disconnect is the half the PHONE sees: it ends the GATT link, so
-            // the phone stops holding its RPA and advertises again.
-            if let Ok(dev) = adapter.device(addr) {
-                let _ = tokio::time::timeout(Duration::from_millis(1200), dev.disconnect()).await;
-            }
-            // Removing the entry is the half WE need: it drops the cached
-            // advertisement so the next run's discovery cannot re-serve this
-            // dead RPA — the same reason `forget_stale_device` exists.
-            let _ =
-                tokio::time::timeout(Duration::from_millis(1200), adapter.remove_device(addr)).await;
-        });
-    });
-    let _ = worker.join();
-    note_session_addr(None);
-}
-
 /// Last BLE address we completed a Noise IK exchange with, per peer.
 ///
 /// Recorded only *after* IK succeeds, so the address is positively tied to
@@ -151,77 +59,6 @@ pub(crate) fn take_peer_addr(peer_pub: &[u8; 32]) -> Option<bluer::Address> {
         .lock()
         .ok()
         .and_then(|mut g| g.as_mut().and_then(|m| m.remove(peer_pub)))
-}
-
-/// Ms since we last heard from the phone over any transport (huge if never).
-pub(crate) fn peer_contact_age_ms() -> u64 {
-    let last = LAST_PEER_CONTACT_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 {
-        return u64::MAX;
-    }
-    now_ms().saturating_sub(last)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Does a failed STATE write mean the LINK is gone, or only that the ATT
-/// bearer was busy?
-///
-/// The distinction decides whether we tear the session down, so it has to be
-/// conservative in the safe direction: anything we do not recognise is treated
-/// as busy and the link is kept. A link that is really dead costs us nothing
-/// to keep believing in for a few more beats — `run_listener` returns on a real
-/// disconnect and tears the session down anyway — whereas killing a live link
-/// costs a full scan, IK handshake, resubscribe and bulk re-push.
-///
-/// Matched on substrings because these arrive as D-Bus error text from BlueZ,
-/// not as typed variants.
-fn state_write_means_link_gone(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    // BlueZ says the device, the characteristic, or the D-Bus object is gone.
-    e.contains("not connected")
-        || e.contains("notconnected")
-        || e.contains("does not exist")
-        || e.contains("doesnotexist")
-        || e.contains("unknown object")
-        || e.contains("unknownobject")
-        || e.contains("no such device")
-        || e.contains("object removed")
-        // zbus's wording for UnknownObject, seen live as "the target object was
-        // either not present or removed". Missing it kept a genuinely dead link
-        // "alive" for 40 beats of pointless retries instead of reconnecting.
-        || e.contains("not present or removed")
-        || e.contains("disconnected")
-}
-
-#[cfg(test)]
-mod link_gone_tests {
-    use super::state_write_means_link_gone;
-
-    /// The exact strings observed on this deployment, so a future edit to the
-    /// list cannot silently drop one.
-    #[test]
-    fn real_bluez_errors_are_classified() {
-        for dead in [
-            "BLE write STATE to AUDIO_SIGNAL: the target object was either not present or removed",
-            "BLE write STATE to AUDIO_SIGNAL: Not connected",
-            "org.freedesktop.DBus.Error.UnknownObject: no such object",
-        ] {
-            assert!(state_write_means_link_gone(dead), "should be fatal: {dead}");
-        }
-        for busy in [
-            "BLE write STATE to AUDIO_SIGNAL: Bluetooth operation in progress: In Progress",
-            "BLE write STATE to AUDIO_SIGNAL: br-connection-busy",
-            "Method call timed out",
-        ] {
-            assert!(!state_write_means_link_gone(busy), "should be retryable: {busy}");
-        }
-    }
 }
 
 /// Find the first trusted-presence advertiser on-air whose 8-byte
@@ -493,7 +330,7 @@ pub(crate) async fn find_trusted_presence_peer(
     scan.abort();
     let _ = scan.await;
     if res.is_some() {
-        touch_presence();
+        crate::presence::touch_presence();
     }
     // Belt-and-braces: also wait until the adapter actually reports
     // not-discovering before the caller connects (StopDiscovery is async
@@ -609,7 +446,7 @@ async fn monitor_presence_wait(
                 Some(MonitorEvent::DeviceFound(id)) => {
                     if validate_presence_candidate(adapter, peers, id.device).await {
                         tracing::info!(addr = %id.device, "presence monitor: trusted peer on air");
-                        touch_presence();
+                        crate::presence::touch_presence();
                         return PresenceWait::Found(id.device);
                     }
                     // A Vortex advertiser that didn't validate: usually the
@@ -1147,7 +984,7 @@ pub(crate) async fn run_ble_persistent_loop(
             peer = %hex::encode(&peer.peer_static_pub[..4]),
             "P2.13: BLE audio-signal session established"
         );
-        touch_presence();
+        crate::presence::touch_presence();
 
         // Bump counter off the hot path — D-Bus to libsecret can stall
         // for hundreds of ms when contended with the BLE adapter's
@@ -1352,7 +1189,7 @@ pub(crate) async fn run_ble_persistent_loop(
                             // keeps the proximity watcher's presence fresh while
                             // connected (the advertisement monitor only runs
                             // between sessions).
-                            touch_presence();
+                            crate::presence::touch_presence();
                             // It ALSO proves the BLE link is live, so it counts
                             // as peer contact — the liveness signal that gates
                             // the disconnect-clear of mirror pills. Without this,
@@ -1362,7 +1199,7 @@ pub(crate) async fn run_ble_persistent_loop(
                             // threshold → the call/handoff pill was falsely
                             // cleared and flickered every ~30s. This 12s beat
                             // keeps it fresh whenever the link is genuinely up.
-                            touch_peer_contact();
+                            crate::presence::touch_peer_contact();
                             if first {
                                 tracing::info!(
                                     earbuds = ?state.earbuds,
@@ -1449,7 +1286,7 @@ pub(crate) async fn run_ble_persistent_loop(
                     // updates in ~1s instead of waiting out the 12s beat.
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(12)) => {}
-                        _ = state_nudge().notified() => {}
+                        _ = crate::presence::state_nudge().notified() => {}
                     }
                 }
             });

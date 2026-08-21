@@ -502,7 +502,11 @@ pub(crate) fn spawn_subsystem(
                                 found
                             };
                             if let Some(id) = id {
-                                let _ = vortex_l3_daemon::core::notification_display::close(id).await;
+                                let _ = crate::notify::close(id).await;
+                                // The live-id map belongs to the freedesktop
+                                // implementation; there is nothing to forget
+                                // where the seam reaches a toast instead.
+                                #[cfg(target_os = "linux")]
                                 vortex_l3_daemon::core::notification_display::forget_live_id(id);
                             }
                             continue;
@@ -548,7 +552,7 @@ pub(crate) fn spawn_subsystem(
                                 .map(|(&id, _)| id)
                                 .unwrap_or(0)
                         };
-                        match vortex_l3_daemon::core::notification_display::show(&notif, replaces_id)
+                        match crate::notify::show_mirror(&notif, replaces_id)
                             .await
                         {
                             Ok(id) => {
@@ -640,7 +644,7 @@ pub(crate) fn spawn_subsystem(
             {
                 let (closed_tx, mut closed_rx) =
                     tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
-                tokio::spawn(vortex_l3_daemon::core::notification_display::watch_closed(closed_tx));
+                crate::notify::watch_closed(closed_tx);
                 let links = notif_links.clone();
                 let recent_actions = notif_recent_actions.clone();
                 let writer_handle = ble_notif_writer.clone();
@@ -707,7 +711,7 @@ pub(crate) fn spawn_subsystem(
             // (no portable inline-reply on freedesktop) — a plain fire.
             {
                 let (act_tx, mut act_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
-                tokio::spawn(vortex_l3_daemon::core::notification_display::watch_actions(act_tx));
+                crate::notify::watch_actions(act_tx);
                 let links = notif_links.clone();
                 let recent_actions = notif_recent_actions.clone();
                 let writer_handle = ble_notif_writer.clone();

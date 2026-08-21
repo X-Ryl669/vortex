@@ -4,6 +4,12 @@
 
 use snow::{params::NoiseParams, Builder};
 
+/// Re-exported so a consumer can NAME the state a completed handshake hands
+/// back without taking its own `snow` dependency. Two copies of snow in one
+/// build are two incompatible `TransportState`s, and the mismatch surfaces as a
+/// baffling type error at an API boundary rather than as a version conflict.
+pub use snow::TransportState;
+
 pub const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 /// The reconnect pattern — used by `run_ik_deterministic` for the test
 /// vector AND at runtime. Runtime additionally mixes the Pairwise Reconnect
