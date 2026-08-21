@@ -52,11 +52,43 @@ use crate::core::platform::{BoxFuture, Notifier};
 /// Start-menu shortcut the installer creates, or nothing appears.
 pub const AUMID: &str = "com.vortex.desktop";
 
-/// Where a click lands. Set once by [`Notifier::actions`]; read by the toast
-/// thread's event handlers.
-static ACTION_SINK: OnceLock<tokio::sync::mpsc::UnboundedSender<(u32, String)>> = OnceLock::new();
-/// Where a dismissal lands. Set once by [`Notifier::closures`].
-static CLOSURE_SINK: OnceLock<tokio::sync::mpsc::UnboundedSender<(u32, u32)>> = OnceLock::new();
+/// Where clicks land — EVERY registrant, not the first.
+///
+/// The freedesktop side broadcasts: each consumer subscribes to the bus and
+/// sees every `ActionInvoked`, filtering by key prefix (`fc:` file consent,
+/// `call:` the call banner, `act:` a mirrored action). Three consumers do
+/// exactly that. A single-slot sink would hand the stream to whichever happened
+/// to register first and leave the others permanently dead — clicks on a
+/// consent prompt doing nothing, with nothing in the log to say why. So this
+/// fans out, which is the same contract on both platforms.
+static ACTION_SINKS: OnceLock<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<(u32, String)>>>> =
+    OnceLock::new();
+/// Same, for dismissals.
+static CLOSURE_SINKS: OnceLock<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<(u32, u32)>>>> =
+    OnceLock::new();
+
+fn action_sinks() -> &'static Mutex<Vec<tokio::sync::mpsc::UnboundedSender<(u32, String)>>> {
+    ACTION_SINKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn closure_sinks() -> &'static Mutex<Vec<tokio::sync::mpsc::UnboundedSender<(u32, u32)>>> {
+    CLOSURE_SINKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Deliver to every registered consumer, dropping the ones whose receiver has
+/// gone. Pruning here rather than on registration keeps a long-lived process
+/// from accumulating dead senders across reconnects.
+fn fan_out_action(id: u32, key: String) {
+    if let Ok(mut sinks) = action_sinks().lock() {
+        sinks.retain(|tx| tx.send((id, key.clone())).is_ok());
+    }
+}
+
+fn fan_out_closure(id: u32, reason: u32) {
+    if let Ok(mut sinks) = closure_sinks().lock() {
+        sinks.retain(|tx| tx.send((id, reason)).is_ok());
+    }
+}
 
 /// Notification ids we hand out. Starts at 1 so 0 keeps its freedesktop
 /// meaning of "no id / do not replace".
@@ -196,9 +228,7 @@ fn show_toast(
                     if let Ok(key) = a.Arguments() {
                         let key = key.to_string_lossy();
                         if !key.is_empty() {
-                            if let Some(tx) = ACTION_SINK.get() {
-                                let _ = tx.send((id, key));
-                            }
+                            fan_out_action(id, key);
                         }
                     }
                 }
@@ -226,9 +256,7 @@ fn show_toast(
                     _ => 4,
                 })
                 .unwrap_or(4);
-            if let Some(tx) = CLOSURE_SINK.get() {
-                let _ = tx.send((id, reason));
-            }
+            fan_out_closure(id, reason);
             Ok(())
         },
     );
@@ -282,12 +310,15 @@ impl Notifier for WindowsNotifier {
     }
 
     fn actions(&self, tx: tokio::sync::mpsc::UnboundedSender<(u32, String)>) {
-        // First caller wins, like the Linux watcher: one process-wide stream
-        // that consumers filter by key prefix.
-        let _ = ACTION_SINK.set(tx);
+        // Additive: every consumer gets every click, as on the bus.
+        if let Ok(mut sinks) = action_sinks().lock() {
+            sinks.push(tx);
+        }
     }
 
     fn closures(&self, tx: tokio::sync::mpsc::UnboundedSender<(u32, u32)>) {
-        let _ = CLOSURE_SINK.set(tx);
+        if let Ok(mut sinks) = closure_sinks().lock() {
+            sinks.push(tx);
+        }
     }
 }
