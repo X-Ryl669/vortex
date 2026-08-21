@@ -14,9 +14,10 @@
 
 use std::path::PathBuf;
 
-use super::{BoxFuture, SessionControl, UserPaths};
+use super::{Autostart, BoxFuture, SessionControl, UserPaths};
 
 pub mod ble;
+pub mod input;
 pub mod notify;
 
 /// Join the multithreaded apartment on this thread, once.
@@ -189,5 +190,177 @@ impl SessionControl for WindowsSession {
 
     fn can_unlock(&self) -> bool {
         false
+    }
+}
+
+/// A NUL-terminated UTF-16 buffer, as every `*W` registry call wants.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A UTF-16 buffer as the BYTES `RegSetValueExW` wants.
+///
+/// `cbData` is a byte count, not a character count. Passing the `u16` length
+/// writes half the string, and the truncation lands in the middle of a path —
+/// which then fails at the next logon, not now.
+fn utf16_as_bytes(v: &[u16]) -> &[u8] {
+    // SAFETY: reinterpreting a u16 slice as bytes — same allocation, same
+    // lifetime, length scaled. No alignment concern going wider to narrower.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// Run-at-login via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+///
+/// Chosen over the alternatives deliberately. A Startup-folder shortcut needs a
+/// `.lnk` built through COM (`IShellLink`) for no gain, and Task Scheduler buys
+/// delayed or elevated starts that Vortex does not want — it should come up with
+/// the user's session, unelevated, like any other tray app.
+///
+/// Per-user (HKCU), never HKLM: the identity key this launches with lives in one
+/// user's profile, so starting it for every account on the machine would have
+/// them all fighting over a single pairing.
+pub struct WindowsAutostart;
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "Vortex";
+
+impl Autostart for WindowsAutostart {
+    /// Whether we are registered to start AND the registration points at THIS
+    /// binary.
+    ///
+    /// The path check matters: after a reinstall to a different directory the
+    /// old value survives and silently launches nothing at the next logon.
+    /// Reporting `false` there makes the settings toggle read off, and flipping
+    /// it rewrites the path — so a stale entry is self-correcting rather than
+    /// invisible.
+    fn is_enabled(&self) -> bool {
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+            REG_VALUE_TYPE,
+        };
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let want = super::quoted_command(&exe);
+        let key_w = wide(RUN_KEY);
+        let val_w = wide(RUN_VALUE);
+
+        let mut key = HKEY::default();
+        // SAFETY: constant key path; `key` is ours and closed on every path.
+        if unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                windows::core::PCWSTR(key_w.as_ptr()),
+                Some(0),
+                KEY_READ,
+                &mut key,
+            )
+        }
+        .is_err()
+        {
+            return false;
+        }
+
+        let mut ty = REG_VALUE_TYPE::default();
+        let mut bytes: u32 = 0;
+        // Size first, then read — the documented two-step, since a registry
+        // string has no length we are entitled to assume.
+        let mut current = String::new();
+        let mut ok = unsafe {
+            RegQueryValueExW(
+                key,
+                windows::core::PCWSTR(val_w.as_ptr()),
+                None,
+                Some(&mut ty),
+                None,
+                Some(&mut bytes),
+            )
+        }
+        .is_ok();
+        if ok && bytes > 0 {
+            let mut buf = vec![0u8; bytes as usize];
+            ok = unsafe {
+                RegQueryValueExW(
+                    key,
+                    windows::core::PCWSTR(val_w.as_ptr()),
+                    None,
+                    Some(&mut ty),
+                    Some(buf.as_mut_ptr()),
+                    Some(&mut bytes),
+                )
+            }
+            .is_ok();
+            if ok {
+                // UTF-16 with a trailing NUL: drop it, or the comparison never
+                // matches.
+                let u16s: Vec<u16> = buf
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .take_while(|c| *c != 0)
+                    .collect();
+                current = String::from_utf16_lossy(&u16s);
+            }
+        }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        ok && current.eq_ignore_ascii_case(&want)
+    }
+
+    fn set_enabled(&self, on: bool) -> Result<(), String> {
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+            KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
+        };
+        let key_w = wide(RUN_KEY);
+        let val_w = wide(RUN_VALUE);
+        let mut key = HKEY::default();
+        // Create-or-open: the Run key exists on every normal install, but
+        // creating covers a profile where it does not.
+        // SAFETY: constant path; `key` is ours and closed below.
+        unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                windows::core::PCWSTR(key_w.as_ptr()),
+                Some(0),
+                None,
+                REG_OPTION_NON_VOLATILE,
+                KEY_WRITE,
+                None,
+                &mut key,
+                None,
+            )
+        }
+        .ok()
+        .map_err(|e| format!("open Run key: {e}"))?;
+
+        let result = if on {
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let value = wide(&super::quoted_command(&exe));
+                    unsafe {
+                        RegSetValueExW(
+                            key,
+                            windows::core::PCWSTR(val_w.as_ptr()),
+                            Some(0),
+                            REG_SZ,
+                            Some(utf16_as_bytes(&value)),
+                        )
+                    }
+                    .ok()
+                    .map_err(|e| format!("write Run value: {e}"))
+                }
+                Err(e) => Err(format!("current_exe: {e}")),
+            }
+        } else {
+            // Deleting a value that is not there is success: this is a toggle,
+            // and "off" is already the state the caller asked for.
+            let _ = unsafe { RegDeleteValueW(key, windows::core::PCWSTR(val_w.as_ptr())) };
+            Ok(())
+        };
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        result
     }
 }

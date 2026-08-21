@@ -987,10 +987,14 @@ mod link_tests {
         link: Arc<FakeGattLink>,
         laptop: TransportState,
     ) -> (
-        tokio::sync::mpsc::UnboundedReceiver<(u8, Vec<u8>)>,
+        tokio::sync::mpsc::UnboundedReceiver<([u8; 32], u8, Vec<u8>)>,
         tokio::task::JoinHandle<Result<(), String>>,
     ) {
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+        // Per-peer: the listener stamps every raw frame with the peer it came
+        // from, so a multi-peer consumer knows whose statement it is. The
+        // listener below is given the all-zero key, so that is what arrives.
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<([u8; 32], u8, Vec<u8>)>();
         let handle = tokio::spawn(async move {
             run_listener(
                 &*link,
@@ -1028,7 +1032,10 @@ mod link_tests {
             AUDIO_SIGNAL_UUID.as_u128(),
             phone_frame(&mut phone, ty::NOTES_SYNC, b"first"),
         );
-        assert_eq!(raw_rx.recv().await.unwrap(), (ty::NOTES_SYNC, b"first".to_vec()));
+        assert_eq!(
+            raw_rx.recv().await.unwrap(),
+            ([0u8; 32], ty::NOTES_SYNC, b"first".to_vec())
+        );
 
         // Frame 2 is sealed and then THROWN AWAY — the link lost it. The phone's
         // send nonce has advanced; the laptop's receive nonce has not.
@@ -1039,7 +1046,7 @@ mod link_tests {
             AUDIO_SIGNAL_UUID.as_u128(),
             phone_frame(&mut phone, ty::NOTES_SYNC, b"third"),
         );
-        let (ty_byte, payload) = tokio::time::timeout(Duration::from_secs(2), raw_rx.recv())
+        let (_peer, ty_byte, payload) = tokio::time::timeout(Duration::from_secs(2), raw_rx.recv())
             .await
             .expect("must not hang")
             .expect("must not close");
@@ -1072,7 +1079,10 @@ mod link_tests {
             AUDIO_SIGNAL_UUID.as_u128(),
             phone_frame(&mut phone, ty::NOTES_SYNC, b"ok"),
         );
-        assert_eq!(raw_rx.recv().await.unwrap(), (ty::NOTES_SYNC, b"ok".to_vec()));
+        assert_eq!(
+            raw_rx.recv().await.unwrap(),
+            ([0u8; 32], ty::NOTES_SYNC, b"ok".to_vec())
+        );
         handle.abort();
     }
 

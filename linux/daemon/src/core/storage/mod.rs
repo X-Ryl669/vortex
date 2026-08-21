@@ -1,12 +1,23 @@
 //! Local storage backends for V1 secrets and trusted-peer metadata
 //! (spec §3.2 and §3.3).
 
-// Secret Service is the LINUX secret backend; the traits below are the seam.
-// A Windows build gets its Credential Manager implementation beside these.
-#[cfg(target_os = "linux")]
+// The trusted-peer TRAIT and record: platform-neutral, like the identity trait
+// below it.
 pub mod peers;
+
+// The Credential Manager naming scheme. Windows-only in use, compiled
+// everywhere so its "a counter is not a peer" rule can be tested here.
+pub mod credential_names;
+
+// Secret Service is the LINUX backend for both traits.
+#[cfg(target_os = "linux")]
+pub mod peers_secret_service;
 #[cfg(target_os = "linux")]
 pub mod secret_service;
+
+// Windows Credential Manager, implementing the same two.
+#[cfg(target_os = "windows")]
+pub mod windows_credentials;
 
 use std::sync::{Arc, Mutex};
 // Only the Secret Service runtime below needs it, and that is Linux-only.
@@ -135,6 +146,10 @@ pub type StorageResult<T> = Result<T, StorageError>;
 ///    every write rather than tracking unlock state ourselves.
 // `::secret_service` — the absolute crate path is required here: the sibling
 // module `storage::secret_service` shadows the crate name inside this module.
+//
+// Linux-gated with the backends it serves: the `secret_service` crate is a
+// Linux-only dependency, so naming its types off Linux does not compile.
+#[cfg(target_os = "linux")]
 pub(crate) async fn unlocked_default_collection<'a>(
     service: &'a ::secret_service::SecretService<'a>,
 ) -> StorageResult<::secret_service::Collection<'a>> {

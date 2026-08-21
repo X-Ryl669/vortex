@@ -22,11 +22,14 @@
 //! # Status
 //!
 //! Linux implementations delegate to the modules that already existed, so this
-//! file adds a boundary without changing behaviour there. On Windows,
-//! [`UserPaths`], [`Notifier`], [`SessionControl`], [`BleCentral`] and
-//! [`GattLink`] are written; [`Autostart`] and [`InputCapture`] have no Windows
-//! implementation yet, and neither does the secret store (a Credential Manager
-//! backend slots in beside `SecretServiceIdentityStore`).
+//! file adds a boundary without changing behaviour there. **Every trait here now
+//! has a Windows implementation**, and so does the secret store — Credential
+//! Manager in `storage::windows_credentials`, beside the Secret Service one.
+//!
+//! What no Windows build has yet is the layer ABOVE this: the Tauri app is
+//! Linux-only (its tray, its D-Bus consumers, its uinput injector), and the
+//! `vortex-l3d` CLI is a Linux BLE harness. This seam is what makes that layer
+//! portable, not a substitute for porting it.
 //!
 //! Everything Windows-side is compiled only on Windows and none of it has ever
 //! run: it type-checks against the WinRT/Win32 metadata, which catches wrong
@@ -87,6 +90,7 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod toast_xml;
+pub mod vk_to_evdev;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -176,6 +180,26 @@ pub trait AudioHandoff: Send + Sync {
 pub trait Autostart: Send + Sync {
     fn is_enabled(&self) -> bool;
     fn set_enabled(&self, on: bool) -> Result<(), String>;
+}
+
+/// Quote an executable path for a Windows command line.
+///
+/// The registry `Run` value is a COMMAND LINE, not a path: Windows splits it on
+/// whitespace, so `C:\Program Files\Vortex\vortex.exe` unquoted launches
+/// `C:\Program`. Since the default install location contains a space, an
+/// unquoted value fails on essentially every machine — silently, at the next
+/// logon, where nobody is watching.
+///
+/// Lives here with a test rather than inline in the Windows module, for the same
+/// reason as [`toast_xml`]: it is pure string work whose failure mode is
+/// invisible.
+pub fn quoted_command(exe: &std::path::Path) -> String {
+    let s = exe.to_string_lossy();
+    if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
+        // Already quoted — double-quoting would make the path literal-quotes.
+        return s.to_string();
+    }
+    format!("\"{s}\"")
 }
 
 /// Pointer/keyboard capture for Universal Control: hold the cursor at a screen
@@ -534,6 +558,26 @@ mod tests {
         for seed in [0u64, 1, 0x0000_0102_0304_0506, 0x0000_FFFF_FFFF_FFFF] {
             assert_eq!(PeerAddr::from_u48(seed).to_u48(), seed);
         }
+    }
+
+    #[test]
+    fn a_command_line_quotes_a_path_with_spaces() {
+        // The case that matters: the default install location has a space, and
+        // an unquoted value launches "C:\Program".
+        assert_eq!(
+            quoted_command(std::path::Path::new("C:\\Program Files\\Vortex\\vortex.exe")),
+            "\"C:\\Program Files\\Vortex\\vortex.exe\""
+        );
+    }
+
+    #[test]
+    fn quoting_is_idempotent_and_unconditional() {
+        // Always quoted, even without a space — a conditional rule is one more
+        // thing to get wrong, and quotes are harmless here.
+        assert_eq!(quoted_command(std::path::Path::new("C:\\v.exe")), "\"C:\\v.exe\"");
+        // An already-quoted path must not gain a second pair.
+        let once = quoted_command(std::path::Path::new("C:\\v.exe"));
+        assert_eq!(quoted_command(std::path::Path::new(&once)), once);
     }
 
     const PAIRING: Uuid128 = 0x0000_0000_0000_0000_0000_0000_0000_0001;
