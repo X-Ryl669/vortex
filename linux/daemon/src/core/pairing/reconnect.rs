@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::core::ble::client::{ClientError, VortexClient};
 use crate::core::ble::frame::{ty, Frame, FrameDecodeError};
-use crate::core::crypto::noise::{NOISE_IK, PROLOGUE_IK};
+use crate::core::crypto::noise::NOISE_IK;
 use crate::core::crypto::x25519::X25519SecBytes;
 
 #[derive(Debug)]
@@ -83,25 +83,10 @@ fn build_ik_initiator(
     Builder::new(params)
         .local_private_key(static_priv)?
         .remote_public_key(peer_static_pub)?
-        .prologue(&prologue_with_prs(prs))?
+        .prologue(&crate::core::crypto::noise::prologue_with_prs(prs))?
         .build_initiator()
 }
 
-/// Build the IK prologue with the Pairwise Reconnect Secret mixed in.
-///
-/// We extend the base prologue with the 32-byte PRS so that any wrong-
-/// PRS attempt by an attacker who has compromised only the long-term
-/// static private key fails AEAD verification on msg1's `s` decryption.
-/// This achieves the same security goal as Noise_IKpsk2_... — binding
-/// reconnect to BOTH static keys AND the prior pairing transcript —
-/// without requiring a Noise pattern that the Android-side library
-/// does not yet implement.
-pub(crate) fn prologue_with_prs(prs: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PROLOGUE_IK.len() + 32);
-    out.extend_from_slice(PROLOGUE_IK);
-    out.extend_from_slice(prs);
-    out
-}
 
 /// Run Noise IK against `client`'s peer using the local static identity,
 /// the trusted peer's static public key, and the Pairwise Reconnect

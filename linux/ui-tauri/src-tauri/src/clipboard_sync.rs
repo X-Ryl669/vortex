@@ -491,15 +491,13 @@ pub(crate) async fn apply_synced_image(app: &AppHandle, png: Vec<u8>) {
 
 /// Where instant-share received files land: the user's REAL download folder,
 /// which is localised — `~/Téléchargements` on a French desktop, `~/Downloads`
-/// only on an English one. Hardcoding `~/Downloads` doesn't just miss it, it
-/// silently *creates* a second, English-named folder beside the real one and
-/// drops every received file where the user never looks. Resolved once per run
-/// (neither `$HOME` nor the XDG config changes under us).
+/// only on an English one. Resolution lives in `core::platform` so Linux and
+/// Windows answer this the same way; here we only cache it (neither `$HOME` nor
+/// the XDG config changes under us) and log where files will go.
 pub(crate) fn downloads_dir() -> Option<PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
-        let dir = xdg_user_dir(&home, "XDG_DOWNLOAD_DIR").unwrap_or_else(|| home.join("Downloads"));
+        let dir = vortex_l3_daemon::core::platform::paths().downloads()?;
         tracing::info!("received files → {}", dir.display());
         Some(dir)
     })
