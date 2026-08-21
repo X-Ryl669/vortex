@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use vortex_l3_daemon::core::ble::client::VortexClient;
 use vortex_l3_daemon::core::identity::IdentityRecord;
 use vortex_l3_daemon::core::pairing::handshake::{run_pairing_initiator, LocalDecision};
+use vortex_l3_daemon::core::platform::linux::LinuxGattLink;
 use vortex_l3_daemon::core::storage::peers::{PeerStore, TrustedPeer};
 
 use crate::{emit_peers, CmdChannel, PairDecisionState, UiCmd};
@@ -61,8 +62,12 @@ pub(crate) async fn do_pair(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let app_for_sas = app.clone();
+    // The XX flow speaks `&dyn GattLink` now, so the connect above — and
+    // everything it knows about dual-mode bearers — stays exactly as it is and
+    // is simply presented through the seam.
+    let link = LinuxGattLink::from_client(adapter.clone(), &client);
     let outcome = run_pairing_initiator(
-        &client,
+        &link,
         &identity.static_priv.0,
         Duration::from_secs(60),
         move |sas: &str| {

@@ -21,10 +21,16 @@
 //!
 //! # Status
 //!
-//! The Windows implementations are stubs that name the API they will call. They
-//! are compiled only on Windows, so they cannot break the Linux build; and the
-//! Linux implementations delegate to the existing modules, so this file adds a
-//! boundary without changing behaviour.
+//! Linux implementations delegate to the modules that already existed, so this
+//! file adds a boundary without changing behaviour there. On Windows,
+//! [`UserPaths`], [`Notifier`], [`SessionControl`], [`BleCentral`] and
+//! [`GattLink`] are written; [`Autostart`] and [`InputCapture`] have no Windows
+//! implementation yet, and neither does the secret store (a Credential Manager
+//! backend slots in beside `SecretServiceIdentityStore`).
+//!
+//! Everything Windows-side is compiled only on Windows and none of it has ever
+//! run: it type-checks against the WinRT/Win32 metadata, which catches wrong
+//! signatures and wrong types and nothing about behaviour.
 //!
 //! **The daemon LIBRARY compiles for Windows.** Verify with:
 //!
@@ -44,26 +50,43 @@
 //! each `cfg` — is every direct BlueZ / D-Bus / PulseAudio / Secret Service
 //! module.
 //!
+//! # BLE is the one trait with both sides written
+//!
+//! [`BleCentral`] / [`GattLink`] now have a BlueZ implementation
+//! ([`linux::LinuxBleCentral`], wrapping the existing `ble::client` rather than
+//! reimplementing its dual-mode connect dance) and a WinRT one
+//! ([`windows::ble::WindowsBleCentral`]). Writing the second one is what
+//! reshaped the trait: it needed a `read` (the capability handshake), a `has`
+//! (the audio-signal characteristic is absent on older phones), an async
+//! `is_connected` (BlueZ answers over D-Bus) and a `scan_for_peer` that returns
+//! the advertisement PAYLOAD rather than a bare address — the phone rotates its
+//! address, so the payload is what identifies a peer.
+//!
+//! Its callers moved over too: `pairing::{handshake, reconnect}` now take
+//! `&dyn GattLink`, are no longer gated, and build for Windows. That also made
+//! them testable for the first time — a full XX pairing with dual approval, and
+//! the IK msg1 wire shape, now run as unit tests against [`FakeGattLink`] with
+//! no adapter and no phone.
+//!
+//! `ble::audio_signal` — the post-handshake event stream, all nineteen frame
+//! types plus the nonce-resync recovery — moved across too. Its one genuinely
+//! local dependency, the earbuds handoff, went behind [`AudioHandoff`]; a
+//! platform with no audio backend passes `None`, drops `AUDIO_OP`, and keeps
+//! the other eighteen.
+//!
 //! # The gates are not the port
 //!
 //! A `cfg(target_os = "linux")` on a module means "no Windows implementation
-//! yet", not "not needed on Windows". Two of them are load-bearing and will
-//! come back as trait work rather than as a second copy:
-//!
-//! * `pairing::{handshake, reconnect}` — the XX/IK Noise state machines are
-//!   platform-neutral but written against `ble::client::VortexClient`
-//!   concretely. They need to take `&dyn GattLink`, after which both platforms
-//!   share them. This is the most security-critical path in the tree, so it was
-//!   deliberately left out of the mechanical gating pass.
-//! * `ble::audio_signal` — the frame dispatch, cipher-resync and AppState
-//!   decode in there are protocol logic that happens to live inside the BlueZ
-//!   notification listener. Windows needs the same dispatch behind a different
-//!   transport, so this wants splitting rather than reimplementing.
+//! yet", not "not needed on Windows". What is left behind one is a Linux
+//! *implementation* — BlueZ, logind, MPRIS, PulseAudio, Secret Service — with
+//! its trait already named here, or a subsystem with no Windows counterpart
+//! written yet.
 
 use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod toast_xml;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -128,6 +151,27 @@ pub trait SessionControl: Send + Sync {
     fn can_unlock(&self) -> bool;
 }
 
+/// The audio-handoff side of the phone's event stream.
+///
+/// `ble::audio_signal` carries nineteen frame types, and exactly one of them —
+/// `AUDIO_OP`, the earbuds handoff — needs to touch the local audio stack. This
+/// trait is that touch point, so the other eighteen don't drag PulseAudio and
+/// MPRIS into a build that has neither.
+///
+/// A platform with no audio backend passes `None` and simply drops `AUDIO_OP`
+/// frames: no earbuds switching, everything else works.
+pub trait AudioHandoff: Send + Sync {
+    /// The phone is starting a buds-claim (almost always an incoming call).
+    /// Pause local media BEFORE the buds are released — once the sink goes away
+    /// the audio server migrates the stream and the player often auto-pauses on
+    /// its own, leaving nothing to resume later.
+    fn pause_for_call(&self) -> BoxFuture<()>;
+
+    /// Drive the switch state machine with a frame from `peer`.
+    fn on_incoming(&self, peer: [u8; 32], frame: crate::core::audio_op::AudioOpFrame)
+        -> BoxFuture<()>;
+}
+
 /// Run Vortex at login.
 pub trait Autostart: Send + Sync {
     fn is_enabled(&self) -> bool;
@@ -180,9 +224,27 @@ pub enum InputEvent {
 /// The laptop is central-**only** — it never advertises and never serves a GATT
 /// server, which is what makes Windows viable at all (WinRT's peripheral role is
 /// far weaker than its central role).
+///
+/// # Construction is deliberately not part of this trait
+///
+/// There is no `platform::ble()` factory to match [`paths`] / [`notifier`] /
+/// [`session`], because the two platforms genuinely differ in what they need to
+/// exist:
+///
+/// * Linux takes the process's ONE shared `bluer::Adapter`
+///   ([`linux::LinuxBleCentral::new`]). Creating a session per use accumulated
+///   D-Bus connections and hung the app after a few call cycles, so the adapter
+///   is passed in rather than acquired — the same reason the heartbeat and the
+///   BLE loop already share one.
+/// * Windows needs no handle at all; WinRT resolves the radio per call.
+///
+/// A uniform factory would have to hide that, and hiding it is how the leak
+/// came back. Callers construct the platform's central once at startup and pass
+/// `Arc<dyn BleCentral>` down, which is what the BLE loop already does with its
+/// adapter today.
 pub trait BleCentral: Send + Sync {
     /// Scan until a Vortex advertisement is seen, or the timeout elapses.
-    fn scan_for_peer(&self, timeout_ms: u64) -> BoxFuture<Result<Option<PeerAddr>, String>>;
+    fn scan_for_peer(&self, timeout_ms: u64) -> BoxFuture<Result<Option<AdvCandidate>, String>>;
     /// Connect and resolve the Vortex GATT service.
     fn connect(&self, addr: PeerAddr) -> BoxFuture<Result<Box<dyn GattLink>, String>>;
     /// Addresses of already-bonded devices, for the reconnect fast path.
@@ -192,15 +254,62 @@ pub trait BleCentral: Send + Sync {
 }
 
 /// An open GATT connection to the phone.
+///
+/// The shape of this trait is set by what the pairing and reconnect flows
+/// actually do over the link, which is: read the capability characteristic,
+/// write frames without response (§9.1 — the flow is driven by notify-on-write,
+/// so the ATT ack buys latency and no reliability), and subscribe for the
+/// notifications those writes provoke.
 pub trait GattLink: Send + Sync {
-    /// Write one frame to a characteristic (`with_response` = acknowledged).
+    /// Write one frame to a characteristic. `with_response = false` is an ATT
+    /// Write Command, which is what the pairing and reconnect frames use.
     fn write(&self, char_uuid: Uuid128, data: &[u8], with_response: bool)
         -> BoxFuture<Result<(), String>>;
+
+    /// Read a characteristic — the capability handshake (§9.1.5) needs this
+    /// before any frame is written.
+    fn read(&self, char_uuid: Uuid128) -> BoxFuture<Result<Vec<u8>, String>>;
+
     /// Subscribe to notifications; frames arrive on `tx` until disconnect.
     fn subscribe(&self, char_uuid: Uuid128, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>)
         -> BoxFuture<Result<(), String>>;
+
+    /// Which peer this link talks to. Both platforms know it at connect time;
+    /// it exists so log lines can name the device without the caller having to
+    /// carry the address alongside the link.
+    fn peer(&self) -> PeerAddr;
+
+    /// Whether this link resolved `char_uuid` at all.
+    ///
+    /// Not every characteristic is guaranteed: the audio-signal one is absent
+    /// on phone builds before P2.13, and those peers must keep working with the
+    /// LAN heartbeat instead of failing the connect. Callers check rather than
+    /// discovering it as a write error.
+    fn has(&self, char_uuid: Uuid128) -> bool;
+
     fn disconnect(&self) -> BoxFuture<Result<(), String>>;
-    fn is_connected(&self) -> bool;
+
+    /// Async because Linux has to ask BlueZ over D-Bus; Windows reads a
+    /// property. A sync signature would have forced Linux to cache a flag and
+    /// answer with something stale.
+    fn is_connected(&self) -> BoxFuture<bool>;
+}
+
+/// A Vortex peer seen on air.
+///
+/// Carries the advertisement payload, not just the address, because the address
+/// alone cannot answer the questions the callers ask: the pairing UI needs the
+/// `pairable` flag and the instance id to match the window the user just opened
+/// on the phone, and the reconnect path needs the presence token to know WHICH
+/// trusted peer this is. The phone rotates its address every few minutes, so it
+/// is the payload that identifies, not the address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvCandidate {
+    pub addr: PeerAddr,
+    pub payload: crate::core::ble::AdvPayload,
+    /// Signal strength, where the platform reports it — used only to prefer a
+    /// nearer peer, never to decide identity.
+    pub rssi: Option<i16>,
 }
 
 /// A Bluetooth device address. Deliberately a plain newtype rather than
@@ -272,7 +381,7 @@ pub fn notifier() -> &'static dyn Notifier {
     }
     #[cfg(target_os = "windows")]
     {
-        &windows::WindowsNotifier
+        &windows::notify::WindowsNotifier
     }
 }
 
@@ -285,6 +394,115 @@ pub fn session() -> &'static dyn SessionControl {
     #[cfg(target_os = "windows")]
     {
         &windows::WindowsSession
+    }
+}
+
+/// A [`GattLink`] with no radio behind it: writes are recorded, reads replay a
+/// scripted value, and notifications are whatever the test pushes.
+///
+/// This is the payoff for having a seam at all. The pairing and reconnect flows
+/// are the code most worth testing and the least testable — today they need a
+/// phone, a BlueZ adapter and a human. Written against `&dyn GattLink` they can
+/// be driven from a unit test on either platform, and this is the harness that
+/// makes that possible. It lives here rather than in a test module so the port
+/// work can use it as it moves those flows onto the trait.
+#[cfg(test)]
+pub struct FakeGattLink {
+    /// Characteristics this link pretends to have.
+    pub present: Vec<Uuid128>,
+    /// `(uuid, bytes, with_response)` in call order.
+    pub writes: std::sync::Mutex<Vec<(Uuid128, Vec<u8>, bool)>>,
+    /// What [`GattLink::read`] answers, per characteristic.
+    pub reads: std::collections::HashMap<Uuid128, Vec<u8>>,
+    /// Senders handed to [`GattLink::subscribe`], so a test can push frames.
+    pub subscribers: std::sync::Mutex<Vec<(Uuid128, tokio::sync::mpsc::UnboundedSender<Vec<u8>>)>>,
+    pub connected: bool,
+}
+
+#[cfg(test)]
+impl FakeGattLink {
+    pub fn new(present: Vec<Uuid128>) -> Self {
+        Self {
+            present,
+            writes: std::sync::Mutex::new(Vec::new()),
+            reads: std::collections::HashMap::new(),
+            subscribers: std::sync::Mutex::new(Vec::new()),
+            connected: true,
+        }
+    }
+
+    /// Deliver `bytes` as a notification on `uuid`, as the phone would.
+    pub fn push_notification(&self, uuid: Uuid128, bytes: Vec<u8>) {
+        for (u, tx) in self.subscribers.lock().unwrap().iter() {
+            if *u == uuid {
+                let _ = tx.send(bytes.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl GattLink for FakeGattLink {
+    fn write(
+        &self,
+        char_uuid: Uuid128,
+        data: &[u8],
+        with_response: bool,
+    ) -> BoxFuture<Result<(), String>> {
+        let ok = self.present.contains(&char_uuid);
+        if ok {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((char_uuid, data.to_vec(), with_response));
+        }
+        Box::pin(async move {
+            if ok {
+                Ok(())
+            } else {
+                Err("no such characteristic".to_string())
+            }
+        })
+    }
+
+    fn read(&self, char_uuid: Uuid128) -> BoxFuture<Result<Vec<u8>, String>> {
+        let v = self.reads.get(&char_uuid).cloned();
+        Box::pin(async move { v.ok_or_else(|| "nothing scripted for this read".to_string()) })
+    }
+
+    fn subscribe(
+        &self,
+        char_uuid: Uuid128,
+        tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) -> BoxFuture<Result<(), String>> {
+        let ok = self.present.contains(&char_uuid);
+        if ok {
+            self.subscribers.lock().unwrap().push((char_uuid, tx));
+        }
+        Box::pin(async move {
+            if ok {
+                Ok(())
+            } else {
+                Err("no such characteristic".to_string())
+            }
+        })
+    }
+
+    fn peer(&self) -> PeerAddr {
+        PeerAddr([0xFA, 0xCE, 0x00, 0x00, 0x00, 0x01])
+    }
+
+    fn has(&self, char_uuid: Uuid128) -> bool {
+        self.present.contains(&char_uuid)
+    }
+
+    fn disconnect(&self) -> BoxFuture<Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn is_connected(&self) -> BoxFuture<bool> {
+        let c = self.connected;
+        Box::pin(async move { c })
     }
 }
 
@@ -316,5 +534,69 @@ mod tests {
         for seed in [0u64, 1, 0x0000_0102_0304_0506, 0x0000_FFFF_FFFF_FFFF] {
             assert_eq!(PeerAddr::from_u48(seed).to_u48(), seed);
         }
+    }
+
+    const PAIRING: Uuid128 = 0x0000_0000_0000_0000_0000_0000_0000_0001;
+    const CAPABILITY: Uuid128 = 0x0000_0000_0000_0000_0000_0000_0000_0002;
+    const ABSENT: Uuid128 = 0x0000_0000_0000_0000_0000_0000_0000_0099;
+
+    /// A round of the shape the pairing flow uses — read capability, write a
+    /// frame without response, receive the notification it provokes — driven
+    /// entirely through `&dyn GattLink`.
+    ///
+    /// This is what the seam is FOR: the same caller runs against BlueZ, WinRT
+    /// or this fake, so the protocol flow can be tested with no radio.
+    #[tokio::test]
+    async fn a_caller_can_drive_the_link_through_the_trait() {
+        let mut fake = FakeGattLink::new(vec![PAIRING, CAPABILITY]);
+        fake.reads.insert(CAPABILITY, vec![0x01, 0x00, 0x00]);
+        let link: &dyn GattLink = &fake;
+
+        assert_eq!(link.read(CAPABILITY).await.unwrap(), vec![0x01, 0x00, 0x00]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        link.subscribe(PAIRING, tx).await.unwrap();
+        link.write(PAIRING, b"msg1", false).await.unwrap();
+
+        // The peer answers on the characteristic we wrote to.
+        fake.push_notification(PAIRING, b"msg2".to_vec());
+        assert_eq!(rx.recv().await.unwrap(), b"msg2".to_vec());
+
+        // Write-without-response is what §9.1 specifies for this path; a
+        // caller that flipped it would still "work" against real hardware but
+        // pay an ATT ack per frame.
+        let writes = fake.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0], (PAIRING, b"msg1".to_vec(), false));
+    }
+
+    /// An absent characteristic must be reportable BEFORE a write is attempted
+    /// — that is how a peer without the audio-signal characteristic keeps
+    /// working instead of failing the connect.
+    #[tokio::test]
+    async fn an_absent_characteristic_is_visible_and_unwritable() {
+        let fake = FakeGattLink::new(vec![PAIRING]);
+        let link: &dyn GattLink = &fake;
+        assert!(link.has(PAIRING));
+        assert!(!link.has(ABSENT));
+        assert!(link.write(ABSENT, b"x", false).await.is_err());
+        assert!(fake.writes.lock().unwrap().is_empty());
+    }
+
+    /// The trait has to be usable as a spawned, shared object — that is how the
+    /// BLE loop will hold it. Fails to compile if a signature stops being
+    /// `Send + Sync` or the futures stop being `Send`.
+    #[tokio::test]
+    async fn the_link_survives_being_shared_across_tasks() {
+        let link: std::sync::Arc<dyn GattLink> =
+            std::sync::Arc::new(FakeGattLink::new(vec![PAIRING]));
+        let l2 = std::sync::Arc::clone(&link);
+        let joined = tokio::spawn(async move {
+            l2.write(PAIRING, b"from another task", false).await.unwrap();
+            l2.is_connected().await
+        })
+        .await
+        .unwrap();
+        assert!(joined);
     }
 }

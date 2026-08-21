@@ -14,9 +14,39 @@
 
 use std::path::PathBuf;
 
-use super::{BoxFuture, Notifier, SessionControl, UserPaths};
+use super::{BoxFuture, SessionControl, UserPaths};
 
 pub mod ble;
+pub mod notify;
+
+/// Join the multithreaded apartment on this thread, once.
+///
+/// WinRT activation fails with `CO_E_NOTINITIALIZED` on a thread that has not
+/// initialized an apartment, and the daemon's threads are plain tokio workers
+/// that never do. This compiles fine without it and then fails on the very
+/// first call — the sort of thing only a real Windows run surfaces.
+///
+/// `S_FALSE` (already initialized) and `RPC_E_CHANGED_MODE` (this thread is
+/// already in an STA — the UI thread, say) are both fine: in either case the
+/// thread has an apartment, which is all we need.
+fn ensure_winrt() {
+    use std::cell::Cell;
+    use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+    thread_local! {
+        static JOINED: Cell<bool> = const { Cell::new(false) };
+    }
+    JOINED.with(|j| {
+        if j.get() {
+            return;
+        }
+        // SAFETY: no arguments to get wrong; the failure modes above are the
+        // documented benign ones and everything else means WinRT is unusable
+        // here, which the next call will report with real context.
+        let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+        j.set(true);
+    });
+}
+
 
 pub struct WindowsPaths;
 
@@ -70,55 +100,69 @@ impl UserPaths for WindowsPaths {
     }
 }
 
-pub struct WindowsNotifier;
+/// Read `WTSINFOEXW.Data.WTSInfoExLevel1.SessionFlags` for this session.
+///
+/// Deliberately not cached: a stale "unlocked" would let proximity auto-lock
+/// skip a lock it should have done.
+fn query_session_locked() -> Option<bool> {
+    use windows::Win32::System::RemoteDesktop::{
+        WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW,
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK,
+    };
 
-impl Notifier for WindowsNotifier {
-    /// TODO: WinRT `ToastNotificationManager` with an `AppUserModelID`.
-    ///
-    /// The AUMID is the whole problem: an unpackaged exe has none until it
-    /// registers a Start-menu shortcut carrying one, and without it Windows
-    /// silently refuses to show the toast. Actions then need a registered COM
-    /// activator (`INotificationActivationCallback`) — see [`Self::actions`].
-    fn show(
-        &self,
-        _summary: &str,
-        _body: &str,
-        _app_id: &str,
-        _actions: &[(String, String)],
-        _replaces: u32,
-        _urgent: bool,
-    ) -> BoxFuture<Result<u32, String>> {
-        Box::pin(async { Err("windows notifier: not implemented".to_string()) })
+    let mut buffer: windows::core::PWSTR = windows::core::PWSTR::null();
+    let mut bytes: u32 = 0;
+    // SAFETY: the out-params are ours; on success WTS allocates `buffer` and we
+    // free it below on every path. The size check before the cast is what makes
+    // the read safe — a shorter buffer would mean a different info level.
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            Some(WTS_CURRENT_SERVER_HANDLE),
+            WTS_CURRENT_SESSION,
+            WTSSessionInfoEx,
+            &mut buffer,
+            &mut bytes,
+        )
+    };
+    if ok.is_err() || buffer.is_null() {
+        return None;
     }
-
-    /// TODO: `ToastNotificationHistory::Remove` by tag. Windows keys toasts by
-    /// string tag, not the u32 the freedesktop API returns, so the
-    /// implementation keeps an id→tag map behind this signature.
-    fn close(&self, _id: u32) -> BoxFuture<Result<(), String>> {
-        Box::pin(async { Err("windows notifier: not implemented".to_string()) })
-    }
-
-    /// TODO: activation callback → `tx`.
-    ///
-    /// This is the piece with no Linux analogue. A toast button carries
-    /// arguments; clicking it activates the app through COM, and the handler
-    /// must translate those arguments back into the same `fc:` / `call:` /
-    /// `act:` keys the existing consumers already filter on — so the routing
-    /// above this trait needs no Windows-specific branch.
-    fn actions(&self, _tx: tokio::sync::mpsc::UnboundedSender<(u32, String)>) {}
-
-    /// TODO: `ToastNotification::Dismissed` / `Failed` events. Windows reports
-    /// dismissal per-notification rather than as a bus signal, so this
-    /// subscribes as toasts are created and fans them into the one channel.
-    fn closures(&self, _tx: tokio::sync::mpsc::UnboundedSender<(u32, u32)>) {}
+    let flags = if (bytes as usize) >= std::mem::size_of::<WTSINFOEXW>() {
+        let info = unsafe { &*(buffer.0 as *const WTSINFOEXW) };
+        // Level 1 is the only level this call returns; anything else means the
+        // OS handed back something we don't understand, so say "don't know".
+        if info.Level == 1 {
+            Some(unsafe { info.Data.WTSInfoExLevel1 }.SessionFlags)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    unsafe { WTSFreeMemory(buffer.0 as *mut std::ffi::c_void) };
+    // WTS_SESSIONSTATE_LOCK / _UNLOCK are reported the right way round on
+    // Windows 8 and later. (On Windows 7 they were inverted — a documented OS
+    // bug. Vortex targets 10+, so this does not compensate for it; doing so
+    // blindly would invert the answer on every supported version.)
+    flags.map(|f| f == WTS_SESSIONSTATE_LOCK as i32)
 }
 
 pub struct WindowsSession;
 
 impl SessionControl for WindowsSession {
-    /// TODO: `LockWorkStation()` from user32.
     fn lock(&self) -> BoxFuture<Result<(), String>> {
-        Box::pin(async { Err("windows session lock: not implemented".to_string()) })
+        Box::pin(async move {
+            // Inside the async block, not before it: a function returning a
+            // future must not lock the screen just because someone built the
+            // future. Nothing is held across an await here (there is none), so
+            // the raw call is fine on any worker.
+            //
+            // SAFETY: no arguments, no out-params. Fails only if the calling
+            // process lacks a visible window station (a service, say), which is
+            // exactly what the error is for.
+            unsafe { windows::Win32::System::Shutdown::LockWorkStation() }
+                .map_err(|e| format!("LockWorkStation: {e}"))
+        })
     }
 
     /// Windows has no programmatic unlock, by design — credentials must be
@@ -129,11 +173,18 @@ impl SessionControl for WindowsSession {
         Box::pin(async { Err("windows cannot unlock a session programmatically".to_string()) })
     }
 
-    /// TODO: `WTSRegisterSessionNotification` + `WTS_SESSION_LOCK`/`_UNLOCK`,
-    /// cached — there is no "is it locked right now" query on Windows, only
-    /// the transition events, so state has to be tracked from process start.
+    /// Query the session's lock flag directly.
+    ///
+    /// The obvious route — `WTSRegisterSessionNotification` and track
+    /// `WTS_SESSION_LOCK`/`_UNLOCK` from process start — cannot answer before
+    /// the first transition, which is the wrong answer for a daemon that starts
+    /// while the screen is already locked. `WTSSessionInfoEx` reports the
+    /// current flag instead, so the first call is as correct as the hundredth.
+    ///
+    /// `None` means "couldn't tell", never "unlocked": proximity auto-lock must
+    /// not act on a guess.
     fn is_locked(&self) -> BoxFuture<Option<bool>> {
-        Box::pin(async { None })
+        Box::pin(async move { query_session_locked() })
     }
 
     fn can_unlock(&self) -> bool {
