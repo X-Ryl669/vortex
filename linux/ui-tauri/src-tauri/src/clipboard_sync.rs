@@ -471,15 +471,13 @@ pub(crate) async fn apply_synced_image(app: &AppHandle, png: Vec<u8>) {
 
 /// Where instant-share received files land: the user's REAL download folder,
 /// which is localised — `~/Téléchargements` on a French desktop, `~/Downloads`
-/// only on an English one. Hardcoding `~/Downloads` doesn't just miss it, it
-/// silently *creates* a second, English-named folder beside the real one and
-/// drops every received file where the user never looks. Resolved once per run
-/// (neither `$HOME` nor the XDG config changes under us).
+/// only on an English one. Resolution lives in `core::platform` so Linux and
+/// Windows answer this the same way; here we only cache it (neither `$HOME` nor
+/// the XDG config changes under us) and log where files will go.
 pub(crate) fn downloads_dir() -> Option<PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
-        let dir = xdg_download_dir(&home).unwrap_or_else(|| home.join("Downloads"));
+        let dir = vortex_l3_daemon::core::platform::paths().downloads()?;
         tracing::info!("received files → {}", dir.display());
         Some(dir)
     })
@@ -498,73 +496,6 @@ pub(crate) fn downloads_label() -> String {
         .unwrap_or_else(|| "Downloads".to_string())
 }
 
-/// The configured `XDG_DOWNLOAD_DIR`: the environment first, else the
-/// `user-dirs.dirs` file that `xdg-user-dir(1)` reads. Not required to exist —
-/// a configured-but-missing folder is still the user's stated intent, and
-/// `apply_synced_file` creates it; falling back to `~/Downloads` there would
-/// reintroduce exactly the bug this avoids.
-fn xdg_download_dir(home: &std::path::Path) -> Option<PathBuf> {
-    if let Some(v) = std::env::var_os("XDG_DOWNLOAD_DIR") {
-        if let Some(p) = expand_home(&v.to_string_lossy(), home) {
-            return Some(p);
-        }
-    }
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home.join(".config"));
-    let text = std::fs::read_to_string(config.join("user-dirs.dirs")).ok()?;
-    expand_home(&parse_user_dirs(&text, "XDG_DOWNLOAD_DIR")?, home)
-}
-
-/// Pull one key out of a `user-dirs.dirs` file. It's shell-syntax:
-/// `# comment` lines and `KEY="value"` assignments. Last assignment wins, as
-/// a shell sourcing it would give.
-fn parse_user_dirs(text: &str, key: &str) -> Option<String> {
-    let mut found = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        if k.trim() != key {
-            continue;
-        }
-        let v = v.trim();
-        // Strip one layer of matching quotes.
-        let v = v
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-            .unwrap_or(v);
-        if !v.is_empty() {
-            found = Some(v.to_string());
-        }
-    }
-    found
-}
-
-/// Expand the `$HOME/…` (or `~/…`) prefix the spec mandates for these values.
-/// Anything else must already be absolute — a bare relative path is malformed,
-/// and guessing at it could scatter files into the process's cwd.
-fn expand_home(raw: &str, home: &std::path::Path) -> Option<PathBuf> {
-    let raw = raw.trim();
-    for prefix in ["$HOME", "${HOME}", "~"] {
-        if let Some(rest) = raw.strip_prefix(prefix) {
-            let rest = rest.trim_start_matches('/');
-            return Some(if rest.is_empty() {
-                home.to_path_buf()
-            } else {
-                home.join(rest)
-            });
-        }
-    }
-    let p = PathBuf::from(raw);
-    p.is_absolute().then_some(p)
-}
 
 /// A non-clobbering path in `dir` for `name`: if it exists, append " (1)",
 /// " (2)", … before the extension (same as a browser download).
@@ -767,76 +698,5 @@ pub fn set_clipboard_sync(enabled: bool) {
 #[tauri::command]
 pub fn get_clipboard_sync() -> bool {
     CLIPBOARD_SYNC.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A real French `user-dirs.dirs`, verbatim shape (comment header, quoted
-    /// `$HOME` values) — the case where hardcoding `~/Downloads` lost files.
-    const FR: &str = r#"# This file is written by xdg-user-dirs-update
-# If you want to change or add directories, just edit the line you're
-XDG_DESKTOP_DIR="$HOME/Bureau"
-XDG_DOWNLOAD_DIR="$HOME/Téléchargements"
-XDG_DOCUMENTS_DIR="$HOME/Documents"
-"#;
-
-    #[test]
-    fn parses_localised_download_dir() {
-        let raw = parse_user_dirs(FR, "XDG_DOWNLOAD_DIR").expect("download dir");
-        assert_eq!(raw, "$HOME/Téléchargements");
-        assert_eq!(
-            expand_home(&raw, std::path::Path::new("/home/cyril")),
-            Some(PathBuf::from("/home/cyril/Téléchargements"))
-        );
-    }
-
-    #[test]
-    fn ignores_comments_and_other_keys() {
-        assert_eq!(parse_user_dirs(FR, "XDG_MUSIC_DIR"), None);
-        // A commented-out assignment must not win.
-        let text = "#XDG_DOWNLOAD_DIR=\"$HOME/nope\"\nXDG_DOWNLOAD_DIR=\"$HOME/yes\"\n";
-        assert_eq!(
-            parse_user_dirs(text, "XDG_DOWNLOAD_DIR"),
-            Some("$HOME/yes".to_string())
-        );
-    }
-
-    #[test]
-    fn last_assignment_wins_like_a_shell() {
-        let text = "XDG_DOWNLOAD_DIR=\"$HOME/first\"\nXDG_DOWNLOAD_DIR=\"$HOME/second\"\n";
-        assert_eq!(
-            parse_user_dirs(text, "XDG_DOWNLOAD_DIR"),
-            Some("$HOME/second".to_string())
-        );
-    }
-
-    #[test]
-    fn expands_home_forms_and_rejects_relative() {
-        let home = std::path::Path::new("/home/cyril");
-        for raw in ["$HOME/Dl", "${HOME}/Dl", "~/Dl"] {
-            assert_eq!(expand_home(raw, home), Some(PathBuf::from("/home/cyril/Dl")));
-        }
-        // Download dir set to the home directory itself.
-        assert_eq!(expand_home("$HOME/", home), Some(home.to_path_buf()));
-        // Absolute paths pass through; relative ones are malformed → fall back.
-        assert_eq!(expand_home("/data/dl", home), Some(PathBuf::from("/data/dl")));
-        assert_eq!(expand_home("Downloads", home), None);
-        assert_eq!(expand_home("", home), None);
-    }
-
-    /// Unquoted and single-quoted values are valid shell too.
-    #[test]
-    fn handles_unquoted_and_single_quoted() {
-        assert_eq!(
-            parse_user_dirs("XDG_DOWNLOAD_DIR=$HOME/Dl\n", "XDG_DOWNLOAD_DIR"),
-            Some("$HOME/Dl".to_string())
-        );
-        assert_eq!(
-            parse_user_dirs("XDG_DOWNLOAD_DIR='$HOME/Dl'\n", "XDG_DOWNLOAD_DIR"),
-            Some("$HOME/Dl".to_string())
-        );
-    }
 }
 

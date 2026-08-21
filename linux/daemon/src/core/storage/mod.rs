@@ -1,10 +1,17 @@
 //! Local storage backends for V1 secrets and trusted-peer metadata
 //! (spec §3.2 and §3.3).
 
+// Secret Service is the LINUX secret backend; the traits below are the seam.
+// A Windows build gets its Credential Manager implementation beside these.
+#[cfg(target_os = "linux")]
 pub mod peers;
+#[cfg(target_os = "linux")]
 pub mod secret_service;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+// Only the Secret Service runtime below needs it, and that is Linux-only.
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 
 use crate::core::identity::{IdentityRecord, IdentityPublicView, Platform};
 use crate::core::crypto::x25519::{X25519Sec, X25519SecBytes};
@@ -26,8 +33,12 @@ use crate::core::crypto::x25519::{X25519Sec, X25519SecBytes};
 /// enters the dedicated runtime's context, so the zbus tasks land on its
 /// own worker thread and a store call always completes no matter how
 /// starved the ambient runtime is.
+/// Linux-only, like the Secret Service backend it exists for: the deadlock it
+/// avoids is a zbus one.
+#[cfg(target_os = "linux")]
 static SECRET_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 fn secret_rt() -> &'static tokio::runtime::Runtime {
     SECRET_RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -44,6 +55,7 @@ fn secret_rt() -> &'static tokio::runtime::Runtime {
 /// ambient multi-thread workers hand their core off via `block_in_place`,
 /// current-thread runtimes (e.g. `#[tokio::test]`) hop to a scoped thread
 /// (blocking them in place would panic), plain threads just block.
+#[cfg(target_os = "linux")]
 pub(crate) fn secret_block_on<F>(fut: F) -> F::Output
 where
     F: std::future::Future + Send,

@@ -1,9 +1,22 @@
 //! BLE constants, advertisement payload codec, and platform-side BLE
 //! integration per spec §5 and §10.
 
-pub mod audio_signal;
-pub mod client;
+// `frame` is the WIRE PROTOCOL: frame types, subtypes and chunk headers, shared
+// byte-for-byte with the phone and used by the LAN transport too (see
+// `lan::tcp_client`, which reassembles bulk-sync datasets by BLE frame type).
+// It is pure Rust and must build everywhere — the phone cannot tell the two
+// laptops apart, and `shared/vectors/` exists to keep it that way.
 pub mod frame;
+
+// Everything below is BlueZ over D-Bus: the central-role transport that
+// carries those frames on Linux. A second OS brings its own transport (WinRT
+// `BluetoothLEDevice`) behind `core::platform::BleCentral` and reuses `frame`
+// unchanged.
+#[cfg(target_os = "linux")]
+pub mod audio_signal;
+#[cfg(target_os = "linux")]
+pub mod client;
+#[cfg(target_os = "linux")]
 pub mod scanner;
 
 /// V1 protocol version byte. Receivers MUST reject other versions (§5.2).

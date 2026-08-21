@@ -1,15 +1,24 @@
 pub mod appstate;
+// The earbuds audio-op transport, driven by `audio_orchestrator` (PulseAudio +
+// BlueZ). LAN-shaped but Linux-bound in purpose: a Windows build has no audio
+// backend to hand the buds to yet.
+#[cfg(target_os = "linux")]
 pub mod audio_lan_session;
 pub mod audio_op;
+#[cfg(target_os = "linux")]
 pub mod audio_orchestrator;
 pub mod audio_route;
 pub mod audio_sink_cache;
+#[cfg(target_os = "linux")]
 pub mod audio_switch;
 pub mod audio_switch_persistence;
+#[cfg(target_os = "linux")]
 pub mod media_runtime;
+#[cfg(target_os = "linux")]
 pub mod media_watch;
 pub mod ble;
 pub mod crypto;
+#[cfg(target_os = "linux")]
 pub mod earbuds;
 pub mod fs_private;
 pub mod earbuds_store;
@@ -22,9 +31,11 @@ pub mod mirror_session;
 pub mod mirror_udp;
 pub mod mirror_tcp;
 pub mod notif_mirror;
+#[cfg(target_os = "linux")]
 pub mod notification_display;
 pub mod notif_capturer;
 pub mod live_activity;
+#[cfg(target_os = "linux")]
 pub mod live_activity_dbus;
 pub mod call_event;
 pub mod handoff;
@@ -35,6 +46,8 @@ pub mod icon_cache;
 pub mod identity;
 pub mod lan;
 pub mod pairing;
+pub mod platform;
+#[cfg(target_os = "linux")]
 pub mod session_lock;
 pub mod status;
 pub mod storage;
