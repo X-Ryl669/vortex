@@ -35,11 +35,10 @@ pub(crate) fn redact_sas(sas: &str) -> String {
 /// "MyLaptop" rather than a platform label. `/proc` on Linux, `COMPUTERNAME`
 /// elsewhere; sanitised on the way out by the handshake either way.
 pub(crate) fn local_device_name() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
-    #[cfg(not(target_os = "linux"))]
-    let raw = std::env::var("COMPUTERNAME").ok();
-    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    // One source, shared with the AppState heartbeat: the pairing frame and the
+    // heartbeat both carry this name, and if they disagree the heartbeat wins by
+    // arriving second.
+    vortex_l3_daemon::core::platform::host_name()
 }
 
 /// Pair over BlueZ: connect to a scanned BD_ADDR, then hand the link to

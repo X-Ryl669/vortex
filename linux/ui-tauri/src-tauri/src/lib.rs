@@ -216,13 +216,116 @@ pub(crate) struct PairDecisionState(pub(crate) Mutex<Option<oneshot::Sender<Loca
 // Tauri entrypoint
 // --------------------------------------------------------------------------
 
+/// `RUST_LOG` if set, else `info`.
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// Start logging to stderr. The journal picks this up under the systemd user
+/// unit, which is where Linux diagnosis happens.
+#[cfg(target_os = "linux")]
+fn init_logging() {
+    tracing_subscriber::fmt().with_env_filter(log_filter()).init();
+}
+
+/// Start logging to a FILE, because a Windows GUI binary has no console to
+/// print to: run the exe by double-clicking it and stderr goes nowhere at all.
+/// Making the log a file by default means the first run of code that has never
+/// executed leaves evidence without anyone having to arrange for it.
+///
+/// `%LOCALAPPDATA%\Vortex\vortex.log`, with the previous run kept as
+/// `vortex.log.1` — one restart of history, because the interesting run is
+/// often the one before the one you thought to look at. Falls back to stderr if
+/// the file cannot be opened, which is no worse than before.
+#[cfg(not(target_os = "linux"))]
+fn init_logging() {
+    use std::io::Write;
+
+    let path = vortex_l3_daemon::core::platform::paths()
+        .logs()
+        .map(|dir| {
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("vortex.log")
+        });
+
+    let file = path.as_ref().and_then(|p| {
+        // Roll the previous run aside rather than appending: a fresh file per
+        // launch is what makes "what did THIS run do" answerable at a glance.
+        if p.exists() {
+            let _ = std::fs::rename(p, p.with_extension("log.1"));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(p)
+            .ok()
+    });
+
+    match file {
+        Some(f) => {
+            // A closure is the `MakeWriter` that needs no extra dependency;
+            // cloned handles share the file offset, so lines from different
+            // threads append rather than overwrite. ANSI off — colour escapes
+            // in a file make it unreadable in Notepad.
+            let writer = move || f.try_clone().expect("clone log handle");
+            tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
+                .with_writer(writer)
+                .with_ansi(false)
+                .init();
+            if let Some(p) = path.as_ref() {
+                tracing::info!("logging to {}", p.display());
+                // Also to stderr, for the case where a console DOES exist and
+                // someone is looking for the file.
+                let _ = writeln!(std::io::stderr(), "vortex: logging to {}", p.display());
+            }
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
+                .with_ansi(false)
+                .init();
+            tracing::warn!("could not open a log file; logging to stderr only");
+        }
+    }
+}
+
+/// Route panics into the log.
+///
+/// The default hook prints to stderr, which on a Windows GUI binary goes
+/// nowhere at all — a thread that panics simply stops, leaving a log that ends
+/// mid-startup with no reason given. That is the single most confusing failure
+/// a first run can produce, so panics go where the rest of the diagnosis is.
+///
+/// Keeps the default hook too: on Linux stderr IS the journal.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // `info.location()` is where it happened; the payload is the message.
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let what = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        tracing::error!(location = %where_, "PANIC: {what}");
+        default(info);
+    }));
+}
+
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    init_logging();
+    log_panics();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "vortex starting"
+    );
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<UiCmd>();
     // Tray heartbeat: the 5-second local-earbuds rescan used to live in the
@@ -230,6 +333,10 @@ pub fn run() {
     // so with the window closed the tray battery/owner rows froze until the
     // phone's next heartbeat. Driven from here instead: same worker path,
     // independent of window visibility.
+    // Linux only: what it drives is a BlueZ earbuds rescan, so off Linux it is
+    // a command with no handler arriving every 5 s forever — 28 warn lines in
+    // the first Windows log, and the noise that hid the real fault.
+    #[cfg(target_os = "linux")]
     {
         let hb_tx = cmd_tx.clone();
         thread::spawn(move || loop {

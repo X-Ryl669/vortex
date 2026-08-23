@@ -105,6 +105,32 @@ pub trait UserPaths: Send + Sync {
     fn config(&self) -> Option<PathBuf>;
     /// Per-user cache root — icon cache, transient blobs.
     fn cache(&self) -> Option<PathBuf>;
+    /// Where a log file goes, on a platform that writes one.
+    ///
+    /// Linux does not: the app runs under a systemd user unit and its output is
+    /// the journal, which is where every diagnosis in this project has come
+    /// from. Windows has no such thing for a desktop app, so it writes a file —
+    /// and "where is the log" must not be a guess when the first run of
+    /// never-executed code goes wrong.
+    fn logs(&self) -> Option<PathBuf>;
+}
+
+/// This machine's name, as the user would recognise it.
+///
+/// Lives at the seam because there is no portable way to ask: Linux reads
+/// `/proc`, Windows has an environment variable that Linux does not set. Both
+/// the pairing APPROVE frame and every AppState heartbeat carry this, and they
+/// have to agree — a heartbeat that reports `None` overwrites the name the
+/// phone learned at pairing time with a blank, which is what made a
+/// freshly-paired Windows laptop show up on the phone as "null".
+pub fn host_name() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
+    // `COMPUTERNAME` is set for every interactive session, and the NetBIOS name
+    // it holds is what the machine calls itself in every Windows UI.
+    #[cfg(not(target_os = "linux"))]
+    let raw = std::env::var("COMPUTERNAME").ok();
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// A desktop notification carrying optional action buttons.
@@ -327,13 +353,23 @@ pub trait GattLink: Send + Sync {
 /// on the phone, and the reconnect path needs the presence token to know WHICH
 /// trusted peer this is. The phone rotates its address every few minutes, so it
 /// is the payload that identifies, not the address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: `local_name` is an owned `String`. Nothing needs it to be — the
+// two fields callers pass around by value (`addr`, `rssi`) are `Copy` on their
+// own.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvCandidate {
     pub addr: PeerAddr,
     pub payload: crate::core::ble::AdvPayload,
     /// Signal strength, where the platform reports it — used only to prefer a
     /// nearer peer, never to decide identity.
     pub rssi: Option<i16>,
+    /// The advert's Complete Local Name, when it carries one.
+    ///
+    /// Cosmetic and untrusted: it is what the pairing radar labels a row with
+    /// so the user recognises their own phone instead of reading a rotating
+    /// random address. The name that ends up in the trust store is the one
+    /// inside the authenticated APPROVE frame, never this.
+    pub local_name: Option<String>,
 }
 
 /// A Bluetooth device address. Deliberately a plain newtype rather than

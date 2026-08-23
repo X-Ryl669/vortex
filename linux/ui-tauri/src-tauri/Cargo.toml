@@ -21,6 +21,21 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# DO NOT REMOVE. `tauri`'s own build script derives `dev = !custom-protocol`,
+# so a build without this feature loads the UI from `devUrl` — a dev server
+# that is not running in a shipped binary — and the window shows
+# ERR_CONNECTION_REFUSED instead of the app.
+#
+# `npm run tauri build` (what install_linux.sh uses) enables it for you, which
+# is why the Linux flow never hit this. A bare `cargo build --release` does not,
+# and note that `--features tauri/custom-protocol` on the command line is a
+# SILENT NO-OP: that syntax only addresses workspace members, so the feature has
+# to be forwarded here. Build a standalone binary with:
+#
+#   cargo build --release --features custom-protocol
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
 serde = { version = "1", features = ["derive"] }

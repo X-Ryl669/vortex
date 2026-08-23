@@ -14,6 +14,9 @@ use vortex_l3_daemon::core::storage::peers::PeerStore;
 // Channel protocol — identical in spirit to bin/ui.rs.
 // --------------------------------------------------------------------------
 
+// `Debug` so the non-Linux dispatcher can name a command it has no handler
+// for; a bare "unsupported" warn repeated every poll says nothing useful.
+#[derive(Debug)]
 pub(crate) enum UiCmd {
     Scan,
     Pair(String),

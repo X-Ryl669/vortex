@@ -88,6 +88,14 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",
     "Win32_System_Com",
+    # The AUMID shortcut that makes toasts visible at all: a PROPVARIANT in the
+    # shortcut's property store (StructuredStorage) keyed by a PROPERTYKEY
+    # (PropertiesSystem). See `notify::register_aumid_shortcut`.
+    "Win32_System_Com_StructuredStorage",
+    # PROPVARIANT is gated on the Variant namespace even though we only need its
+    # VT_LPWSTR tag.
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Shutdown",

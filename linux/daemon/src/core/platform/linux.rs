@@ -31,6 +31,12 @@ impl UserPaths for LinuxPaths {
             .unwrap_or_else(|| home.join(".cache"));
         Some(base.join("vortex"))
     }
+
+    /// The journal, in practice — this answers for completeness, and points at
+    /// the cache root so a file written here is never mistaken for state.
+    fn logs(&self) -> Option<PathBuf> {
+        self.cache()
+    }
 }
 
 fn config_home() -> Option<PathBuf> {
@@ -270,6 +276,7 @@ impl BleCentral for LinuxBleCentral {
                     addr: PeerAddr(c.address.0),
                     payload: c.payload,
                     rssi: c.rssi,
+                    local_name: c.local_name.clone(),
                 });
             });
             tokio::select! {

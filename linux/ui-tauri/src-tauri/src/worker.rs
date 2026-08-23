@@ -757,23 +757,91 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 // Pairing over the seam: scan for a pairable phone, then the
                 // same XX handshake and trust save the Linux path uses. The
                 // address the UI sends is ignored — see `pair_by_scan`.
+                // THE thing that unblocks the whole UI off Linux, and the
+                // reason the radar stayed empty even once `Scan` had a handler.
+                //
+                // `emit_peers` runs once at worker startup (above), but Tauri
+                // events are not replayed: the webview registers its listeners
+                // in `initConnectionStore()`, and anything emitted before that
+                // is gone. The frontend's `peersLoaded` flips only on a
+                // `vortex:peers` event, and `runScanLoop` refuses to start
+                // until it is true — so a lost startup emit means no scan is
+                // ever requested, no matter how well discovery works.
+                //
+                // Linux never noticed because this command re-emits peers, and
+                // Vue calls it on every mount and webview reload. That makes it
+                // the repair for the lost first emit, not just a refresh. Off
+                // Linux it was dropped, so `peersLoaded` stayed false for the
+                // life of the process.
+                //
+                // Identity and peers only: the rest of the Linux handler is
+                // earbuds and switch state, which need a radio and an audio
+                // device. The UI treats those events as optional; `vortex:peers`
+                // is the one it gates on.
+                #[cfg(not(target_os = "linux"))]
+                UiCmd::RefreshState => {
+                    let _ = ctx.app.emit("vortex:identity", IdentityInfo { ready: true });
+                    emit_peers(&ctx.app, ctx.peer_store.clone()).await;
+                }
+                // The radar the Pair button lives on. Without this arm the
+                // Windows pairing screen has nothing to click, so the handler
+                // below is unreachable — see `scan_for_ui`.
+                #[cfg(not(target_os = "linux"))]
+                UiCmd::Scan => crate::ble_portable::scan_for_ui(
+                    &ctx.app,
+                    vortex_l3_daemon::core::platform::windows::ble::central(),
+                    &mut active_scan,
+                ),
                 #[cfg(not(target_os = "linux"))]
                 UiCmd::Pair(_addr) => {
+                    // Quiet the radio first, for the reason the BlueZ path
+                    // documents below: the radar scan and the pairing scan are
+                    // two watchers competing for one radio, and `pair_by_scan`
+                    // starts with a scan of its own.
+                    if let Some(h) = active_scan.take() {
+                        h.abort();
+                        let _ = h.await;
+                    }
                     let central = vortex_l3_daemon::core::platform::windows::ble::central();
-                    if let Err(e) = crate::ble_portable::pair_by_scan(
+                    let result = crate::ble_portable::pair_by_scan(
                         &ctx.app,
                         central,
                         &ctx.identity,
                         ctx.peer_store.clone(),
                     )
-                    .await
-                    {
-                        tracing::warn!("pairing failed: {e}");
-                        let _ = ctx.app.emit("vortex:pairing_error", e);
+                    .await;
+                    // `vortex:pairing_result` — the SAME event the BlueZ path
+                    // emits, and the only one the overlay listens for. It had
+                    // been emitting `vortex:pairing_error`, which nothing
+                    // subscribes to: a pairing that fully succeeded left the
+                    // approve screen up forever, on top of the rest of the UI,
+                    // while the phone was already synced underneath it. Both
+                    // outcomes have to be reported, not just the failure.
+                    match result {
+                        Ok(()) => {
+                            let _ = ctx.app.emit(
+                                "vortex:pairing_result",
+                                crate::ipc::PairingResultDto::Ok {
+                                    ok: true,
+                                    message: "trust persisted".to_string(),
+                                },
+                            );
+                            emit_peers(&ctx.app, ctx.peer_store.clone()).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("pairing failed: {e}");
+                            let _ = ctx.app.emit(
+                                "vortex:pairing_result",
+                                crate::ipc::PairingResultDto::Err { ok: false, error: e },
+                            );
+                        }
                     }
                 }
+                // Naming the command matters: the frontend is one shared
+                // bundle, so anything it polls lands here, and a nameless warn
+                // repeated every few seconds says only "something is missing".
                 #[cfg(not(target_os = "linux"))]
-                _ => tracing::warn!("UI command has no handler on this platform; ignoring"),
+                other => tracing::warn!(cmd = ?other, "UI command has no handler on this platform; ignoring"),
             }
         }
     });

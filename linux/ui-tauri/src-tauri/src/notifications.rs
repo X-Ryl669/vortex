@@ -525,7 +525,18 @@ pub(crate) fn spawn_subsystem(
                 let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<
                     vortex_l3_daemon::core::notif_mirror::NotificationMirror,
                 >();
+                // Linux only: the capture is a `dbus-monitor` child parsing the
+                // session bus, and there is no such bus elsewhere. Left ungated
+                // it respawned every 5 s forever, logging a warn per attempt.
+                // Windows' equivalent is the UserNotificationListener, which
+                // needs a packaged-identity capability the app does not have
+                // yet, so laptop→phone mirroring is simply off there — the
+                // consumer below stays, harmlessly idle on a channel nothing
+                // feeds.
+                #[cfg(target_os = "linux")]
                 vortex_l3_daemon::core::notif_capturer::spawn(cap_tx);
+                #[cfg(not(target_os = "linux"))]
+                drop(cap_tx);
                 let writer_handle = ble_notif_writer.clone();
                 tokio::spawn(async move {
                     while let Some(notif) = cap_rx.recv().await {

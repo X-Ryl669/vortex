@@ -30,8 +30,27 @@ static AUTO_ACCEPT_LOADED: OnceLock<()> = OnceLock::new();
 /// restart would leave the user believing files are still gated when they are
 /// not, or waiting for a prompt that no longer comes.
 fn auto_accept_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/share/vortex/file_auto_accept"))
+    // Linux keeps its existing location. Moving it to the seam's `config()`
+    // (`~/.config/vortex`) would read as "auto-accept was never enabled" on
+    // every machine that already has this set — silently re-gating a user's
+    // choice, which is the mirror image of the hazard in the doc comment above.
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".local/share/vortex/file_auto_accept"))
+    }
+    // Everywhere else, through the seam. `$HOME` is a Unix variable that Windows
+    // does not set, so this resolved to `None` there: the value could not be
+    // read and `set_file_auto_accept` failed outright with "no HOME". The toggle
+    // was unusable — and it is the only way round a platform whose consent
+    // banner cannot be shown at all (see `notify`), so it has to work there
+    // most of all.
+    #[cfg(not(target_os = "linux"))]
+    Some(
+        vortex_l3_daemon::core::platform::paths()
+            .config()?
+            .join("file_auto_accept"),
+    )
 }
 
 /// The current setting, loading the persisted value on first use. Anything
