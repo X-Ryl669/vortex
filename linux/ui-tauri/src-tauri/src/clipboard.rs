@@ -293,11 +293,41 @@ fn poll_once(cb: &mut arboard::Clipboard, last_sig: &mut String, last_state: &mu
 /// password. We ask the CLIPBOARD owner to convert to that target: if it's
 /// offered, the copy is secret → don't store or sync it.
 ///
-/// X11/XWayland only (arboard already proves the bridge works on the GNOME
-/// target). Fails OPEN on ANY error — a probe failure must never silently halt
-/// normal clipboard sync. One persistent connection + owned window, lazily
-/// built; the round-trip happens only when the text actually changed.
+/// Fails OPEN on ANY error — a probe failure must never silently halt normal
+/// clipboard sync.
+///
+/// It has to ask about the SAME selection arboard reads, or it answers about
+/// text that was never captured. Under Wayland those are two different
+/// selections: arboard (with `wayland-data-control`) reads the Wayland one,
+/// while the X11 probe below sees whatever XWayland last got handed — which on
+/// Plasma is frequently minutes stale. An X11-only probe would then report "not
+/// secret" for a password copy it simply cannot see, and the password would sync
+/// to the phone. So Wayland is asked first, on Wayland's own terms.
+
+/// The Wayland arm: list the MIME types the selection offers and look for the
+/// hint among them. Cheaper than the X11 round trip — no conversion request,
+/// the compositor already knows the offer's type list.
+///
+/// `None` means "could not ask" (no Wayland display, no data-control protocol),
+/// which hands the question to the X11 probe rather than answering it wrongly.
+fn wayland_clipboard_is_secret() -> Option<bool> {
+    use wl_clipboard_rs::paste::{get_mime_types, ClipboardType, Seat};
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return None;
+    }
+    match get_mime_types(ClipboardType::Regular, Seat::Unspecified) {
+        Ok(types) => Some(types.iter().any(|t| t == "x-kde-passwordManagerHint")),
+        // An empty clipboard is a definite "not secret", not a failure to ask.
+        Err(wl_clipboard_rs::paste::Error::ClipboardEmpty) => Some(false),
+        Err(_) => None,
+    }
+}
+
 fn clipboard_is_secret() -> bool {
+    if let Some(secret) = wayland_clipboard_is_secret() {
+        return secret;
+    }
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{
         AtomEnum, ConnectionExt, CreateWindowAux, WindowClass,
