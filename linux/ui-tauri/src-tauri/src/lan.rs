@@ -1094,6 +1094,10 @@ pub(crate) fn spawn_heartbeat(
             let auto_ble_writers = ble_audio_writers.clone();
             tokio::spawn(async move {
                 let mut consec_lan_fail = 0u32;
+                // Distinct from `consec_lan_fail == 0`, which cannot tell "the
+                // last attempt succeeded" from "there has not been one yet" —
+                // and the difference is the whole cold start. See the nudge below.
+                let mut lan_ever_synced = false;
                 loop {
                     let (had_trust, lan_synced) = {
                         let _g = auto_lock_clone.lock().await;
@@ -1148,11 +1152,26 @@ pub(crate) fn spawn_heartbeat(
                         // Edge-triggered on purpose: a steady-state LAN tick
                         // must not poke BLE every cycle when the phone simply
                         // has Bluetooth off.
-                        if consec_lan_fail > 0 {
+                        // The FIRST sync after launch is a down→up edge too,
+                        // and the one that matters most: at startup the BLE loop
+                        // has no learned RPA, so it cannot take its direct-connect
+                        // fast path and instead sits in presence discovery
+                        // (monitor registration, or 15 s scans backing off
+                        // 5→10→20→45 s). Meanwhile LAN is up in about two
+                        // seconds and knows the phone is right there.
+                        //
+                        // `consec_lan_fail > 0` alone could not see that edge,
+                        // because the counter starts at 0 and a first success
+                        // leaves it at 0 — so the nudge never fired on a cold
+                        // start and BLE rode out the full wait. Everything that
+                        // rides BLE and only BLE was dead until it finished:
+                        // clipboard text, in BOTH directions.
+                        if consec_lan_fail > 0 || !lan_ever_synced {
                             if let Some(n) = crate::BLE_RETRY_NUDGE.get() {
                                 n.notify_one();
                             }
                         }
+                        lan_ever_synced = true;
                         consec_lan_fail = 0;
                     } else if had_trust {
                         consec_lan_fail = consec_lan_fail.saturating_add(1);
