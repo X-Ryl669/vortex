@@ -244,7 +244,8 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // a consumer task applies it to the UI instantly — the same Vue
         // event + tray refresh a LAN heartbeat produces, but in ~200 ms over
         // the already-open BLE link instead of a fresh TCP+IK reconnect.
-        let ble_state_tx = crate::lan_state::spawn_state_consumer(app.clone());
+        let ble_state_tx =
+            crate::lan_state::spawn_state_consumer(app.clone(), peer_store.clone());
 
         // BLE notification-mirror channel: the persistent listener forwards
         // a decoded NotificationMirror here; a consumer pops it as a desktop

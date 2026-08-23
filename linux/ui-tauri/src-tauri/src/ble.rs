@@ -493,7 +493,32 @@ pub(crate) async fn connect_bonded_or_scan(
             return None;
         }
     };
-    match VortexClient::connect(adapter, addr).await {
+    // Capped, for the same reason the fast path above is capped — and this is
+    // the one that actually burns. Measured on a cold start: six doomed attempts
+    // at 13-18 s each, two minutes of dead time, then a connect that succeeded in
+    // under a second once the address was fresh.
+    //
+    // The address comes from a scan, but the phone rotates its presence RPA every
+    // 60 s. Uncapped, one doomed attempt plus the next 15 s scan is ~33 s — the
+    // same order as the rotation, so we spend most of the time dialling addresses
+    // the phone has already abandoned, and each failure costs a further rotation.
+    // Capping turns that into several short attempts per window, each on a fresher
+    // address. 8 s is well above a healthy connect-plus-service-discovery (the
+    // fast path expects sub-second on a known-good RPA) and well below the 13-18 s
+    // a dead RPA was costing.
+    const CONNECT_CAP: Duration = Duration::from_secs(8);
+    let connect = match tokio::time::timeout(CONNECT_CAP, VortexClient::connect(adapter, addr)).await
+    {
+        Ok(r) => r,
+        // A tokio timeout drops the future, but BlueZ keeps the connect attempt in
+        // flight — the next connect to a different RPA would fail "In Progress".
+        // `clear_pending_connect` in the error arm below cancels it, so route the
+        // timeout through the same cleanup rather than duplicating it.
+        Err(_) => Err(vortex_l3_daemon::core::ble::client::ClientError::Timeout(
+            "connect (capped)",
+        )),
+    };
+    match connect {
         Ok(client) => {
             *last_rpa = Some(addr);
             *consec_connect_fail = 0;
