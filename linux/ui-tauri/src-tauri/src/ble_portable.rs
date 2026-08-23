@@ -107,6 +107,12 @@ pub(crate) async fn run_portable_ble_loop(
     retry_nudge: Arc<tokio::sync::Notify>,
 ) {
     let mut consec_fail: usize = 0;
+    // Announce itself once. The wait-for-a-peer branch below is silent by
+    // design (it polls every 10 s and would flood), but that made a first run
+    // with nothing paired indistinguishable from a loop that never started —
+    // which is how the first Windows log read.
+    tracing::info!("portable BLE loop started");
+    let mut announced_no_peer = false;
     loop {
         // A trusted peer is the precondition for everything below: IK needs the
         // peer's static key and the PRS. Before pairing there is nothing to
@@ -118,8 +124,15 @@ pub(crate) async fn run_portable_ble_loop(
             })
             .await
             {
-                Ok(Some(p)) => p,
+                Ok(Some(p)) => {
+                    announced_no_peer = false;
+                    p
+                }
                 _ => {
+                    if !announced_no_peer {
+                        tracing::info!("no trusted peer yet; BLE loop idle until pairing");
+                        announced_no_peer = true;
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     continue;
                 }
@@ -414,4 +427,71 @@ pub(crate) async fn pair_by_scan(
         crate::pairing::local_device_name().as_deref(),
     )
     .await
+}
+
+/// `UiCmd::Scan` off Linux — populate the pairing radar over the seam.
+///
+/// Not just noise reduction: without this the Windows pairing UI is a dead end.
+/// `runScanLoop` in the frontend polls `start_scan` and renders whatever
+/// `vortex:scan_result` reports, and the Pair button only exists on a row of
+/// that list — so a `Scan` that answers nothing means no row, no button, and no
+/// way to reach [`pair_by_scan`] at all. That is exactly what the first Windows
+/// run showed: an empty radar and a log full of "UI command has no handler".
+///
+/// Emits the same three events the BlueZ scan does (`vortex:busy` around it,
+/// `vortex:scan_result` per hit, `vortex:scan_done` at the end) because the
+/// frontend drives its spinner off them and gives up after 11 s regardless.
+///
+/// Two honest differences from Linux, both invisible to the user:
+///  - One hit at most. `scan_for_peer` resolves on the first Vortex advert it
+///    decodes, so it cannot enumerate. One phone is the case that matters, and
+///    the SAS comparison is what makes picking the wrong one of two safe.
+///  - The row label comes from the advert's Complete Local Name, which most
+///    adverts omit — the phone spends its 31-byte budget on the service data.
+///    The radar then renders "Android device", same as a nameless hit on Linux.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn scan_for_ui(
+    app: &tauri::AppHandle,
+    central: Arc<dyn BleCentral>,
+    active_scan: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    use tauri::Emitter;
+
+    // Supersede a still-running scan so handles don't leak, same as the BlueZ
+    // path — the frontend re-polls every few seconds and would otherwise stack
+    // one radio-holding scan per poll.
+    if let Some(prev) = active_scan.take() {
+        prev.abort();
+    }
+    let app = app.clone();
+    *active_scan = Some(tokio::spawn(async move {
+        let _ = app.emit("vortex:busy", true);
+        match central.scan_for_peer(SCAN_MS).await {
+            // Pairable only, matching the Linux filter: a trusted-presence
+            // advert means that phone is already paired (with us or with
+            // another laptop), and offering it as a fresh pair target leads to
+            // a handshake failure the user cannot act on.
+            Ok(Some(c)) if c.payload.flags.is_pairable() => {
+                let hit = crate::ipc::ScanHitDto {
+                    addr: c.addr.to_string(),
+                    rssi: c.rssi.unwrap_or(0),
+                    instance: hex::encode(c.payload.payload_8),
+                    name: c.local_name.clone(),
+                };
+                tracing::info!(
+                    addr = %hit.addr, rssi = hit.rssi, instance = %hit.instance,
+                    "scan hit",
+                );
+                let _ = app.emit("vortex:scan_result", hit);
+            }
+            Ok(Some(c)) => tracing::info!(
+                addr = %c.addr,
+                "scan saw a Vortex phone that is not in a pairing window; not offered",
+            ),
+            Ok(None) => tracing::debug!("scan found no Vortex advertisement"),
+            Err(e) => tracing::warn!("scan failed: {e}"),
+        }
+        let _ = app.emit::<Option<()>>("vortex:scan_done", None);
+        let _ = app.emit("vortex:busy", false);
+    }));
 }

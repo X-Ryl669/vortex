@@ -49,8 +49,120 @@ use crate::core::platform::toast_xml::toast_xml;
 use crate::core::platform::{BoxFuture, Notifier};
 
 /// The AppUserModelID toasts are shown under. Must match the AUMID on the
-/// Start-menu shortcut the installer creates, or nothing appears.
+/// Start-menu shortcut [`register_aumid_shortcut`] creates, or nothing appears.
 pub const AUMID: &str = "com.vortex.desktop";
+
+/// Give this AUMID a Start-menu shortcut, so toasts are actually displayed.
+///
+/// Windows will not show a toast for an AppUserModelID it cannot resolve to an
+/// installed app, and it does not consider that an error: `CreateToastNotifier`
+/// succeeds, `Show` succeeds, and nothing appears. That is exactly what the
+/// first working Windows run did — a file-consent banner was "shown", no one
+/// saw it, and the 45-second timeout declined the transfer.
+///
+/// The registration IS a shortcut in the user's Start menu whose
+/// `System.AppUserModel.ID` property holds the AUMID. Nothing about it needs an
+/// installer or admin rights, which is why this is done here rather than left
+/// to packaging: a standalone .exe can register itself on first run and toasts
+/// start working. An MSI would write the same shortcut.
+///
+/// Idempotent by existence check. Cheap, and rewriting the shortcut on every
+/// launch would reset a name or icon the user customised.
+///
+/// # Unverified
+///
+/// Type-checked only, like everything else in this module. The failure mode if
+/// it is wrong is the one we already have — silent, invisible toasts — so it
+/// logs what it did either way.
+pub fn register_aumid_shortcut() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{Interface, GUID, PCWSTR, PWSTR};
+    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
+    use windows::Win32::System::Variant::VT_LPWSTR;
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink, FOLDERID_Programs};
+
+    ensure_winrt();
+
+    let Some(dir) = super::known_folder(&FOLDERID_Programs) else {
+        tracing::warn!("toasts: no Start-menu Programs folder; AUMID unregistered");
+        return;
+    };
+    let link_path = dir.join("Vortex.lnk");
+    if link_path.exists() {
+        tracing::debug!(path = %link_path.display(), "toasts: AUMID shortcut already present");
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::warn!("toasts: cannot resolve own path; AUMID unregistered");
+        return;
+    };
+
+    // `System.AppUserModel.ID`. Spelled out rather than imported because the
+    // PKEY_* names are C macros that do not survive into the bindings.
+    const PKEY_APPUSERMODEL_ID: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0x9F4C2855_9F79_4B39_A8D0_E1D42DE1D5F3),
+        pid: 5,
+    };
+
+    // Null-terminated UTF-16 in locals that outlive every call below: a PCWSTR
+    // is a borrowed pointer, so a temporary would hand the shell freed memory.
+    let exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let link_w: Vec<u16> =
+        link_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut aumid_w: Vec<u16> = AUMID.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let result = (|| -> windows::core::Result<()> {
+        // SAFETY: a straight-line COM sequence — create the shell-link object,
+        // point it at this exe, stamp the AUMID into its property store, save.
+        // Each fallible step is checked before the next runs, and every pointer
+        // handed over borrows a local declared above.
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(PCWSTR(exe_w.as_ptr()))?;
+            // The Start-menu label, and the name Windows attributes the toast to.
+            link.SetDescription(&HSTRING::from("Vortex"))?;
+
+            // PROPVARIANT has no safe constructor in this crate version, so it
+            // is assembled by hand: a VT_LPWSTR tag plus a borrowed pointer to
+            // the string. `SetValue` copies the value into the store, so the
+            // buffer only has to survive the call — and because the struct has
+            // no `Drop`, letting it fall out of scope cannot free a pointer we
+            // still own.
+            let mut pv = PROPVARIANT::default();
+            {
+                let inner = &mut *pv.Anonymous.Anonymous;
+                inner.vt = VT_LPWSTR;
+                inner.Anonymous.pwszVal = PWSTR(aumid_w.as_mut_ptr());
+            }
+            let store: IPropertyStore = link.cast()?;
+            store.SetValue(&PKEY_APPUSERMODEL_ID, &pv)?;
+            store.Commit()?;
+
+            let file: IPersistFile = link.cast()?;
+            file.Save(PCWSTR(link_w.as_ptr()), true)?;
+            Ok(())
+        }
+    })();
+    match result {
+        Ok(()) => tracing::info!(
+            path = %link_path.display(),
+            aumid = AUMID,
+            "toasts: registered AUMID shortcut (notifications should now appear)",
+        ),
+        Err(e) => tracing::warn!(
+            "toasts: AUMID shortcut failed ({}); toasts stay invisible",
+            err_str(&e)
+        ),
+    }
+}
+
+/// WinRT/COM error to string, for the log lines above.
+fn err_str(e: &windows::core::Error) -> String {
+    format!("{} ({})", e.message(), e.code().0)
+}
 
 /// Where clicks land — EVERY registrant, not the first.
 ///
@@ -132,6 +244,10 @@ fn send(cmd: Cmd) -> Result<(), String> {
 /// Owns the notifier and every live toast, start to finish.
 fn toast_thread(rx: Receiver<Cmd>) {
     ensure_winrt();
+    // Before the first notifier, not at app startup: this is the one place that
+    // needs the AUMID to resolve, it runs exactly once, and a build that never
+    // shows a notification never pays for it.
+    register_aumid_shortcut();
     let notifier = match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID)) {
         Ok(n) => n,
         Err(e) => {

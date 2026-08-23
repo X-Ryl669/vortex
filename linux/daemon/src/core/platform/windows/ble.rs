@@ -49,9 +49,10 @@ use windows::Devices::Bluetooth::Advertisement::{
     BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementWatcher,
     BluetoothLEScanningMode,
 };
+use windows::core::IInspectable;
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristic, GattClientCharacteristicConfigurationDescriptorValue,
-    GattCommunicationStatus, GattValueChangedEventArgs, GattWriteOption,
+    GattCommunicationStatus, GattSession, GattValueChangedEventArgs, GattWriteOption,
 };
 use windows::Devices::Bluetooth::{
     BluetoothAdapter, BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice,
@@ -92,11 +93,12 @@ impl BleCentral for WindowsBleCentral {
         // never crosses an await. Only the address comes back, over a channel.
         // This also gives the COM object consistent thread affinity, which a
         // non-agile object is entitled to expect.
-        let (done_tx, done_rx) =
-            tokio::sync::oneshot::channel::<Result<Option<(u64, AdvPayload, i16)>, String>>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<
+            Result<Option<(u64, AdvPayload, i16, Option<String>)>, String>,
+        >();
         std::thread::spawn(move || {
             ensure_winrt();
-            let outcome = (|| -> Result<Option<(u64, AdvPayload, i16)>, String> {
+            let outcome = (|| -> Result<Option<(u64, AdvPayload, i16, Option<String>)>, String> {
                 let watcher = BluetoothLEAdvertisementWatcher::new()
                     .map_err(|e| err("advertisement watcher", e))?;
                 watcher
@@ -106,7 +108,8 @@ impl BleCentral for WindowsBleCentral {
                 // `recv_timeout` gives us the scan deadline for free. The
                 // sender sits behind a Mutex because WinRT may invoke the
                 // handler from any thread, so it must be Sync as well as Send.
-                let (hit_tx, hit_rx) = std::sync::mpsc::channel::<(u64, AdvPayload, i16)>();
+                let (hit_tx, hit_rx) =
+                    std::sync::mpsc::channel::<(u64, AdvPayload, i16, Option<String>)>();
                 let hit_tx = std::sync::Mutex::new(hit_tx);
                 let handler = TypedEventHandler::<
                     BluetoothLEAdvertisementWatcher,
@@ -123,7 +126,15 @@ impl BleCentral for WindowsBleCentral {
                     // which rides in the service-data section. So walk the raw
                     // AD sections and let the protocol layer decide — same
                     // §5.2 filter both platforms use.
-                    for section in args.Advertisement()?.DataSections()? {
+                    let advertisement = args.Advertisement()?;
+                    // Cosmetic, for the pairing radar's row label. Absent from
+                    // most adverts — the phone spends its name budget on the
+                    // service data — and an empty HSTRING is "no name", not "".
+                    let local_name = match advertisement.LocalName() {
+                        Ok(n) if !n.is_empty() => Some(n.to_string_lossy()),
+                        _ => None,
+                    };
+                    for section in advertisement.DataSections()? {
                         if section.DataType()? != AD_TYPE_SERVICE_DATA_128 {
                             continue;
                         }
@@ -136,7 +147,7 @@ impl BleCentral for WindowsBleCentral {
                             // A closed channel means we already have our
                             // answer; dropping this advert is right then.
                             if let Ok(g) = hit_tx.lock() {
-                                let _ = g.send((addr, payload, rssi));
+                                let _ = g.send((addr, payload, rssi, local_name));
                             }
                             break;
                         }
@@ -163,10 +174,11 @@ impl BleCentral for WindowsBleCentral {
 
         Box::pin(async move {
             match done_rx.await {
-                Ok(Ok(hit)) => Ok(hit.map(|(addr, payload, rssi)| AdvCandidate {
+                Ok(Ok(hit)) => Ok(hit.map(|(addr, payload, rssi, local_name)| AdvCandidate {
                     addr: PeerAddr::from_u48(addr),
                     payload,
                     rssi: Some(rssi),
+                    local_name,
                 })),
                 Ok(Err(e)) => Err(e),
                 // The scan thread died without reporting. Treat it as "no peer
@@ -231,9 +243,60 @@ impl BleCentral for WindowsBleCentral {
                 chars.insert(u.to_u128(), c);
             }
 
+            // Hold the link open for as long as this object lives.
+            //
+            // This is the one WinRT behaviour with no BlueZ counterpart at all,
+            // and the reason the first real pairing attempt failed. Windows has
+            // no connect call and no disconnect call: it opens the ACL for a
+            // GATT operation and closes it again once it decides nothing needs
+            // it. Holding the device, its service and a subscribed
+            // characteristic does NOT count as needing it — an idle link is
+            // dropped in seconds.
+            //
+            // Every frame of the XX handshake is a write or a prompt reply, so
+            // the link survived all of it. Then the flow waits for the phone's
+            // user to compare three emoji and tap Approve, which is the first
+            // idle gap in the protocol — Windows tore the link down inside it,
+            // the phone's approval notification had nowhere to land, and the
+            // handshake died 60 s later on `timeout: peer approval` while the
+            // phone showed the laptop as "Disconnected".
+            //
+            // `MaintainConnection` is what tells the OS otherwise. It has to be
+            // a `GattSession` we keep: dropping the session drops the intent
+            // with it.
+            let session = GattSession::FromDeviceIdAsync(
+                &device
+                    .BluetoothDeviceId()
+                    .map_err(|e| err("BluetoothDeviceId", e))?,
+            )
+            .map_err(|e| err("GattSession::FromDeviceIdAsync", e))?
+            .await
+            .map_err(|e| err("GattSession::FromDeviceIdAsync await", e))?;
+            session
+                .SetMaintainConnection(true)
+                .map_err(|e| err("SetMaintainConnection", e))?;
+
+            // Say so when the link goes up or down. Without this a dropped link
+            // is invisible until some later operation times out, and a timeout
+            // cannot distinguish "the peer never answered" from "there was no
+            // longer a connection to answer over" — the exact ambiguity that
+            // made the failure above take a round trip to hardware to explain.
+            let status_handler = TypedEventHandler::<BluetoothLEDevice, IInspectable>::new(
+                move |dev, _| {
+                    let dev = dev.ok()?;
+                    tracing::info!(status = ?dev.ConnectionStatus()?, "BLE link state changed");
+                    Ok(())
+                },
+            );
+            let status_token = device
+                .ConnectionStatusChanged(&status_handler)
+                .map_err(|e| err("ConnectionStatusChanged", e))?;
+
             Ok(Box::new(WindowsGattLink {
                 addr,
                 device,
+                session,
+                status_token,
                 chars,
                 subscriptions: Mutex::new(Vec::new()),
             }) as Box<dyn GattLink>)
@@ -306,6 +369,12 @@ pub struct WindowsGattLink {
     /// property read can fail, and a link always knows who it dialled.
     addr: PeerAddr,
     device: BluetoothLEDevice,
+    /// Held, not used: this is the `MaintainConnection` intent that stops
+    /// Windows dropping an idle link out from under the protocol. See
+    /// [`BleCentral::connect`] for what happens without it.
+    session: GattSession,
+    /// So the link-state logging can be unhooked on the way down.
+    status_token: i64,
     chars: HashMap<Uuid128, GattCharacteristic>,
     subscriptions: Mutex<Vec<(GattCharacteristic, i64)>>,
 }
@@ -467,6 +536,11 @@ impl GattLink for WindowsGattLink {
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
+        // Drop the keep-alive intent explicitly. Releasing the session object
+        // would do it too, but the whole point of that field is that it is easy
+        // to lose track of by accident — so the teardown says it out loud.
+        let _ = self.session.SetMaintainConnection(false);
+        let _ = self.device.RemoveConnectionStatusChanged(self.status_token);
         Box::pin(async move {
             for (c, token) in taken {
                 let _ = c.RemoveValueChanged(token);

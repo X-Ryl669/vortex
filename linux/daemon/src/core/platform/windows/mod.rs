@@ -99,6 +99,13 @@ impl UserPaths for WindowsPaths {
                 .join("Cache"),
         )
     }
+
+    /// `%LOCALAPPDATA%\Vortex` — beside the cache, not inside it: a cache
+    /// cleaner is entitled to delete the cache, and deleting the log of the run
+    /// that just failed is the opposite of useful.
+    fn logs(&self) -> Option<PathBuf> {
+        Some(known_folder(&windows::Win32::UI::Shell::FOLDERID_LocalAppData)?.join("Vortex"))
+    }
 }
 
 /// Read `WTSINFOEXW.Data.WTSInfoExLevel1.SessionFlags` for this session.
