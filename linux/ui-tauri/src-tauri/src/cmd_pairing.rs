@@ -174,7 +174,11 @@ pub(crate) async fn forget_peer(ctx: &WorkerCtx, hex_str: String) {
         crate::ble::forget_stale_device(&ctx.adapter, addr).await;
     }
     // Drop all of the forgotten phone's cached data + blank its UI pages.
+    // Order matters: clear the in-page state (which reads the still-active
+    // paths) BEFORE dropping the peer's directory and unsetting it.
     purge_peer_cache(&ctx.app);
+    crate::peer_cache::remove_peer_dir(&arr);
+    crate::peer_cache::clear_active_peer(&arr);
     emit_peers(&ctx.app, ctx.peer_store.clone()).await;
     // Background revoke retries (best-effort). Peer may be offline now; keep
     // trying for up to 60 s so a peer that comes back inside that window still
@@ -235,11 +239,13 @@ pub(crate) async fn forget_all(ctx: &WorkerCtx) {
         }
     })
     .await;
-    // Same BlueZ cleanup as `forget_peer`, for every dropped peer.
+    // Same BlueZ + per-peer cache cleanup as `forget_peer`, for every peer.
     for peer_pub in &pubs {
         if let Some(addr) = crate::ble::take_peer_addr(peer_pub) {
             crate::ble::forget_stale_device(&ctx.adapter, addr).await;
         }
+        crate::peer_cache::remove_peer_dir(peer_pub);
+        crate::peer_cache::clear_active_peer(peer_pub);
     }
     purge_peer_cache(&ctx.app);
     emit_peers(&ctx.app, ctx.peer_store.clone()).await;
