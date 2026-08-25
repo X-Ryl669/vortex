@@ -75,6 +75,10 @@ class MainUiState(
  */
 class VortexActions(
     val onForgetPeer: (TrustedPeer) -> Unit,
+    /** Open a pairing window while trust already exists, so this phone
+     *  can be offered to a second laptop without forgetting the first. */
+    val onAddPair: () -> Unit,
+    val onCancelAddPair: () -> Unit,
     val onOpenAutostart: () -> Unit,
     val onDismissAutostartHint: () -> Unit,
     val onRequestBatteryWhitelist: () -> Unit,
@@ -204,6 +208,8 @@ fun VortexRoot(
                         pickerState = ui.picker.collectAsState().value,
                         switchState = EarbudsSwitchHolder.state.collectAsState().value,
                         onForgetPeer = actions.onForgetPeer,
+                        onAddPair = actions.onAddPair,
+                        onCancelAddPair = actions.onCancelAddPair,
                         onOpenAutostart = actions.onOpenAutostart,
                         onDismissAutostartHint = actions.onDismissAutostartHint,
                         onRequestBatteryWhitelist = actions.onRequestBatteryWhitelist,

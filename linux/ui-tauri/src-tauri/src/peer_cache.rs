@@ -21,40 +21,6 @@
 
 use std::path::PathBuf;
 
-/// The peer whose data the phone-specific caches currently refer to.
-///
-/// Interim owner of "which peer is active". The full arbiter (design doc
-/// §D4 — separating *connected* from *active*) will take this over; until
-/// then it is set from the single trusted peer at startup and refreshed
-/// whenever a BLE session completes Noise IK. That reproduces today's
-/// behaviour exactly for the single-peer case, which is every existing
-/// install, while giving the cache paths a real peer to key on.
-static ACTIVE_PEER: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
-
-/// Point the phone-specific caches at `peer_pub`.
-pub(crate) fn set_active_peer(peer_pub: &[u8; 32]) {
-    if let Ok(mut g) = ACTIVE_PEER.lock() {
-        if g.as_ref() != Some(peer_pub) {
-            tracing::debug!(peer = %hex::encode(&peer_pub[..4]), "active peer for caches");
-        }
-        *g = Some(*peer_pub);
-    }
-}
-
-/// Forget the active peer if it is `peer_pub` (no-op for any other peer, so a
-/// `ForgetPeer` for an inactive device cannot blank the active one's paths).
-pub(crate) fn clear_active_peer(peer_pub: &[u8; 32]) {
-    if let Ok(mut g) = ACTIVE_PEER.lock() {
-        if g.as_ref() == Some(peer_pub) {
-            *g = None;
-        }
-    }
-}
-
-fn active_peer() -> Option<[u8; 32]> {
-    ACTIVE_PEER.lock().ok().and_then(|g| *g)
-}
-
 /// `~/.cache/vortex` — the shared root (notes, clipboard, icons live here).
 fn cache_root() -> Option<PathBuf> {
     let mut p = PathBuf::from(std::env::var_os("HOME")?);
@@ -64,10 +30,14 @@ fn cache_root() -> Option<PathBuf> {
 
 /// Directory for the active peer's caches, created if absent.
 ///
+/// "Active" comes from [`crate::arbiter`] — the single owner of that notion,
+/// so the cache paths and the session logic can never disagree about which
+/// phone's data is on screen.
+///
 /// `None` when no peer is active — before the first pairing there is nothing
 /// to cache, and every caller already treats `None` as "skip the cache".
 pub(crate) fn peer_dir() -> Option<PathBuf> {
-    let peer = active_peer()?;
+    let peer = crate::arbiter::active()?;
     let mut p = cache_root()?;
     p.push("peers");
     p.push(hex::encode(&peer[..8]));
