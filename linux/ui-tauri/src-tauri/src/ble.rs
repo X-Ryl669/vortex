@@ -847,7 +847,20 @@ pub(crate) async fn run_ble_persistent_loop(
         // Forget's BlueZ cleanup (see PEER_BLE_ADDRS), and to point the
         // phone-specific caches at this peer.
         remember_peer_addr(&peer.peer_static_pub, client.address);
-        crate::peer_cache::set_active_peer(&peer.peer_static_pub);
+        crate::arbiter::note_connected(&peer.peer_static_pub);
+        // Ownership, separately from the link (design doc §D4). A refusal is
+        // logged rather than acted on for now: nothing sends `PeerHandoff.CLAIM`
+        // yet, so the only way to reach Busy is a second trusted phone
+        // connecting while one is active — worth seeing in the log.
+        if let crate::arbiter::Claim::Busy { current } =
+            crate::arbiter::claim(&peer.peer_static_pub)
+        {
+            tracing::warn!(
+                peer = %hex::encode(&peer.peer_static_pub[..4]),
+                active = %hex::encode(&current[..4]),
+                "second peer connected while another is active; link up but not active"
+            );
+        }
 
         let Some(transport) = outcome.transport else {
             tracing::error!("P2.13: IK outcome missing transport state — internal bug");

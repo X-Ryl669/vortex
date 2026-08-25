@@ -47,6 +47,7 @@ mod lan_state;
 mod live_activity;
 mod media_remote;
 mod mirror;
+mod arbiter;
 mod mirror_inject;
 mod peer_cache;
 mod mirror_window;

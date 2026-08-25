@@ -126,6 +126,107 @@ internal fun MainActivity.startPairingWindowLanIfUntrusted(identity: IdentityRec
     }
 }
 
+/**
+ * How long a user-opened "pair another laptop" window stays open before
+ * presence advertising is restored.
+ *
+ * Bounded on purpose: the window *preempts* the trusted-presence beacon, so
+ * an indefinitely-open one would leave this phone invisible to the laptop it
+ * is already paired with (and, worse, would read as "away" to that laptop's
+ * proximity auto-lock).
+ */
+internal const val PAIRING_WINDOW_MS = 120_000L
+
+/**
+ * Open a pairing window even though trust already exists — the phone-side
+ * counterpart of the laptop's "Add phone".
+ *
+ * Until now pairable mode was reachable only with an EMPTY peer list
+ * (`onResume`'s auto-start and `selectLaunchMode`), so a phone that had ever
+ * paired could not be offered to a second laptop without forgetting the
+ * first. That is the single-peer trap this unblocks.
+ *
+ * Why it has to preempt rather than run alongside presence: `Advertiser`
+ * holds one advertising set and `startWith` refuses while another is active,
+ * and once trust exists VortexService owns the radio, the GATT server and the
+ * LAN listener (an Activity-local LanServer would race it for port 51820).
+ * So the window stops the service, advertises pairable from the Activity, and
+ * hands the radio back when it closes.
+ */
+internal fun MainActivity.onAddPairClicked() {
+    val needed = requiredPermissions().filter {
+        ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+    }
+    if (needed.isEmpty()) {
+        startPairingWindow()
+    } else {
+        // Route the post-grant callback to the window instead of the default
+        // advertising mode, which would pick trusted-presence and silently do
+        // the opposite of what the user asked for.
+        pendingPairingWindow = true
+        permissionLauncher.launch(needed.toTypedArray())
+    }
+}
+
+internal fun MainActivity.startPairingWindow() {
+    val identity = identityState.value ?: run {
+        state.value = AdvertiseState.Error("identity not ready")
+        return
+    }
+    pairingWindowJob?.cancel()
+    state.value = AdvertiseState.Starting
+    // Release the radio, GATT server and LAN listener from the service first.
+    VortexService.stop(applicationContext)
+    pairingWindowJob = lifecycleScope.launch {
+        // The service tears down asynchronously; advertising before its
+        // BluetoothGattServer.close() lands makes our own start() fail with a
+        // busy adapter. Same reasoning as the 600 ms hand-off delay used when
+        // pairing completes, in the other direction.
+        delay(600)
+        val instanceId = ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }
+        pairingInstanceId = instanceId
+        // mDNS instance must match the BLE payload_8 (spec §5.4) so a
+        // discoverer correlates the two transports.
+        lanServer = LanServer(applicationContext, identity, peerStore).also {
+            it.start(LanServerMode.PairingWindow(instanceId))
+        }
+        if (!gattServer.start()) {
+            state.value = AdvertiseState.Error("failed to start GATT server")
+            endPairingWindow()
+            return@launch
+        }
+        advertiser.startPairableAdvertiseWith(instanceId) { result ->
+            state.value = when (result) {
+                is Advertiser.StartResult.Started -> AdvertiseState.Active(result.payload)
+                is Advertiser.StartResult.Failed -> AdvertiseState.Error(result.reason)
+            }
+        }
+        delay(PAIRING_WINDOW_MS)
+        // Still pairable → nobody paired; close up and go back to presence.
+        // A successful pair already restarted the service via BothApproved,
+        // which leaves state at TrustedPresence, so this is a no-op then.
+        if (state.value is AdvertiseState.Active || state.value is AdvertiseState.Starting) {
+            endPairingWindow()
+        }
+    }
+}
+
+/** Close the window and give the radio back to the service. */
+internal fun MainActivity.endPairingWindow() {
+    pairingWindowJob?.cancel()
+    pairingWindowJob = null
+    advertiser.stopAll()
+    gattServer.stop()
+    lanServer?.stop()
+    lanServer = null
+    if (peerStore.list().isNotEmpty()) {
+        VortexService.start(applicationContext)
+        state.value = AdvertiseState.TrustedPresence
+    } else {
+        state.value = AdvertiseState.Idle
+    }
+}
+
 internal fun MainActivity.onApproveClicked(outcome: PairingOrchestrator.HandshakeOutcome) {
     val orch = pairingOrchestrator ?: return
     val frame = orch.buildLocalApprovalFrame(

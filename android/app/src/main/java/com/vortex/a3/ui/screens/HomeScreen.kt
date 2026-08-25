@@ -87,6 +87,8 @@ fun HomeScreen(
     pickerState: PickerState,
     switchState: SwitchState,
     onForgetPeer: (TrustedPeer) -> Unit,
+    onAddPair: () -> Unit,
+    onCancelAddPair: () -> Unit,
     onOpenAutostart: () -> Unit,
     onDismissAutostartHint: () -> Unit,
     onRequestBatteryWhitelist: () -> Unit,
@@ -276,6 +278,39 @@ fun HomeScreen(
                         onOpenPicker = onOpenEarbudsPicker,
                         onRemoveSaved = onRemoveSavedEarbuds,
                     )
+                }
+
+                // "Pair another laptop". A pairable window preempts the
+                // trusted-presence beacon (one advertising set), so it is
+                // explicit and bounded rather than always-on: while it is
+                // open the already-paired laptop cannot see this phone.
+                val windowOpen =
+                    state is AdvertiseState.Active || state is AdvertiseState.Starting
+                SurfaceCard {
+                    if (windowOpen) {
+                        Text(
+                            str("discover.title"),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FW.SemiBold,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        WaitingForLinuxRow(state = state)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        TextButton(onClick = onCancelAddPair) {
+                            Text(str("peers.add_pair_cancel"))
+                        }
+                    } else {
+                        Text(
+                            str("peers.add_pair_hint"),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(onClick = onAddPair) {
+                            Text(str("peers.add_pair"))
+                        }
+                    }
                 }
             }
 

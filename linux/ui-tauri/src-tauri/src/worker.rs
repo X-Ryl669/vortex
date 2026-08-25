@@ -131,7 +131,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // has no answer until a session picks one (BLE IK sets it), and
         // guessing would show the wrong phone's messages.
         if let [only] = trusted.as_slice() {
-            crate::peer_cache::set_active_peer(&only.peer_static_pub);
+            crate::arbiter::claim(&only.peer_static_pub);
         }
 
         // BLE adapter.
