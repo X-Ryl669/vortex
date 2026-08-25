@@ -844,8 +844,10 @@ pub(crate) async fn run_ble_persistent_loop(
         consec_ik_fail = 0;
         tracing::info!("P2.13: BLE IK returned; peer_counter={}", outcome.peer_counter);
         // IK proved this address really is this peer — safe to remember for
-        // Forget's BlueZ cleanup (see PEER_BLE_ADDRS).
+        // Forget's BlueZ cleanup (see PEER_BLE_ADDRS), and to point the
+        // phone-specific caches at this peer.
         remember_peer_addr(&peer.peer_static_pub, client.address);
+        crate::peer_cache::set_active_peer(&peer.peer_static_pub);
 
         let Some(transport) = outcome.transport else {
             tracing::error!("P2.13: IK outcome missing transport state — internal bug");

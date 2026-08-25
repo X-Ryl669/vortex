@@ -48,6 +48,7 @@ mod live_activity;
 mod media_remote;
 mod mirror;
 mod mirror_inject;
+mod peer_cache;
 mod mirror_window;
 mod notes;
 mod notifications;

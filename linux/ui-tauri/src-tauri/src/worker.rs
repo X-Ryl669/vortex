@@ -122,7 +122,17 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
             }
         };
         emit_peers(&app, peer_store.clone()).await;
-        let _have_trust = !peer_store.list().unwrap_or_default().is_empty();
+        let trusted = peer_store.list().unwrap_or_default();
+        let _have_trust = !trusted.is_empty();
+        // Point the phone-specific caches at the trusted peer before any
+        // session exists, so the SMS/contacts/call-log pages render from cache
+        // at startup exactly as they did when those files were global. Only
+        // when there is exactly one peer: with several, "which phone's data"
+        // has no answer until a session picks one (BLE IK sets it), and
+        // guessing would show the wrong phone's messages.
+        if let [only] = trusted.as_slice() {
+            crate::peer_cache::set_active_peer(&only.peer_static_pub);
+        }
 
         // BLE adapter.
         let session = match bluer::Session::new().await {
