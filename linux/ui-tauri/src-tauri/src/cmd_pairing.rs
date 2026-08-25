@@ -126,6 +126,152 @@ pub(crate) async fn pair(
     }
 }
 
+/// How long a switch window stays open (design doc §D9). Long enough to walk
+/// to another machine and wake it, short enough that an unattended press stops
+/// scanning-on-top-of-a-live-link — the most expensive radio state we have.
+const SWITCH_WINDOW_SECS: u64 = 45;
+
+/// One candidate device offered by a switch scan.
+#[derive(serde::Serialize, Clone)]
+struct SwitchCandidateDto {
+    peer_static_pub: String,
+    name: Option<String>,
+    rssi: i16,
+}
+
+/// `UiCmd::SwitchPeer` — keep the current peer, look for another trusted one.
+///
+/// Explicitly NOT a release: the active link is held for the whole scan, so
+/// the persistent reconnect loop has nothing to race back into and the laptop
+/// cannot end up connected to nothing. Ownership only moves in
+/// [`activate_peer`], once a replacement is actually in hand (§D3).
+///
+/// Returns immediately and does the scan on a spawned task. The worker's
+/// command loop is strictly sequential — awaiting a 45 s scan here would stall
+/// every other command behind it, including the 5 s earbuds heartbeat. Same
+/// reason `UiCmd::Scan` spawns rather than awaiting.
+pub(crate) fn switch_peer(ctx: &WorkerCtx) {
+    // A second press while a window is open is a no-op rather than a second
+    // scan: two concurrent discoveries would fight over the adapter.
+    if crate::arbiter::is_switching() {
+        tracing::debug!("switch already in progress; ignoring");
+        return;
+    }
+    let active = crate::arbiter::active();
+    crate::arbiter::begin_switch(Duration::from_secs(SWITCH_WINDOW_SECS));
+
+    let app = ctx.app.clone();
+    let adapter = ctx.adapter.clone();
+    let peer_store = ctx.peer_store.clone();
+    tokio::spawn(async move {
+        let _ = app.emit("vortex:switch_scanning", true);
+        let candidates = crate::ble::scan_other_trusted_peers(
+            &adapter,
+            &peer_store,
+            active,
+            Duration::from_secs(SWITCH_WINDOW_SECS),
+        )
+        .await;
+        let _ = app.emit("vortex:switch_scanning", false);
+
+        // Cancelled while we were scanning — drop the result rather than
+        // acting on a switch the user already backed out of.
+        if !crate::arbiter::is_switching() {
+            tracing::info!("switch window closed during scan; discarding candidates");
+            return;
+        }
+
+        let dtos: Vec<SwitchCandidateDto> = candidates
+            .iter()
+            .map(|c| SwitchCandidateDto {
+                peer_static_pub: hex::encode(c.peer_static_pub),
+                name: c.name.clone(),
+                rssi: c.rssi,
+            })
+            .collect();
+        tracing::info!(count = dtos.len(), "switch scan finished");
+
+        match candidates.as_slice() {
+            // Nothing else in range: report it and close, leaving the current
+            // peer untouched. The UI shows "no other device found".
+            [] => {
+                crate::arbiter::end_switch();
+                let _ = app.emit("vortex:switch_candidates", dtos);
+            }
+            // Exactly one — no point asking which.
+            [only] => {
+                do_activate(&app, &peer_store, only.peer_static_pub).await;
+            }
+            // Several: let the user pick (§D8).
+            _ => {
+                let _ = app.emit("vortex:switch_candidates", dtos);
+            }
+        }
+    });
+}
+
+/// `UiCmd::CancelSwitch` — close the window, change nothing.
+pub(crate) async fn cancel_switch(ctx: &WorkerCtx) {
+    crate::arbiter::end_switch();
+    let _ = ctx.app.emit("vortex:switch_scanning", false);
+    let _ = ctx
+        .app
+        .emit::<Vec<SwitchCandidateDto>>("vortex:switch_candidates", Vec::new());
+}
+
+/// `UiCmd::ActivatePeer` — hand session ownership to this trusted peer.
+pub(crate) async fn activate_peer(ctx: &WorkerCtx, hex_str: String) {
+    let Ok(bytes) = hex::decode(&hex_str) else { return };
+    if bytes.len() != 32 {
+        return;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    do_activate(&ctx.app, &ctx.peer_store, arr).await;
+}
+
+/// Shared body of "adopt this peer as the active one", callable both from the
+/// command handler and from the spawned switch scan.
+///
+/// The ownership flip is atomic (§D4): the displaced peer stops being active
+/// the instant this runs, even though its transport link may take a while to
+/// drop. Without that ordering two phones would briefly both own the session
+/// and both mirror notifications and clipboard into this laptop.
+async fn do_activate(
+    app: &tauri::AppHandle,
+    peer_store: &std::sync::Arc<dyn vortex_l3_daemon::core::storage::peers::PeerStore>,
+    peer_pub: [u8; 32],
+) {
+    // Refuse to activate a peer we do not actually trust — for the command
+    // path the hex arrives from the webview, so it is untrusted input.
+    let ps = peer_store.clone();
+    let known = tokio::task::spawn_blocking(move || ps.load(&peer_pub).is_ok())
+        .await
+        .unwrap_or(false);
+    if !known {
+        tracing::warn!(peer = %hex::encode(&peer_pub[..4]), "activate: not a trusted peer");
+        return;
+    }
+
+    let displaced = crate::arbiter::force_activate(&peer_pub);
+    crate::arbiter::end_switch();
+    if let Some(prev) = displaced {
+        // TODO(multi-peer): send PeerHandoff.RELEASE to `prev` so it stops
+        // presenting itself as connected. Until the frame is wired, the
+        // displaced phone learns of it on its next contact.
+        tracing::info!(
+            displaced = %hex::encode(&prev[..4]),
+            "displaced peer still needs a PeerHandoff.RELEASE"
+        );
+    }
+    let _ = app.emit("vortex:switch_scanning", false);
+    let _ = app.emit::<Vec<SwitchCandidateDto>>("vortex:switch_candidates", Vec::new());
+    // Blank the pages that were showing the old phone's data, then re-emit
+    // peers so the UI's `active` flags follow the new owner.
+    purge_peer_cache(app);
+    emit_peers(app, peer_store.clone()).await;
+}
+
 /// `UiCmd::ForgetPeer` — forget locally now (instant UI), then best-effort
 /// background revoke retries for up to 60 s so trust drops bidirectionally.
 pub(crate) async fn forget_peer(ctx: &WorkerCtx, hex_str: String) {
