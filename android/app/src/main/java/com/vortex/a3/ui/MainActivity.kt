@@ -265,12 +265,10 @@ class MainActivity : ComponentActivity() {
         }
         intent.getStringExtra("remove_bond")?.let { mac ->
             val adapter = getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
-            val ok = adapter?.let {
-                com.vortex.a3.core.ble.BondCleaner.removeBond(it, mac)
-            } ?: false
-            android.widget.Toast.makeText(
-                this, "removeBond($mac) = $ok", android.widget.Toast.LENGTH_LONG
-            ).show()
+            // Result is not shown on screen: BondCleaner already logs it
+            // ("VortexBondCleaner: removeBond(<mac>) -> <ok>"), and a toast on
+            // top of the pairing UI got in the way while live-debugging bonds.
+            adapter?.let { com.vortex.a3.core.ble.BondCleaner.removeBond(it, mac) }
         }
     }
 
