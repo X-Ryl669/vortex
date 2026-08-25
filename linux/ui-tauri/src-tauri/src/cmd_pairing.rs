@@ -162,6 +162,17 @@ pub(crate) async fn forget_peer(ctx: &WorkerCtx, hex_str: String) {
         }
         Err(e) => tracing::warn!("peer_store.forget JOIN ERROR: {}", e),
     }
+    // Drop the peer's BlueZ device object too. Vortex creates no BT bond on
+    // Linux (see the 2026-06-02 note in `pairing.rs`), so this is normally not
+    // a *bond* removal — it evicts the cached device entry whose stale RPA
+    // otherwise gets re-served from the adapter's advertisement cache and
+    // burns connect timeouts on the next pairing. If a bond *does* exist
+    // (added by hand in the desktop's Bluetooth panel, or by an older build),
+    // this drops it, which is what keeps the two sides from ending up in the
+    // one-sided-bond state that fails with `timeout: service discovery`.
+    if let Some(addr) = crate::ble::take_peer_addr(&arr) {
+        crate::ble::forget_stale_device(&ctx.adapter, addr).await;
+    }
     // Drop all of the forgotten phone's cached data + blank its UI pages.
     purge_peer_cache(&ctx.app);
     emit_peers(&ctx.app, ctx.peer_store.clone()).await;
@@ -197,6 +208,18 @@ pub(crate) async fn forget_peer(ctx: &WorkerCtx, hex_str: String) {
 
 /// `UiCmd::ForgetAll` — drop every trusted peer (local only).
 pub(crate) async fn forget_all(ctx: &WorkerCtx) {
+    // Collect the pubkeys before forgetting so the BlueZ cleanup below still
+    // knows which peers existed (the store is empty by then).
+    let ps = ctx.peer_store.clone();
+    let pubs = tokio::task::spawn_blocking(move || {
+        ps.list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.peer_static_pub)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
     let ps = ctx.peer_store.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Ok(list) = ps.list() {
@@ -212,6 +235,12 @@ pub(crate) async fn forget_all(ctx: &WorkerCtx) {
         }
     })
     .await;
+    // Same BlueZ cleanup as `forget_peer`, for every dropped peer.
+    for peer_pub in &pubs {
+        if let Some(addr) = crate::ble::take_peer_addr(peer_pub) {
+            crate::ble::forget_stale_device(&ctx.adapter, addr).await;
+        }
+    }
     purge_peer_cache(&ctx.app);
     emit_peers(&ctx.app, ctx.peer_store.clone()).await;
 }

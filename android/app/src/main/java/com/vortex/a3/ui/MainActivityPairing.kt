@@ -71,6 +71,11 @@ internal fun MainActivity.wirePairingOrchestrator(identity: IdentityRecord) {
                             peerName = outcome.peerName,
                         )
                     )
+                    // Remember the laptop's BD_ADDR so Forget can clear any BT
+                    // bond for it later (see PeerStore.loadPeerBtAddr). The
+                    // central's address here is the laptop's public static
+                    // address, so it stays valid for the life of the pairing.
+                    peerStore.savePeerBtAddr(outcome.peerStaticPub, outcome.device.address)
                     refreshPeerList()
                     state.value = AdvertiseState.TrustedPresence
                     // Hand off to the background service: stop our
@@ -180,6 +185,20 @@ internal fun MainActivity.onForgetPeerClicked(peer: TrustedPeer) {
         // be offline forever.
         kotlinx.coroutines.delay(1_500)
         VortexService.pendingRevokes.remove(hex)
+        // Drop any BT bond for this laptop BEFORE forgetting, while its
+        // address is still on file. Vortex never creates these bonds (Linux
+        // deliberately skips Device::pair()), but one added via the desktop's
+        // Bluetooth panel or left by an older build survives the peer-store
+        // wipe — and a bond the laptop no longer holds makes the next pairing
+        // fail during encryption with `timeout: service discovery`, which is
+        // the "retry several times until it works" symptom. Android also
+        // hides profile-less LE bonds from Settings, so this is the only way
+        // for the user to clear one.
+        peerStore.loadPeerBtAddr(peer.peerStaticPub)?.let { mac ->
+            val btAdapter =
+                getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
+            btAdapter?.let { com.vortex.a3.core.ble.BondCleaner.removeBond(it, mac) }
+        }
         peerStore.forget(peer.peerStaticPub)
         refreshPeerList()
         if (peerStore.list().isEmpty()) {
@@ -193,7 +212,12 @@ internal fun MainActivity.onForgetAllClicked() {
     // Legacy entrypoint — kept around for any future Settings page
     // 'Danger zone' but no longer wired into the home screen.
     VortexService.stop(applicationContext)
+    val btAdapter = getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
     for (peer in peerStore.list()) {
+        // Same bond cleanup as the single-peer path — see onForgetPeerClicked.
+        peerStore.loadPeerBtAddr(peer.peerStaticPub)?.let { mac ->
+            btAdapter?.let { com.vortex.a3.core.ble.BondCleaner.removeBond(it, mac) }
+        }
         peerStore.forget(peer.peerStaticPub)
     }
     refreshPeerList()
