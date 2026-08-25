@@ -563,6 +563,11 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 UiCmd::Pair(addr_str) => cmd_pairing::pair(&ctx, addr_str, &mut active_scan).await,
                 UiCmd::ForgetPeer(hex_str) => cmd_pairing::forget_peer(&ctx, hex_str).await,
                 UiCmd::ForgetAll => cmd_pairing::forget_all(&ctx).await,
+                UiCmd::SwitchPeer => cmd_pairing::switch_peer(&ctx),
+                UiCmd::CancelSwitch => cmd_pairing::cancel_switch(&ctx).await,
+                UiCmd::ActivatePeer(hex_str) => {
+                    cmd_pairing::activate_peer(&ctx, hex_str).await
+                }
                 UiCmd::RefreshState => cmd_earbuds::refresh_state(&ctx).await,
                 UiCmd::RefreshLocalEarbuds => cmd_earbuds::refresh_local_earbuds(&ctx).await,
                 UiCmd::RequestEarbudsSwitch { peer_static_pub, mac } => {

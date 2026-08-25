@@ -151,6 +151,122 @@ pub(crate) fn expected_presence_tokens(
         .collect()
 }
 
+/// A trusted peer seen on air during a switch scan.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerCandidate {
+    pub peer_static_pub: [u8; 32],
+    pub name: Option<String>,
+    pub rssi: i16,
+}
+
+/// Scan for trusted-presence beacons from trusted peers OTHER than `exclude`.
+///
+/// [`expected_presence_tokens`] flattens every peer's tokens into one set,
+/// which answers "is any trusted peer nearby" — enough for reconnect, but not
+/// for a switch, which has to know *which* peer it found so it can leave the
+/// active one out. So this builds the token→peer map instead.
+///
+/// Excluding the active peer is what makes "Switch" coherent: the user pressed
+/// it precisely because they do not want the device they are already on
+/// (design doc §D3).
+pub(crate) async fn scan_other_trusted_peers(
+    adapter: &bluer::Adapter,
+    peer_store: &Arc<dyn PeerStore>,
+    exclude: Option<[u8; 32]>,
+    wait: Duration,
+) -> Vec<PeerCandidate> {
+    use std::collections::HashMap;
+    use vortex_l3_daemon::core::crypto::presence::{current_bucket, derive_presence_token};
+
+    let peers = {
+        let store = peer_store.clone();
+        tokio::task::spawn_blocking(move || store.list().unwrap_or_default())
+            .await
+            .unwrap_or_default()
+    };
+    let others: Vec<_> = peers
+        .into_iter()
+        .filter(|p| exclude.as_ref() != Some(&p.peer_static_pub))
+        .collect();
+    if others.is_empty() {
+        return Vec::new();
+    }
+
+    // token -> peer, over the same ±2 bucket window the reconnect path
+    // tolerates (clock skew / a Doze-deferred rotation).
+    let now_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bucket_now = current_bucket(now_sec, PRESENCE_ROTATION_SEC);
+    let mut by_token: HashMap<[u8; 8], ([u8; 32], Option<String>)> = HashMap::new();
+    for p in &others {
+        for d in [-2i64, -1, 0, 1, 2] {
+            let tok = derive_presence_token(&p.prs, (bucket_now as i64 + d) as u64);
+            by_token.insert(tok, (p.peer_static_pub, p.peer_name.clone()));
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PeerCandidate>(16);
+    let scan = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            let _ = run_filtered_scan(adapter, move |c| {
+                if !c.payload.flags.is_trusted_presence() {
+                    return;
+                }
+                let Some((peer_pub, stored_name)) = by_token.get(&c.payload.payload_8) else {
+                    return;
+                };
+                let _ = tx.try_send(PeerCandidate {
+                    peer_static_pub: *peer_pub,
+                    // Prefer the live SCAN_RSP name, fall back to the name
+                    // recorded at pairing.
+                    name: c.local_name.clone().or_else(|| stored_name.clone()),
+                    rssi: c.rssi.unwrap_or(0),
+                });
+            })
+            .await;
+        })
+    };
+
+    // Collect for the whole window rather than stopping at the first hit: the
+    // point is to know whether there is ONE candidate (auto-connect) or
+    // several (ask the user), so an early return would make the picker
+    // depend on which phone happened to advertise first.
+    let mut found: HashMap<[u8; 32], PeerCandidate> = HashMap::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(cand)) => {
+                // Keep the strongest sighting per peer — RSSI wobbles a lot
+                // between advertising events.
+                found
+                    .entry(cand.peer_static_pub)
+                    .and_modify(|e| {
+                        if cand.rssi > e.rssi {
+                            *e = cand.clone();
+                        }
+                    })
+                    .or_insert(cand);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // Same abort+join discipline as find_trusted_presence_peer: bluer only
+    // issues StopDiscovery when the scan future is actually dropped, so
+    // without the join the next scan races a still-live discovery session.
+    scan.abort();
+    let _ = scan.await;
+    let mut out: Vec<_> = found.into_values().collect();
+    out.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+    out
+}
+
 pub(crate) async fn find_trusted_presence_peer(
     adapter: &bluer::Adapter,
     peer_store: &Arc<dyn PeerStore>,
