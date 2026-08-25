@@ -56,6 +56,40 @@ pub(crate) fn touch_peer_contact() {
     LAST_PEER_CONTACT_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Last BLE address we completed a Noise IK exchange with, per peer.
+///
+/// Recorded only *after* IK succeeds, so the address is positively tied to
+/// that `peer_static_pub` — before IK we merely believe an RPA belongs to the
+/// peer whose presence token matched, and acting on a belief would let us
+/// remove a stranger's BlueZ device object.
+///
+/// Used by `Forget` to clean up the peer's BlueZ device object (see
+/// [`forget_stale_device`]). Vortex deliberately creates no BT bond on Linux
+/// (see the 2026-06-02 note in `pairing.rs`), so there is usually no *bond*
+/// to drop here — but a cached device object with a stale RPA does linger, and
+/// leaving it behind is what feeds the RPA-churn connect wedge on the next
+/// pairing. Entries are dropped on forget; the map holds one small entry per
+/// trusted peer, so it needs no eviction.
+static PEER_BLE_ADDRS: std::sync::Mutex<
+    Option<std::collections::HashMap<[u8; 32], bluer::Address>>,
+> = std::sync::Mutex::new(None);
+
+/// Tie `addr` to `peer_pub` after a successful IK.
+pub(crate) fn remember_peer_addr(peer_pub: &[u8; 32], addr: bluer::Address) {
+    if let Ok(mut g) = PEER_BLE_ADDRS.lock() {
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(*peer_pub, addr);
+    }
+}
+
+/// Remove and return the address last tied to `peer_pub`, if any.
+pub(crate) fn take_peer_addr(peer_pub: &[u8; 32]) -> Option<bluer::Address> {
+    PEER_BLE_ADDRS
+        .lock()
+        .ok()
+        .and_then(|mut g| g.as_mut().and_then(|m| m.remove(peer_pub)))
+}
+
 /// Ms since we last heard from the phone over any transport (huge if never).
 pub(crate) fn peer_contact_age_ms() -> u64 {
     let last = LAST_PEER_CONTACT_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -571,7 +605,7 @@ async fn power_cycle_adapter(adapter: &bluer::Adapter) {
 /// (live-observed: 67s walk-up reconnect, the user typed their password
 /// long before the eager unlock could fire). RPA entries are transient by
 /// nature — removing one can't lose anything durable.
-async fn forget_stale_device(adapter: &bluer::Adapter, addr: bluer::Address) {
+pub(crate) async fn forget_stale_device(adapter: &bluer::Adapter, addr: bluer::Address) {
     match tokio::time::timeout(Duration::from_secs(3), adapter.remove_device(addr)).await {
         Ok(Ok(())) => tracing::debug!(addr = %addr, "stale RPA entry removed from BlueZ"),
         Ok(Err(e)) => tracing::debug!(addr = %addr, "remove_device: {e} (ignored)"),
@@ -809,6 +843,9 @@ pub(crate) async fn run_ble_persistent_loop(
         };
         consec_ik_fail = 0;
         tracing::info!("P2.13: BLE IK returned; peer_counter={}", outcome.peer_counter);
+        // IK proved this address really is this peer — safe to remember for
+        // Forget's BlueZ cleanup (see PEER_BLE_ADDRS).
+        remember_peer_addr(&peer.peer_static_pub, client.address);
 
         let Some(transport) = outcome.transport else {
             tracing::error!("P2.13: IK outcome missing transport state — internal bug");
