@@ -33,9 +33,7 @@ pub(crate) static LAST_GOOD_PEER_IP: std::sync::Mutex<Option<std::net::IpAddr>> 
     std::sync::Mutex::new(None);
 
 fn last_peer_ip_path() -> Option<std::path::PathBuf> {
-    let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/last_peer_ip");
-    Some(p)
+    crate::peer_cache::peer_file("last_peer_ip")
 }
 
 /// Is a phone→laptop file pull waiting on the next heartbeat round? The pull is
