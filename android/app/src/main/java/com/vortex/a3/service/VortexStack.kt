@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.vortex.a3.core.ble.Advertiser
+import com.vortex.a3.core.ble.FrameSub
 import com.vortex.a3.core.ble.GattServer
 import android.bluetooth.BluetoothManager
 import com.vortex.a3.core.identity.IdentityRecord
@@ -704,6 +705,29 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 android.os.SystemClock.elapsedRealtime() - srv.lastDisconnectAtMs <
                 FAST_ADV_WINDOW_MS
         }
+        // The laptop handed ownership to another phone (design doc §D4). Stop
+        // presenting ourselves as its active peer and go back on air so a
+        // laptop that DOES want us can find us — otherwise we would sit
+        // silently attached to a laptop that has moved on, invisible to
+        // everything else until the link happened to drop.
+        server.onPeerHandoffReceived = { peerPub, kind, successorName ->
+            if (kind == FrameSub.HANDOFF_RELEASE) {
+                val who = if (successorName.isBlank()) "another phone" else successorName
+                Log.i(TAG, "peer released us (now with $who) — resuming presence")
+                if (activePeerPub?.contentEquals(peerPub) == true) activePeerPub = null
+                // A seek in flight is moot: the laptop already chose someone.
+                stopSeeking()
+                // Presence resumes on the next phase evaluation; kick it so we
+                // are discoverable now rather than up to ACTIVE_RECHECK_MS later.
+                advertiser?.kickRotation()
+            } else {
+                // BUSY / CLAIM are defined in the contract but nothing sends
+                // them yet; log so an unexpected one is visible rather than
+                // silently dropped.
+                Log.i(TAG, "PEER_HANDOFF kind=0x${"%02x".format(kind)} — no handler")
+            }
+        }
+
         // Advertising is suspended while a session is live — the session IS the
         // presence proof, and beaconing on top of it is the single largest
         // avoidable battery cost here (design doc §D5).
