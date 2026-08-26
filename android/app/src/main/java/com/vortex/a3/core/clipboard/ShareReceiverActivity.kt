@@ -77,18 +77,39 @@ class ShareReceiverActivity : Activity() {
         }
 
         var sent = 0
+        var tooLarge = 0
+        var largestRejected = 0L
         for (uri in uris) {
-            val file = ClipboardFileReader.read(this, uri)
-            if (file != null) {
-                VortexService.clipboardFileBus.tryEmit(file)
-                Log.i(TAG, "share: forwarded file '${file.name}' (${file.bytes.size} bytes)")
-                sent++
-            } else {
-                Log.w(TAG, "share: couldn't read $uri")
+            when (val outcome = ClipboardFileReader.read(this, uri)) {
+                is ClipboardFileReader.Outcome.Ok -> {
+                    val file = outcome.file
+                    VortexService.clipboardFileBus.tryEmit(file)
+                    Log.i(TAG, "share: forwarded file '${file.name}' (${file.bytes.size} bytes)")
+                    sent++
+                }
+                is ClipboardFileReader.Outcome.TooLarge -> {
+                    tooLarge++
+                    largestRejected = maxOf(largestRejected, outcome.bytes)
+                    Log.w(TAG, "share: $uri over the size cap (${outcome.bytes} bytes)")
+                }
+                is ClipboardFileReader.Outcome.Unreadable -> {
+                    Log.w(TAG, "share: couldn't read $uri (${outcome.why})")
+                }
             }
         }
+        // Name the actual reason. "Couldn't read the shared file" for a file the
+        // user can see perfectly well is what made an over-cap share look like a
+        // bug rather than a limit — and before the size pre-check, a big one
+        // took the whole app down without saying anything at all.
         val msg = when {
+            sent == 0 && tooLarge > 0 -> {
+                val cap = ClipboardFileReader.MAX_FILE_BYTES / (1024 * 1024)
+                val mb = largestRejected / (1024 * 1024)
+                if (tooLarge == 1) "File is too big to send ($mb MB; limit $cap MB)"
+                else "$tooLarge files are too big to send (limit $cap MB)"
+            }
             sent == 0 -> "Couldn't read the shared file(s)"
+            tooLarge > 0 -> "Sending $sent; $tooLarge too big to send"
             sent == 1 -> "Sending file to laptop…"
             else -> "Sending $sent files to laptop…"
         }
