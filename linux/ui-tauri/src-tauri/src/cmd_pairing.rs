@@ -242,6 +242,12 @@ async fn do_activate(
     peer_store: &std::sync::Arc<dyn vortex_l3_daemon::core::storage::peers::PeerStore>,
     peer_pub: [u8; 32],
 ) {
+    let successor_name = {
+        let ps = peer_store.clone();
+        tokio::task::spawn_blocking(move || ps.load(&peer_pub).ok().and_then(|p| p.peer_name))
+            .await
+            .unwrap_or(None)
+    };
     // Refuse to activate a peer we do not actually trust — for the command
     // path the hex arrives from the webview, so it is untrusted input.
     let ps = peer_store.clone();
@@ -256,13 +262,7 @@ async fn do_activate(
     let displaced = crate::arbiter::force_activate(&peer_pub);
     crate::arbiter::end_switch();
     if let Some(prev) = displaced {
-        // TODO(multi-peer): send PeerHandoff.RELEASE to `prev` so it stops
-        // presenting itself as connected. Until the frame is wired, the
-        // displaced phone learns of it on its next contact.
-        tracing::info!(
-            displaced = %hex::encode(&prev[..4]),
-            "displaced peer still needs a PeerHandoff.RELEASE"
-        );
+        send_release(&prev, successor_name).await;
     }
     let _ = app.emit("vortex:switch_scanning", false);
     let _ = app.emit::<Vec<SwitchCandidateDto>>("vortex:switch_candidates", Vec::new());
@@ -270,6 +270,47 @@ async fn do_activate(
     // peers so the UI's `active` flags follow the new owner.
     purge_peer_cache(app);
     emit_peers(app, peer_store.clone()).await;
+}
+
+
+/// Tell `peer_pub` it is no longer the active peer.
+///
+/// Best-effort by nature: it can only be delivered while a link to that peer is
+/// still up. That is the normal case here — a switch is confirmed while the
+/// displaced peer is still the live BLE session (see `BLE_SEALED_WRITER`) — but
+/// if the link already dropped, the peer simply learns on next contact, which is
+/// the behaviour we had before this frame existed. So a failure is logged at
+/// debug, not surfaced: nothing is broken by it.
+async fn send_release(peer_pub: &[u8; 32], successor_name: Option<String>) {
+    use vortex_l3_daemon::core::ble::frame::{sub, ty};
+    let Some(holder) = crate::BLE_SEALED_WRITER.get() else {
+        tracing::debug!("RELEASE not sent: no BLE session holder yet");
+        return;
+    };
+    let writer = { holder.lock().await.clone() };
+    let Some(writer) = writer else {
+        tracing::debug!(
+            peer = %hex::encode(&peer_pub[..4]),
+            "RELEASE not sent: no live BLE session"
+        );
+        return;
+    };
+    // Payload is the successor's display name, purely so the phone can say
+    // "moved to <name>". Empty when unknown — the sub code is what carries
+    // meaning, so an absent name must not change behaviour.
+    let payload = successor_name.unwrap_or_default().into_bytes();
+    // The sealed writer takes only a frame type, so the kind rides as the first
+    // payload byte rather than Frame.sub. Receivers read it back the same way.
+    let mut body = Vec::with_capacity(payload.len() + 1);
+    body.push(sub::HANDOFF_RELEASE);
+    body.extend_from_slice(&payload);
+    match writer(ty::PEER_HANDOFF, body).await {
+        Ok(()) => tracing::info!(
+            peer = %hex::encode(&peer_pub[..4]),
+            "sent PeerHandoff.RELEASE to the displaced peer"
+        ),
+        Err(e) => tracing::debug!("RELEASE send failed: {e}"),
+    }
 }
 
 /// `UiCmd::ForgetPeer` — forget locally now (instant UI), then best-effort
