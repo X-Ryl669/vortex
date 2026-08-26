@@ -227,6 +227,31 @@ internal fun MainActivity.endPairingWindow() {
     }
 }
 
+/**
+ * "Switch laptop": look for another remembered laptop while staying connected
+ * to the current one.
+ *
+ * Seek before release (design doc §D3) — nothing is dropped here. The service
+ * holds the current link for the whole window and only the arrival of a
+ * different laptop ends it, so a cancelled or fruitless seek leaves the phone
+ * exactly where it was. Pressing again while a window is open closes it, which
+ * doubles as Cancel without spending card space on a second control.
+ */
+internal fun MainActivity.onSwitchLaptopClicked() {
+    if (VortexService.isSeeking()) {
+        VortexService.stopSeeking()
+        seekingLaptop.value = false
+        return
+    }
+    val started = VortexService.startSeeking()
+    seekingLaptop.value = started
+    if (!started) {
+        // Refused: no stack running, or fewer than two remembered laptops. The
+        // card only offers the action with 2+, so this is the service-down case.
+        android.util.Log.i("VortexSwitch", "seek not started (service down?)")
+    }
+}
+
 internal fun MainActivity.onApproveClicked(outcome: PairingOrchestrator.HandshakeOutcome) {
     val orch = pairingOrchestrator ?: return
     val frame = orch.buildLocalApprovalFrame(
