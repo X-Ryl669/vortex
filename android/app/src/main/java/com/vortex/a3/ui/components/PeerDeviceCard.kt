@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Cast
+import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material3.Icon
@@ -62,6 +63,11 @@ fun PeerDeviceCard(
     /** Tap to view the laptop's screen on this phone (laptop→phone mirror).
      *  Null hides the action (e.g. the peer isn't a laptop / not reachable). */
     onViewScreen: (() -> Unit)? = null,
+    /** Tap to look for another remembered laptop while staying on this one.
+     *  Null hides the action (fewer than two laptops remembered). */
+    onSwitch: (() -> Unit)? = null,
+    /** True while a seek window is open — shows the action as busy. */
+    seeking: Boolean = false,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -127,6 +133,26 @@ fun PeerDeviceCard(
                             .background(Color(0xFFF0B43C)),
                     )
                 }
+                Spacer(modifier = Modifier.size(8.dp))
+            }
+            if (onSwitch != null) {
+                // Switch to another remembered laptop. Tinted while seeking so
+                // the state is visible without stealing card space for a label
+                // — the window closes itself, so there is nothing to undo.
+                Icon(
+                    imageVector = Icons.Outlined.PhoneAndroid,
+                    contentDescription = "Switch to another laptop",
+                    tint = if (seeking) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(onClick = onSwitch)
+                        .padding(4.dp)
+                        .size(20.dp),
+                )
                 Spacer(modifier = Modifier.size(8.dp))
             }
             if (locked != null && onToggleLock != null) {

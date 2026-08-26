@@ -177,6 +177,12 @@ class MainActivity : ComponentActivity() {
      *  back on. */
     internal val bluetoothOff = MutableStateFlow(false)
 
+    /** True while a "switch laptop" seek window is open. Mirrored from the
+     *  service (which owns the window and its expiry) by the same 3 s
+     *  ticker that refreshes staleness, so a window that times out on its
+     *  own stops showing as busy without needing a callback. */
+    internal val seekingLaptop = MutableStateFlow(false)
+
     /** True while [btStateReceiver] is registered, so onPause unregisters
      *  exactly once (double-unregister throws). */
     private var btReceiverRegistered = false
@@ -359,6 +365,10 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             while (isActive) {
                 nowTickState.value = System.currentTimeMillis()
+                // The service owns the seek window and its 45 s expiry, so mirror
+                // it rather than tracking a second copy here — otherwise a window
+                // that times out on its own would keep showing as busy.
+                seekingLaptop.value = VortexService.isSeeking()
                 delay(3_000)
             }
         }
@@ -430,6 +440,7 @@ class MainActivity : ComponentActivity() {
         showNotifAccessDialog = showNotifAccessDialog,
         showAutostartDialog = showAutostartDialog,
         bluetoothOff = bluetoothOff,
+        seekingLaptop = seekingLaptop,
     )
 
     /** Bundle the activity's callbacks for the root composable. */
@@ -437,6 +448,7 @@ class MainActivity : ComponentActivity() {
         onForgetPeer = ::onForgetPeerClicked,
         onAddPair = ::onAddPairClicked,
         onCancelAddPair = ::endPairingWindow,
+        onSwitchLaptop = ::onSwitchLaptopClicked,
         onOpenAutostart = ::onOpenAutostartSettings,
         onDismissAutostartHint = ::dismissAutostartHint,
         onRequestBatteryWhitelist = ::onRequestBatteryWhitelist,
