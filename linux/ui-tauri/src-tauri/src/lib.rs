@@ -50,6 +50,7 @@ mod mirror;
 mod arbiter;
 mod mirror_inject;
 mod peer_cache;
+mod peer_handoff;
 mod mirror_window;
 mod notes;
 mod notifications;

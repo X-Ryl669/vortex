@@ -21,7 +21,7 @@ use crate::worker_ctx::WorkerCtx;
 ///
 /// Clipboard history is deliberately NOT wiped: it's a laptop-local feature
 /// (the Super+V popup), not the peer's data, so it outlives the link.
-fn purge_peer_cache(app: &tauri::AppHandle) {
+pub(crate) fn purge_peer_cache(app: &tauri::AppHandle) {
     crate::contacts::clear(app);
     crate::call_log::clear(app);
     crate::sms::clear(app);

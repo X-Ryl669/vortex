@@ -544,6 +544,30 @@ class GattServer(
     fun sendNotesSyncEncrypted(peerStaticPub: ByteArray, chunkPayload: ByteArray): Boolean =
         sealAndNotify(peerStaticPub, FrameType.NOTES_SYNC, chunkPayload, "sendNotesSync")
 
+    /**
+     * Session-ownership handoff (PEER_HANDOFF 0x4F) — tell [peerStaticPub] it is
+     * no longer our active peer, so its UI stops claiming a live link instead of
+     * finding out on next contact (design doc §D4).
+     *
+     * [kind] is a [FrameSub] HANDOFF_* code, carried as the FIRST PAYLOAD BYTE
+     * rather than in Frame.sub: the laptop's generic sealed-frame writer only
+     * takes a frame type, so both sides agreed on this placement.
+     * [successorName] is advisory, for the receiver's UI ("moved to <name>").
+     */
+    fun sendPeerHandoffEncrypted(
+        peerStaticPub: ByteArray,
+        kind: Byte,
+        successorName: String = "",
+    ): Boolean {
+        val name = successorName.toByteArray(Charsets.UTF_8)
+        val body = ByteArray(name.size + 1)
+        body[0] = kind
+        name.copyInto(body, 1)
+        return sealAndNotify(
+            peerStaticPub, FrameType.PEER_HANDOFF, body, "sendPeerHandoff", logSuccess = true,
+        )
+    }
+
     /** Clipboard sync (CLIPBOARD 0x40) → peer's system clipboard. */
     fun sendClipboardEncrypted(peerStaticPub: ByteArray, clipJson: ByteArray): Boolean =
         sealAndNotify(peerStaticPub, FrameType.CLIPBOARD, clipJson, "sendClipboardEncrypted", logSuccess = true)

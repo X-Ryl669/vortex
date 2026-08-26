@@ -671,6 +671,21 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 (previousPeer == null || !previousPeer.contentEquals(peerPub))
             ) {
                 Log.i(TAG, "seek satisfied — another laptop connected")
+                // Tell the laptop we just left, while its link is still up.
+                // Ordering matters: this runs BEFORE stopSeeking() teardown so
+                // the old session is still registered and can carry the frame.
+                // Best-effort — if it has already dropped, that laptop falls
+                // back to noticing on next contact, which is what happened
+                // before this frame existed.
+                previousPeer?.let { old ->
+                    val successor = try {
+                        peerStore.load(peerPub)?.peerName.orEmpty()
+                    } catch (_: Exception) { "" }
+                    val sent = server.sendPeerHandoffEncrypted(
+                        old, FrameSub.HANDOFF_RELEASE, successor,
+                    )
+                    Log.i(TAG, "RELEASE to previous laptop sent=$sent")
+                }
                 stopSeeking()
             }
             val bleWriter: suspend (com.vortex.a3.core.earbuds.AudioOpFrame) -> Result<Unit> = { f ->
