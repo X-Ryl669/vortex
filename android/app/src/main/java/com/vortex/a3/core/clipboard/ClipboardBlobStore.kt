@@ -9,7 +9,14 @@ import java.security.MessageDigest
  * this keeps several; the oldest is evicted past [MAX_ENTRIES].
  */
 object ClipboardBlobStore {
-    private const val MAX_ENTRIES = 32
+    /**
+     * Blobs kept before the oldest is evicted — and therefore the hard ceiling
+     * on how many files ONE share can deliver: the laptop pulls them one at a
+     * time over LAN, so a blob evicted before its turn is a file that silently
+     * never arrives. Callers cap their batch at this, so the two numbers cannot
+     * drift apart (see ShareReceiverActivity.MAX_SHARE_FILES).
+     */
+    const val MAX_ENTRIES = 32
 
     // Insertion-ordered so eviction drops the oldest first.
     private val blobs = LinkedHashMap<String, ByteArray>()
