@@ -683,6 +683,20 @@ class GattServer(
 
     fun hasActiveConnection(): Boolean = connectedAddrs.isNotEmpty()
 
+    /**
+     * True when a peer has SUBSCRIBED to AUDIO_SIGNAL, i.e. the notify path is
+     * actually deliverable.
+     *
+     * Distinct from [hasActiveConnection], which only says some central holds
+     * an ACL link. Those come apart in practice: BlueZ owns the ACL, so it
+     * survives the laptop app being restarted or killed, leaving a connection
+     * with no Vortex session behind it. Treating that as "connected" made the
+     * phone suppress its presence advertising while being unreachable — the
+     * laptop could not find it to re-establish, and neither side broke the tie.
+     */
+    fun hasAudioSignalSubscriber(): Boolean =
+        synchronized(audioSignalSubscribers) { audioSignalSubscribers.isNotEmpty() }
+
     private val callback = object : BluetoothGattServerCallback() {
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
             // Track the negotiated ATT MTU per device: the notify payload

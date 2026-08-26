@@ -763,7 +763,13 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // avoidable battery cost here (design doc §D5).
         adv.linkedProvider = provider@{
             val srv = gattServer ?: return@provider false
-            srv.hasActiveConnection()
+            // SUBSCRIBED, not merely ACL-connected. BlueZ owns the ACL link, so
+            // it outlives the laptop app: after a restart the phone saw a
+            // "connection" with no session behind it, stayed silent, and became
+            // unreachable — the laptop had nothing to find and the phone had no
+            // reason to advertise. Observed live: file offers sat retrying with
+            // "BLE link down?" while the phone never advertised.
+            srv.hasAudioSignalSubscriber()
         }
         // Which peers' tokens we may advertise. Re-read every round rather
         // than captured once, so pairing a new laptop or forgetting one takes
