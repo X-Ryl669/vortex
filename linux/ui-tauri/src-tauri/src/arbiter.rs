@@ -19,13 +19,6 @@
 //! can back off. A peer that cannot tell refusal from packet loss retries in a
 //! tight loop against the phone's single GATT link.
 
-// The switch half of this API (`force_activate`, `begin_switch`,
-// `is_switching`, `end_switch`, `is_connected`, `is_active`) is written but not
-// yet called: the Switch button and the candidate picker land next. Kept here
-// rather than added piecemeal so the ownership rules live in one reviewed
-// place, with the tests that pin them. Drop this allow once the UI is wired.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -141,6 +134,13 @@ pub(crate) fn note_disconnected(peer_pub: &[u8; 32]) {
     }
 }
 
+/// Whether any transport link to `peer_pub` is currently up.
+///
+/// Only the tests read this today. It stays because it is the other half of the
+/// connected/active split this module exists for, and the `PeerHandoff.RELEASE`
+/// path needs it: a displaced peer can only be *told* it was displaced while a
+/// link to it is still up, otherwise the notice has to wait for next contact.
+#[allow(dead_code)]
 pub(crate) fn is_connected(peer_pub: &[u8; 32]) -> bool {
     state()
         .lock()

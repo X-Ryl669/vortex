@@ -470,6 +470,29 @@ class VortexService : Service() {
             liveLan?.nudge()
         }
 
+        /**
+         * "Switch laptop": start advertising to the OTHER remembered laptops
+         * while staying connected to the current one.
+         *
+         * Seek-before-release (design doc §D3): nothing is dropped here. The
+         * current link is held until another laptop actually connects, so a
+         * cancelled or fruitless seek leaves the phone exactly where it was.
+         *
+         * Returns false when there is no stack running or fewer than two
+         * remembered laptops, so the UI can leave the button disabled rather
+         * than opening a window that cannot succeed.
+         */
+        fun startSeeking(): Boolean = liveStack?.startSeeking() ?: false
+
+        /** Close a seek window; advertising returns to whatever the phase
+         *  machine says (silent while linked, presence otherwise). */
+        fun stopSeeking() {
+            liveStack?.stopSeeking()
+        }
+
+        /** True while a seek window is open — drives the UI's spinner. */
+        fun isSeeking(): Boolean = liveStack?.isSeeking() ?: false
+
         /** Public entrypoint: start the service from anywhere. Idempotent. */
         fun start(context: Context) {
             val intent = Intent(context, VortexService::class.java)

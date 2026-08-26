@@ -63,6 +63,8 @@ class MainUiState(
     val showAutostartDialog: MutableStateFlow<Boolean>,
     /** Bluetooth adapter is off/absent → drives the home "turn on BT" banner. */
     val bluetoothOff: StateFlow<Boolean>,
+    /** A "switch laptop" seek window is open. */
+    val seekingLaptop: StateFlow<Boolean>,
 )
 
 /**
@@ -79,6 +81,8 @@ class VortexActions(
      *  can be offered to a second laptop without forgetting the first. */
     val onAddPair: () -> Unit,
     val onCancelAddPair: () -> Unit,
+    /** Look for another remembered laptop while staying on this one. */
+    val onSwitchLaptop: () -> Unit,
     val onOpenAutostart: () -> Unit,
     val onDismissAutostartHint: () -> Unit,
     val onRequestBatteryWhitelist: () -> Unit,
@@ -210,6 +214,8 @@ fun VortexRoot(
                         onForgetPeer = actions.onForgetPeer,
                         onAddPair = actions.onAddPair,
                         onCancelAddPair = actions.onCancelAddPair,
+                        onSwitchLaptop = actions.onSwitchLaptop,
+                        seekingLaptop = ui.seekingLaptop.collectAsState().value,
                         onOpenAutostart = actions.onOpenAutostart,
                         onDismissAutostartHint = actions.onDismissAutostartHint,
                         onRequestBatteryWhitelist = actions.onRequestBatteryWhitelist,

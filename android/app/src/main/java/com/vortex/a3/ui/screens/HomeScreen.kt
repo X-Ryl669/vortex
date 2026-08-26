@@ -89,6 +89,8 @@ fun HomeScreen(
     onForgetPeer: (TrustedPeer) -> Unit,
     onAddPair: () -> Unit,
     onCancelAddPair: () -> Unit,
+    onSwitchLaptop: () -> Unit,
+    seekingLaptop: Boolean,
     onOpenAutostart: () -> Unit,
     onDismissAutostartHint: () -> Unit,
     onRequestBatteryWhitelist: () -> Unit,
@@ -265,6 +267,10 @@ fun HomeScreen(
                         } else {
                             null
                         },
+                        // Only offered with a second laptop to switch TO —
+                        // otherwise the seek can only ever time out.
+                        onSwitch = if (peerCount > 1) onSwitchLaptop else null,
+                        seeking = seekingLaptop,
                     )
 
                     EarbudsCard(
