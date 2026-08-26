@@ -67,6 +67,9 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     internal val sentIconPkgs = java.util.Collections.synchronizedSet(HashSet<String>())
     private var clipboardListener: com.vortex.a3.core.clipboard.ClipboardListener? = null
     internal var wifiDirectTeardownJob: kotlinx.coroutines.Job? = null
+    /** elapsedRealtime of the last WIFI_DIRECT_OFFER, for coalescing (see
+     *  [maybeStartWifiDirect]). 0 = none since the group last went down. */
+    @Volatile internal var lastWifiDirectOfferAtMs: Long = 0L
     /** Icon PNG bytes per ICON frame chunk (kept under the BLE notify MTU
      *  once the appId header + AEAD tag + frame header are added). */
     internal val ICON_CHUNK = 180
@@ -86,6 +89,18 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      *  session is live is the most expensive radio state there is, so an
      *  unattended press must not scan forever. */
     private var seekJob: kotlinx.coroutines.Job? = null
+
+    /** Paces multi-file shares (see [ShareQueue]). Lazy because it needs
+     *  `ctx`, which resolves through the Service's base context. */
+    internal val shareQueue: ShareQueue by lazy {
+        ShareQueue(
+            context = ctx,
+            emit = { file -> VortexService.clipboardFileBus.tryEmit(file) },
+            // Offers awaiting collection == files in flight, so pacing follows
+            // real delivery instead of a timer.
+            inFlight = { pendingOffers.size },
+        )
+    }
 
     internal var contactsProvider: com.vortex.a3.core.contacts.ContactsProvider? = null
     /** Reads the phone's recent call log + observes changes; emits to callLogBus. */
@@ -1066,6 +1081,11 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
          *  enough that an unattended press stops advertising-on-top-of-a-
          *  live-link before it costs real battery. */
         internal const val SEEK_WINDOW_MS = 45_000L
+
+        /** Minimum gap between WIFI_DIRECT_OFFERs. Each one costs the laptop a
+         *  Wi-Fi disconnect/reconnect (single adapter), so they must not track
+         *  the file count. Well inside the 60 s idle teardown. */
+        internal const val WIFI_DIRECT_OFFER_MIN_GAP_MS = 30_000L
 
         /** How long an AUDIO_SIGNAL subscription must stay up before the
          *  companion mirror burst (contacts/recents/SMS, ~37 chunks) fires.

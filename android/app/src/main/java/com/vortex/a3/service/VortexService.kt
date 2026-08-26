@@ -71,6 +71,10 @@ class VortexService : Service() {
         Log.i(tag, "onStartCommand flags=$flags startId=$startId action=${intent?.action}")
         if (!stack.isStarted()) {
             ensureStackStarted()
+            // A share can arrive before the stack is up (cold start from the
+            // share sheet). Queue it anyway — the queue paces itself off
+            // delivery, so it simply drains once the link exists.
+            if (intent?.action == ACTION_ENQUEUE_SHARE) enqueueShare(intent)
         } else when (intent?.action) {
             // READ_PHONE_STATE granted after the stack was already running
             // (the common trusted-launch path never asked for it).
@@ -84,6 +88,7 @@ class VortexService : Service() {
             // in-app button and the proximity auto-unlock.
             ACTION_LOCK_LAPTOP -> requestLaptopLock(applicationContext, "lock")
             ACTION_UNLOCK_LAPTOP -> requestLaptopLock(applicationContext, "unlock")
+            ACTION_ENQUEUE_SHARE -> enqueueShare(intent)
         }
         return START_STICKY
     }
@@ -98,6 +103,30 @@ class VortexService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * Take the URIs a share handed us and queue them.
+     *
+     * The URIs arrive in the Intent's ClipData with
+     * `FLAG_GRANT_READ_URI_PERMISSION`, which is what extends the share sheet's
+     * read grant to this service. That indirection is the point: the queue
+     * reads each file on its turn rather than the Activity reading all of them
+     * up front, so memory stays flat no matter how many were selected.
+     */
+    private fun enqueueShare(intent: Intent) {
+        val clip = intent.clipData
+        val uris = buildList {
+            if (clip != null) {
+                for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let { add(it) }
+            }
+        }
+        if (uris.isEmpty()) {
+            Log.w(tag, "enqueueShare: no URIs in ClipData")
+            return
+        }
+        Log.i(tag, "enqueueShare: ${uris.size} file(s)")
+        stack.shareQueue.enqueue(uris)
+    }
 
     private val retryHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val retryStart = Runnable { ensureStackStarted() }
@@ -151,6 +180,9 @@ class VortexService : Service() {
          *  it. One-tap (no biometric); the laptop gates on this phone being
          *  unlocked (owner-present gate). */
         const val ACTION_UNLOCK_LAPTOP = "com.vortex.a3.UNLOCK_LAPTOP"
+        /** Intent action: a share sheet handed us files to send. URIs ride in
+         *  ClipData with FLAG_GRANT_READ_URI_PERMISSION. */
+        const val ACTION_ENQUEUE_SHARE = "com.vortex.a3.ENQUEUE_SHARE"
 
         /**
          * Latest peer AppState snapshot, keyed by peer_static_pub hex.
@@ -204,12 +236,27 @@ class VortexService : Service() {
         /** A FILE (any non-image content) captured on THIS phone for sending to
          *  the laptop — same offer+LAN-pull path as images, but the laptop
          *  writes it to disk and makes it pasteable. */
+        /**
+         * Outgoing shared files. Buffer holds a whole capped batch, and
+         * overflow SUSPENDS rather than dropping.
+         *
+         * It was 4 slots with DROP_OLDEST, which silently discarded most of any
+         * multi-file share: sharing 150 files delivered about 20, because the
+         * collector (stash + JSON + BLE notify) could not drain a 4-slot buffer
+         * as fast as the share loop filled it, and DROP_OLDEST throws away the
+         * overflow without telling anyone. Worse, `tryEmit` returns TRUE on a
+         * drop, so the sender counted every file as sent and the toast lied.
+         *
+         * With SUSPEND, `tryEmit` returns false instead of discarding, so the
+         * caller can count what was actually accepted and report the rest.
+         */
         val clipboardFileBus: kotlinx.coroutines.flow.MutableSharedFlow<
             com.vortex.a3.core.clipboard.ClipboardOutgoingFile> =
             kotlinx.coroutines.flow.MutableSharedFlow(
                 replay = 0,
-                extraBufferCapacity = 4,
-                onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+                extraBufferCapacity =
+                    com.vortex.a3.core.clipboard.ClipboardBlobStore.MAX_ENTRIES,
+                onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.SUSPEND,
             )
 
         /** Browsing HANDOFF (seamless-continuity): a page the phone wants to continue
