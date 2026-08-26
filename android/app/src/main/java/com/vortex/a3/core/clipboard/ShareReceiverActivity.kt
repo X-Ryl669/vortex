@@ -76,42 +76,52 @@ class ShareReceiverActivity : Activity() {
             }
         }
 
-        var sent = 0
-        var tooLarge = 0
-        var largestRejected = 0L
-        for (uri in uris) {
-            when (val outcome = ClipboardFileReader.read(this, uri)) {
-                is ClipboardFileReader.Outcome.Ok -> {
-                    val file = outcome.file
-                    VortexService.clipboardFileBus.tryEmit(file)
-                    Log.i(TAG, "share: forwarded file '${file.name}' (${file.bytes.size} bytes)")
-                    sent++
-                }
-                is ClipboardFileReader.Outcome.TooLarge -> {
-                    tooLarge++
-                    largestRejected = maxOf(largestRejected, outcome.bytes)
-                    Log.w(TAG, "share: $uri over the size cap (${outcome.bytes} bytes)")
-                }
-                is ClipboardFileReader.Outcome.Unreadable -> {
-                    Log.w(TAG, "share: couldn't read $uri (${outcome.why})")
-                }
-            }
+        // Hand the whole list to the service and let it pace itself.
+        //
+        // Deliberately NOT read here: reading every file up front is what made
+        // an 835 MB share an OutOfMemoryError, and what made a 150-file share
+        // lose most of its files to buffer overflow. The service reads each
+        // file on its turn (see ShareQueue), so memory is flat and the batch is
+        // bounded by real delivery instead of a cap that refuses work.
+        //
+        // ClipData + FLAG_GRANT_READ_URI_PERMISSION is what carries the share
+        // sheet's read grant across to the service; plain extras would not.
+        if (uris.isEmpty()) {
+            // Nothing readable in the share and the text path above did not
+            // claim it. `uris.first()` below would throw.
+            Log.w(TAG, "share: no URIs and no text — nothing to do")
+            Toast.makeText(this, "Nothing to send", Toast.LENGTH_SHORT).show()
+            finish()
+            overridePendingTransition(0, 0)
+            return
         }
-        // Name the actual reason. "Couldn't read the shared file" for a file the
-        // user can see perfectly well is what made an over-cap share look like a
-        // bug rather than a limit — and before the size pre-check, a big one
-        // took the whole app down without saying anything at all.
-        val msg = when {
-            sent == 0 && tooLarge > 0 -> {
-                val cap = ClipboardFileReader.MAX_FILE_BYTES / (1024 * 1024)
-                val mb = largestRejected / (1024 * 1024)
-                if (tooLarge == 1) "File is too big to send ($mb MB; limit $cap MB)"
-                else "$tooLarge files are too big to send (limit $cap MB)"
+        val clip = android.content.ClipData.newUri(contentResolver, "vortex-share", uris.first())
+        for (u in uris.drop(1)) clip.addItem(android.content.ClipData.Item(u))
+        val svc = android.content.Intent(this, VortexService::class.java).apply {
+            action = VortexService.ACTION_ENQUEUE_SHARE
+            clipData = clip
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                startForegroundService(svc)
+            } else {
+                startService(svc)
             }
-            sent == 0 -> "Couldn't read the shared file(s)"
-            tooLarge > 0 -> "Sending $sent; $tooLarge too big to send"
-            sent == 1 -> "Sending file to laptop…"
-            else -> "Sending $sent files to laptop…"
+        } catch (e: Exception) {
+            Log.w(TAG, "couldn't hand the share to the service: ${e.message}")
+            Toast.makeText(this, "Couldn't start the transfer", Toast.LENGTH_SHORT).show()
+            finish()
+            overridePendingTransition(0, 0)
+            return
+        }
+        Log.i(TAG, "share: handed ${uris.size} file(s) to the queue")
+        // One toast. Per-file progress is the notification the queue maintains —
+        // a toast per file meant 150 toasts for a 150-file share.
+        val msg = if (uris.size == 1) {
+            "Sending file to laptop…"
+        } else {
+            "Queued ${uris.size} files for the laptop"
         }
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
