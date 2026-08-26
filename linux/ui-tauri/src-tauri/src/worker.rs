@@ -313,6 +313,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // into. All merge/protocol logic lives in notes.rs.
         let ble_sealed_writer: Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        let _ = crate::BLE_SEALED_WRITER.set(ble_sealed_writer.clone());
         let ble_notes_tx = crate::notes::spawn_sync(app.clone(), ble_sealed_writer.clone());
         crate::notes::spawn_reminders(); // desktop due-date reminders
 

@@ -169,6 +169,18 @@ class GattServer(
     @Volatile var onCallControlReceived: (peerStaticPub: ByteArray, jsonBytes: ByteArray) -> Unit =
         { _, _ -> }
 
+    /**
+     * Invoked when the laptop WRITES a PEER_HANDOFF frame: it has handed
+     * session ownership to a different phone, so we are no longer its active
+     * peer. `kind` is the [FrameSub] code, `successorName` the display name of
+     * whoever took over (empty when unknown — the kind carries the meaning).
+     */
+    @Volatile var onPeerHandoffReceived: (
+        peerStaticPub: ByteArray,
+        kind: Byte,
+        successorName: String,
+    ) -> Unit = { _, _, _ -> }
+
     /** Invoked when the laptop WRITES a NOTES_SYNC chunk (`[total][idx][data]`):
      *  reassembled + LWW-merged into the local notes store. */
     @Volatile var onNotesSyncReceived: (peerStaticPub: ByteArray, chunk: ByteArray) -> Unit =
@@ -965,6 +977,26 @@ class GattServer(
                                 onNotesSyncReceived(peerPub, jsonBytes)
                             } catch (e: Exception) {
                                 Log.w(TAG, "onNotesSyncReceived threw: ${e.message}")
+                            }
+                        }
+                        FrameType.PEER_HANDOFF -> {
+                            // The kind rides as the first payload byte rather
+                            // than Frame.sub: the laptop's generic sealed-frame
+                            // writer only takes a frame type, so both sides
+                            // agree to carry it here. An empty payload is
+                            // malformed — ignore rather than guess a kind.
+                            if (jsonBytes.isEmpty()) {
+                                Log.w(TAG, "PEER_HANDOFF with empty payload — ignored")
+                            } else {
+                                val kind = jsonBytes[0]
+                                val name = runCatching {
+                                    String(jsonBytes, 1, jsonBytes.size - 1, Charsets.UTF_8)
+                                }.getOrDefault("")
+                                try {
+                                    onPeerHandoffReceived(peerPub, kind, name)
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "onPeerHandoffReceived threw: ${e.message}")
+                                }
                             }
                         }
                     }
