@@ -794,7 +794,7 @@ pub(crate) async fn run_ble_persistent_loop(
     >,
     // Generic additive-frame channel (e.g. NOTES_SYNC) — the listener forwards
     // (frame_ty, payload) here; the owning feature module filters + handles it.
-    raw_frame_tx: tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>,
+    raw_frame_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)>,
     notif_writer: Arc<tokio::sync::Mutex<Option<NotifWriter>>>,
     clipboard_writer: Arc<tokio::sync::Mutex<Option<crate::ClipboardWriter>>>,
     clipboard_image_writer: Arc<tokio::sync::Mutex<Option<crate::ClipboardImageWriter>>>,

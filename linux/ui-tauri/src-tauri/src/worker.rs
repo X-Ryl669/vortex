@@ -315,6 +315,14 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
             Arc::new(tokio::sync::Mutex::new(None));
         let _ = crate::BLE_SEALED_WRITER.set(ble_sealed_writer.clone());
         let ble_notes_tx = crate::notes::spawn_sync(app.clone(), ble_sealed_writer.clone());
+        // The generic additive-frame channel is single-consumer and notes used to
+        // own it. Put the peer-handoff dispatcher in front: it takes the frames it
+        // handles and forwards the rest to notes unchanged.
+        let ble_raw_tx = crate::peer_handoff::spawn_dispatcher(
+            app.clone(),
+            peer_store.clone(),
+            ble_notes_tx,
+        );
         crate::notes::spawn_reminders(); // desktop due-date reminders
 
         // BLE app-icon channel: the listener forwards ICON chunks here; a
@@ -419,7 +427,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
             let ble_clipboard_image_tx = ble_clipboard_image_tx.clone();
             let ble_clipboard_offer_tx = ble_clipboard_offer_tx.clone();
             let ble_handoff_tx = ble_handoff_tx.clone();
-            let ble_notes_tx = ble_notes_tx.clone();
+            let ble_raw_tx = ble_raw_tx.clone();
             let ble_notif_writer = ble_notif_writer.clone();
             let ble_clipboard_writer = ble_clipboard_writer.clone();
             let ble_clipboard_image_writer = ble_clipboard_image_writer.clone();
@@ -447,7 +455,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                     ble_clipboard_image_tx,
                     ble_clipboard_offer_tx,
                     ble_handoff_tx,
-                    ble_notes_tx,
+                    ble_raw_tx,
                     ble_notif_writer,
                     ble_clipboard_writer,
                     ble_clipboard_image_writer,
