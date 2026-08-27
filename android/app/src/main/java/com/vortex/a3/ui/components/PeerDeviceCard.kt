@@ -20,7 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Cast
-import androidx.compose.material.icons.outlined.PhoneAndroid
+import androidx.compose.material.icons.outlined.PhonelinkOff
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material3.Icon
@@ -101,6 +101,29 @@ fun PeerDeviceCard(
             iconTint = MaterialTheme.colorScheme.primary,
             iconBg = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
             statusDot = statusDotColor,
+            // Beside the device icon, not in the bottom row. Two facing arrows
+            // sandwiched between the cast and lock glyphs read as "swap those
+            // two", and it crowded the row enough to wrap the battery
+            // percentage onto a second line. "Unlink" says what this does:
+            // leave this laptop for another one.
+            afterIcon = onSwitch?.let { switch ->
+                {
+                    Icon(
+                        imageVector = Icons.Outlined.PhonelinkOff,
+                        contentDescription = "Switch to another laptop",
+                        tint = if (seeking) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(onClick = switch)
+                            .padding(4.dp)
+                            .size(20.dp),
+                    )
+                }
+            },
         )
         Spacer(modifier = Modifier.height(14.dp))
         Text(name, color = MaterialTheme.colorScheme.onSurface, fontWeight = FW.SemiBold, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
@@ -133,26 +156,6 @@ fun PeerDeviceCard(
                             .background(Color(0xFFF0B43C)),
                     )
                 }
-                Spacer(modifier = Modifier.size(8.dp))
-            }
-            if (onSwitch != null) {
-                // Switch to another remembered laptop. Tinted while seeking so
-                // the state is visible without stealing card space for a label
-                // — the window closes itself, so there is nothing to undo.
-                Icon(
-                    imageVector = Icons.Outlined.PhoneAndroid,
-                    contentDescription = "Switch to another laptop",
-                    tint = if (seeking) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable(onClick = onSwitch)
-                        .padding(4.dp)
-                        .size(20.dp),
-                )
                 Spacer(modifier = Modifier.size(8.dp))
             }
             if (locked != null && onToggleLock != null) {
