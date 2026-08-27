@@ -108,7 +108,18 @@ fun HomeScreen(
     onEnableBluetooth: () -> Unit,
 ) {
     val peerCount = peers.size
-    val primaryPeer = peers.firstOrNull()
+    // Show the laptop we are actually talking to.
+    //
+    // This used to be `peers.firstOrNull()`, which with two trusted laptops
+    // meant "an arbitrary one" — observed showing a laptop 40 km away as
+    // "Disconnected" while the phone was happily syncing with the one on the
+    // desk. Freshest traffic wins; `pairedAt` breaks ties so the choice is
+    // still deterministic when nothing has been heard from yet (and then it is
+    // most-recently-paired, which is the best available guess at "yours").
+    val primaryPeer = peers.maxWithOrNull(
+        compareBy<TrustedPeer> { peerLastSeen[it.peerStaticPub.toHex()] ?: 0L }
+            .thenBy { it.pairedAt },
+    )
     val primaryState = primaryPeer?.let { peerStates[it.peerStaticPub.toHex()] }
     val primaryHex = primaryPeer?.peerStaticPub?.toHex()
     val lastSeen = primaryHex?.let { peerLastSeen[it] } ?: 0L
