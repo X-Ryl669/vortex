@@ -201,6 +201,13 @@ class EncryptedPrefsPeerStore(context: Context) : PeerStore {
                 runCatching { TrustedPeer.decode(Base64.decode(s, Base64.NO_WRAP)) }.getOrNull()
             }
             .filterNotNull()
+            // Deterministic order. `prefs.all` is a HashMap, so without this the
+            // sequence follows hash order — and every `list().firstOrNull()`
+            // caller silently means "an arbitrary peer". That showed up as the
+            // phone's home card displaying whichever laptop hashed first
+            // instead of the one it was actually connected to. Most recently
+            // paired first, so "the one peer" degrades to something sensible.
+            .sortedByDescending { it.pairedAt }
             .toList()
     }
 
