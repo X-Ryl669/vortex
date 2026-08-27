@@ -449,6 +449,7 @@ class MainActivity : ComponentActivity() {
         onAddPair = ::onAddPairClicked,
         onCancelAddPair = ::endPairingWindow,
         onSwitchLaptop = ::onSwitchLaptopClicked,
+        onSwitchToPeer = ::onSwitchToPeerClicked,
         onOpenAutostart = ::onOpenAutostartSettings,
         onDismissAutostartHint = ::dismissAutostartHint,
         onRequestBatteryWhitelist = ::onRequestBatteryWhitelist,
