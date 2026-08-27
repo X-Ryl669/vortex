@@ -68,7 +68,10 @@ pub(crate) struct BleSinks {
     pub handoff: tokio::sync::mpsc::UnboundedSender<
         vortex_l3_daemon::core::handoff::HandoffEvent,
     >,
-    pub raw: tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>,
+    /// Additive frames, stamped with the peer they came from — the listener
+    /// carries the sender's key so a multi-peer consumer knows whose statement
+    /// it is rather than inferring it from whoever is active.
+    pub raw: tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)>,
 }
 
 /// The laptop→phone writer holders the features send through. Filled on connect,

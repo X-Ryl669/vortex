@@ -59,6 +59,15 @@ pub(crate) fn peer_dir() -> Option<PathBuf> {
 
 /// Best-effort `chmod 0700`. A failure is not fatal — the 0700 cache root
 /// still shields the contents — so we log and carry on.
+/// Windows has no POSIX mode to set. The protection is already there by
+/// construction: the cache lives under `%LOCALAPPDATA%`, inside the user's
+/// profile, whose ACL grants the user and administrators only. Faking a chmod
+/// here would be worse than doing nothing — it would read as a guarantee this
+/// function is not the one providing.
+#[cfg(not(unix))]
+fn restrict_to_owner(_dir: &std::path::Path) {}
+
+#[cfg(unix)]
 fn restrict_to_owner(dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(dir) {
