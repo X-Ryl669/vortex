@@ -24,7 +24,7 @@ use tauri::State;
 
 /// One message, so the UI can say the same thing everywhere and a log line
 /// names the reason rather than just failing.
-const UNSUPPORTED: &str = "not available on this platform yet";
+pub(crate) const UNSUPPORTED: &str = "not available on this platform yet";
 
 // ── Earbuds hand-off (PulseAudio + BlueZ on Linux) ────────────────────────
 
