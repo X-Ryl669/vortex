@@ -766,6 +766,8 @@ pub(crate) async fn run_ble_persistent_loop(
     // Consecutive connect failures against a present phone — drives the
     // adapter power-cycle self-heal (see CONNECT_WEDGE_THRESHOLD).
     let mut consec_connect_fail: u32 = 0;
+    let mut announced_no_peer = false;
+    tracing::info!("BLE persistent loop started");
     loop {
         // Need a trusted peer record to authenticate against.
         // Same blocking-pool offload as the LAN heartbeat: libsecret
@@ -779,8 +781,19 @@ pub(crate) async fn run_ble_persistent_loop(
             .await
             .unwrap_or(None);
             match first {
-                Some(p) => p,
+                Some(p) => {
+                    announced_no_peer = false;
+                    p
+                }
                 None => {
+                    // Announce once, not every 10 s. Without it, a loop idling
+                    // for want of a trusted peer and a loop failing to connect
+                    // look identical in the log — both are silence. The portable
+                    // loop already says this; the BlueZ one did not.
+                    if !announced_no_peer {
+                        tracing::info!("no trusted peer yet; BLE loop idle until pairing");
+                        announced_no_peer = true;
+                    }
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     continue;
                 }

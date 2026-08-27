@@ -225,23 +225,41 @@ fn log_filter() -> tracing_subscriber::EnvFilter {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
 
-/// Start logging to stderr. The journal picks this up under the systemd user
-/// unit, which is where Linux diagnosis happens.
-#[cfg(target_os = "linux")]
-fn init_logging() {
-    tracing_subscriber::fmt().with_env_filter(log_filter()).init();
+/// Tee log lines to stderr AND the log file.
+///
+/// stderr is best-effort on purpose: a Windows GUI binary has none, and a
+/// desktop-launched Linux app has it pointed at `/dev/null`. A failed write
+/// there must never cost us the line in the file.
+struct Tee(std::fs::File);
+
+impl std::io::Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), buf);
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        self.0.flush()
+    }
 }
 
-/// Start logging to a FILE, because a Windows GUI binary has no console to
-/// print to: run the exe by double-clicking it and stderr goes nowhere at all.
-/// Making the log a file by default means the first run of code that has never
-/// executed leaves evidence without anyone having to arrange for it.
+/// Start logging to a FILE — on every platform — while still writing stderr for
+/// whoever is watching a terminal.
 ///
-/// `%LOCALAPPDATA%\Vortex\vortex.log`, with the previous run kept as
-/// `vortex.log.1` — one restart of history, because the interesting run is
-/// often the one before the one you thought to look at. Falls back to stderr if
-/// the file cannot be opened, which is no worse than before.
-#[cfg(not(target_os = "linux"))]
+/// A file is not a Windows nicety. Neither platform reliably has a console:
+/// a Windows GUI binary has none at all, and on Linux the app is started from a
+/// `.desktop` autostart entry, which sends stdout and stderr to `/dev/null`. So
+/// the installed Linux app kept no record of anything, and every diagnosis
+/// began by asking someone to kill it and relaunch it by hand with `RUST_LOG`
+/// set — which loses exactly the run that misbehaved. (The doc comment this
+/// replaces claimed the journal picked it up; that is only true under a systemd
+/// user unit, which is not how this is installed.)
+///
+/// `~/.cache/vortex/vortex.log`, or `%LOCALAPPDATA%\Vortex\vortex.log`, with
+/// the previous run kept as `vortex.log.1` — one restart of history, because
+/// the interesting run is often the one before the one you thought to look at.
+/// Falls back to stderr alone if the file cannot be opened, which is no worse
+/// than before.
 fn init_logging() {
     use std::io::Write;
 
@@ -272,7 +290,7 @@ fn init_logging() {
             // cloned handles share the file offset, so lines from different
             // threads append rather than overwrite. ANSI off — colour escapes
             // in a file make it unreadable in Notepad.
-            let writer = move || f.try_clone().expect("clone log handle");
+            let writer = move || Tee(f.try_clone().expect("clone log handle"));
             tracing_subscriber::fmt()
                 .with_env_filter(log_filter())
                 .with_writer(writer)
@@ -280,8 +298,8 @@ fn init_logging() {
                 .init();
             if let Some(p) = path.as_ref() {
                 tracing::info!("logging to {}", p.display());
-                // Also to stderr, for the case where a console DOES exist and
-                // someone is looking for the file.
+                // Named on stderr too, so someone watching a terminal knows
+                // where the file is without reading this function.
                 let _ = writeln!(std::io::stderr(), "vortex: logging to {}", p.display());
             }
         }
