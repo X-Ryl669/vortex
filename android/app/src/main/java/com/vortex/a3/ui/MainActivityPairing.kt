@@ -252,6 +252,29 @@ internal fun MainActivity.onSwitchLaptopClicked() {
     }
 }
 
+/**
+ * Switch to one specific remembered laptop.
+ *
+ * Unlike [onSwitchLaptopClicked] this names the destination, so the seek
+ * advertises only that peer's token rather than cycling every remembered one —
+ * found as fast as the single-peer case, and less time on air.
+ */
+internal fun MainActivity.onSwitchToPeerClicked(peer: TrustedPeer) {
+    if (VortexService.isSeeking()) {
+        // Already looking; a second tap would only change the target
+        // mid-flight. Treat it as cancel, matching the header action.
+        VortexService.stopSeeking()
+        seekingLaptop.value = false
+        return
+    }
+    val started = VortexService.startSeeking(peer.peerStaticPub)
+    seekingLaptop.value = started
+    android.util.Log.i(
+        "VortexSwitch",
+        "targeted seek for '${peer.peerName ?: "laptop"}' started=$started",
+    )
+}
+
 internal fun MainActivity.onApproveClicked(outcome: PairingOrchestrator.HandshakeOutcome) {
     val orch = pairingOrchestrator ?: return
     val frame = orch.buildLocalApprovalFrame(

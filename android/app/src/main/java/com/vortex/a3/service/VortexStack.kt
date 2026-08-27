@@ -70,6 +70,16 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     /** elapsedRealtime of the last WIFI_DIRECT_OFFER, for coalescing (see
      *  [maybeStartWifiDirect]). 0 = none since the group last went down. */
     @Volatile internal var lastWifiDirectOfferAtMs: Long = 0L
+
+    /**
+     * The one laptop a seek is aimed at, when the user picked it explicitly.
+     *
+     * A targeted seek advertises only THAT peer's token instead of cycling all
+     * of them, so it is both faster to be found (no dwell sharing) and cheaper
+     * on air. `null` = untargeted, i.e. "any remembered laptop but the current
+     * one" (design doc §D1).
+     */
+    @Volatile internal var seekTarget: ByteArray? = null
     /** Icon PNG bytes per ICON frame chunk (kept under the BLE notify MTU
      *  once the appId header + AEAD tag + frame header are added). */
     internal val ICON_CHUNK = 180
@@ -785,6 +795,13 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 return@provider emptyList()
             }
             if (!adv.seeking) return@provider all.map { it.prs }
+            // Targeted seek: advertise only the chosen laptop's token. One
+            // token means no dwell sharing, so it is seen as fast as the
+            // single-peer case.
+            seekTarget?.let { target ->
+                return@provider all.filter { it.peerStaticPub.contentEquals(target) }
+                    .map { it.prs }
+            }
             val linkedPub = activePeerPub
             all.filter { linkedPub == null || !it.peerStaticPub.contentEquals(linkedPub) }
                 .map { it.prs }
@@ -807,7 +824,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      * Open a seek window: advertise to the other remembered laptops while
      * staying connected to the current one. See [VortexService.startSeeking].
      */
-    fun startSeeking(): Boolean {
+    fun startSeeking(target: ByteArray? = null): Boolean {
         val adv = advertiser ?: return false
         // Nothing to switch to — refuse rather than burn the radio on a window
         // that cannot possibly succeed.
@@ -817,6 +834,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             return false
         }
         seekJob?.cancel()
+        seekTarget = target?.copyOf()
         adv.seeking = true
         // Re-advertise immediately with the seek peer set instead of waiting
         // out the current dwell / rotation sleep.
@@ -840,6 +858,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         val adv = advertiser ?: return
         if (!adv.seeking) return
         adv.seeking = false
+        seekTarget = null
         // Back to the phase machine's verdict: silent if still linked,
         // presence otherwise.
         adv.kickRotation()

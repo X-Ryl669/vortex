@@ -83,6 +83,8 @@ class VortexActions(
     val onCancelAddPair: () -> Unit,
     /** Look for another remembered laptop while staying on this one. */
     val onSwitchLaptop: () -> Unit,
+    /** Switch to one NAMED laptop; lets the seek advertise a single token. */
+    val onSwitchToPeer: (TrustedPeer) -> Unit,
     val onOpenAutostart: () -> Unit,
     val onDismissAutostartHint: () -> Unit,
     val onRequestBatteryWhitelist: () -> Unit,
@@ -215,6 +217,7 @@ fun VortexRoot(
                         onAddPair = actions.onAddPair,
                         onCancelAddPair = actions.onCancelAddPair,
                         onSwitchLaptop = actions.onSwitchLaptop,
+                        onSwitchToPeer = actions.onSwitchToPeer,
                         seekingLaptop = ui.seekingLaptop.collectAsState().value,
                         onOpenAutostart = actions.onOpenAutostart,
                         onDismissAutostartHint = actions.onDismissAutostartHint,

@@ -529,7 +529,8 @@ class VortexService : Service() {
          * remembered laptops, so the UI can leave the button disabled rather
          * than opening a window that cannot succeed.
          */
-        fun startSeeking(): Boolean = liveStack?.startSeeking() ?: false
+        fun startSeeking(target: ByteArray? = null): Boolean =
+            liveStack?.startSeeking(target) ?: false
 
         /** Close a seek window; advertising returns to whatever the phase
          *  machine says (silent while linked, presence otherwise). */
