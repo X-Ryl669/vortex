@@ -7,10 +7,15 @@ use std::time::Duration;
 
 use tauri::Emitter;
 
+#[cfg(target_os = "linux")]
 use vortex_l3_daemon::core::ble::scanner::run_filtered_scan;
 
-use crate::ipc::{emit_peers, PairingResultDto, PairingStartedDto, ScanHitDto};
-use crate::pairing::{do_pair, send_revoke_to_peer};
+#[cfg(target_os = "linux")]
+use crate::ipc::{PairingResultDto, PairingStartedDto, ScanHitDto};
+use crate::ipc::emit_peers;
+#[cfg(target_os = "linux")]
+use crate::pairing::do_pair;
+use crate::pairing::send_revoke_to_peer;
 use crate::worker_ctx::WorkerCtx;
 
 /// Wipe every cached scrap of the peer's data — contacts, recents, SMS, notes,
@@ -30,6 +35,10 @@ pub(crate) fn purge_peer_cache(app: &tauri::AppHandle) {
 }
 
 /// `UiCmd::Scan` — pairable-only BLE scan, superseding any running scan.
+///
+/// Linux-only: it holds a BlueZ adapter. The seam equivalent for other
+/// platforms is `ble_portable::scan_for_ui`.
+#[cfg(target_os = "linux")]
 pub(crate) fn scan(ctx: &WorkerCtx, active_scan: &mut Option<tokio::task::JoinHandle<()>>) {
     // Supersede any still-running scan so handles don't leak.
     if let Some(prev) = active_scan.take() {
@@ -72,6 +81,10 @@ pub(crate) fn scan(ctx: &WorkerCtx, active_scan: &mut Option<tokio::task::JoinHa
 }
 
 /// `UiCmd::Pair` — quiet the radio (abort+await any scan), then run IK pairing.
+///
+/// Linux-only for the same reason as [`scan`]; elsewhere the worker calls
+/// `ble_portable::pair_by_scan`.
+#[cfg(target_os = "linux")]
 pub(crate) async fn pair(
     ctx: &WorkerCtx,
     addr_str: String,

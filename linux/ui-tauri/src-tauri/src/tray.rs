@@ -144,14 +144,22 @@ pub(crate) fn setup(app: &tauri::App) -> tauri::Result<()> {
     let phone_i = MenuItem::with_id(
         app, "phone_batt", "Phone   --", false, None::<&str>,
     )?;
+    // Earbuds hand-off is the audio backend plus BlueZ, so off Linux there is
+    // nothing behind this row. A tray item is not a Tauri command — a click has
+    // no return value and nowhere to report an error — so an unsupported one
+    // cannot say so and would simply do nothing. Leave it out instead.
+    #[cfg(target_os = "linux")]
     let switch_i =
         MenuItem::with_id(app, "switch", "Switch earbuds", true, None::<&str>)?;
     let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    #[cfg(target_os = "linux")]
     let menu = Menu::with_items(
         app,
         &[&phone_i, &buds_i, &switch_i, &show_i, &quit_i],
     )?;
+    #[cfg(not(target_os = "linux"))]
+    let menu = Menu::with_items(app, &[&phone_i, &buds_i, &show_i, &quit_i])?;
     app.manage(BatteryMenuItem { buds: buds_i, phone: phone_i });
     // White monochrome BRAND SPIRAL for the status area. Like Telegram / Cursor,
     // we ship ONE fixed light icon rather than swapping per theme: the
@@ -166,6 +174,8 @@ pub(crate) fn setup(app: &tauri::App) -> tauri::Result<()> {
         .tooltip("Vortex")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
+            // Only built on Linux (see the menu above), so only handled there.
+            #[cfg(target_os = "linux")]
             "switch" => {
                 // Toggle the buds between this laptop and the phone.
                 use tauri::Manager;

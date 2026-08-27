@@ -69,7 +69,10 @@ mod transfers;
 mod transfers_out;
 mod worker_transfers;
 mod worker_ctx;
-#[cfg(target_os = "linux")]
+// Available everywhere: ForgetPeer / ForgetAll need no radio — they are a trust
+// store delete, a cache purge and a LAN revoke, all of which work on any
+// platform. Only Scan and Pair inside it are Linux-gated, since those two are
+// the ones that hold a BlueZ adapter.
 mod cmd_pairing;
 #[cfg(target_os = "linux")]
 mod cmd_earbuds;

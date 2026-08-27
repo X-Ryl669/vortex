@@ -34,9 +34,10 @@ use crate::sms::{self, spawn_consumer as spawn_sms_consumer};
 use crate::{
     notifications, worker_ctx, BLE_RETRY_NUDGE, CALL_MIRROR_TX, CALL_WRITER, SYNC_NUDGE,
 };
+use crate::cmd_pairing;
 // The UI commands that need a radio or an audio device.
 #[cfg(target_os = "linux")]
-use crate::{cmd_earbuds, cmd_pairing, earbuds};
+use crate::{cmd_earbuds, earbuds};
 
 #[tauri::command]
 pub fn start_scan(state: State<'_, CmdChannel>) -> Result<(), String> {
@@ -48,6 +49,7 @@ pub fn refresh_state(state: State<'_, CmdChannel>) -> Result<(), String> {
     state.0.send(UiCmd::RefreshState).map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
 pub fn start_screen_mirror(
     state: State<'_, CmdChannel>,
@@ -62,9 +64,36 @@ pub fn start_screen_mirror(
         .map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
 pub fn stop_screen_mirror(state: State<'_, CmdChannel>) -> Result<(), String> {
     state.0.send(UiCmd::StopMirror).map_err(|e| e.to_string())
+}
+
+/// Phone-screen mirroring needs the GStreamer pipeline and the GTK window that
+/// hosts its sink, both Linux-gated — so there is no handler for `StartMirror`
+/// off Linux and the worker would drop it.
+///
+/// The failure mode this replaces is the bad one: these used to send the command
+/// and return `Ok(())`, so the UI's mirror button reported success and then
+/// nothing happened at all. Same contract as every other unsupported command
+/// (see `platform_unsupported`) — say so, and let the UI show it.
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub fn start_screen_mirror(
+    _state: State<'_, CmdChannel>,
+    _width: u32,
+    _height: u32,
+    _fps: u32,
+    _bitrate: u32,
+) -> Result<(), String> {
+    Err(crate::platform_unsupported::UNSUPPORTED.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub fn stop_screen_mirror(_state: State<'_, CmdChannel>) -> Result<(), String> {
+    Err(crate::platform_unsupported::UNSUPPORTED.to_string())
 }
 
 // --------------------------------------------------------------------------
@@ -757,6 +786,16 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 // Pairing over the seam: scan for a pairable phone, then the
                 // same XX handshake and trust save the Linux path uses. The
                 // address the UI sends is ignored — see `pair_by_scan`.
+                // Forgetting a peer needs no radio: a trust-store delete, a
+                // cache purge, and a best-effort LAN revoke so the phone drops
+                // us too. These were Linux-only purely because the module they
+                // live in was, which left a Windows user with a paired-forever
+                // phone and no way back — the trust record is in Credential
+                // Manager, so there is no folder to delete either.
+                #[cfg(not(target_os = "linux"))]
+                UiCmd::ForgetPeer(hex_str) => cmd_pairing::forget_peer(&ctx, hex_str).await,
+                #[cfg(not(target_os = "linux"))]
+                UiCmd::ForgetAll => cmd_pairing::forget_all(&ctx).await,
                 // THE thing that unblocks the whole UI off Linux, and the
                 // reason the radar stayed empty even once `Scan` had a handler.
                 //
