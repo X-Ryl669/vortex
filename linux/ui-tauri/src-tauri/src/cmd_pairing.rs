@@ -163,6 +163,11 @@ struct SwitchCandidateDto {
 /// command loop is strictly sequential — awaiting a 45 s scan here would stall
 /// every other command behind it, including the 5 s earbuds heartbeat. Same
 /// reason `UiCmd::Scan` spawns rather than awaiting.
+/// Linux-only: it drives a BlueZ discovery to find the other trusted peers
+/// on air. The seam has no multi-peer scan yet, so the dispatcher off Linux
+/// simply has no arm for `SwitchPeer` — `ActivatePeer` still works, so a peer
+/// already known can be made active there.
+#[cfg(target_os = "linux")]
 pub(crate) fn switch_peer(ctx: &WorkerCtx) {
     // A second press while a window is open is a no-op rather than a second
     // scan: two concurrent discoveries would fight over the adapter.
@@ -370,6 +375,10 @@ pub(crate) async fn forget_peer(ctx: &WorkerCtx, hex_str: String) {
     // (added by hand in the desktop's Bluetooth panel, or by an older build),
     // this drops it, which is what keeps the two sides from ending up in the
     // one-sided-bond state that fails with `timeout: service discovery`.
+    // BlueZ-specific, so Linux-only: the stale device object and any bond are
+    // BlueZ concepts. Everything else in this handler — the trust delete, the
+    // cache purge, the revoke — is what makes forgetting work off Linux too.
+    #[cfg(target_os = "linux")]
     if let Some(addr) = crate::ble::take_peer_addr(&arr) {
         crate::ble::forget_stale_device(&ctx.adapter, addr).await;
     }
@@ -442,6 +451,7 @@ pub(crate) async fn forget_all(ctx: &WorkerCtx) {
     .await;
     // Same BlueZ + per-peer cache cleanup as `forget_peer`, for every peer.
     for peer_pub in &pubs {
+        #[cfg(target_os = "linux")]
         if let Some(addr) = crate::ble::take_peer_addr(peer_pub) {
             crate::ble::forget_stale_device(&ctx.adapter, addr).await;
         }

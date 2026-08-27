@@ -530,7 +530,10 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 clipboard_image: ble_clipboard_image_tx.clone(),
                 clipboard_offer: ble_clipboard_offer_tx.clone(),
                 handoff: ble_handoff_tx.clone(),
-                raw: ble_notes_tx.clone(),
+                // The dispatcher's input, not notes' — peer-handoff frames are
+                // taken in front and the rest forwarded on, so the seam loop has
+                // to enter at the same point the BlueZ loop does.
+                raw: ble_raw_tx.clone(),
             };
             let writers = crate::ble_portable::BleWriterSlots {
                 notif: ble_notif_writer.clone(),
