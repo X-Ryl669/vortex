@@ -59,6 +59,7 @@ import com.vortex.a3.ui.components.CardCorner
 import com.vortex.a3.ui.components.EarbudsCard
 import com.vortex.a3.ui.components.EarbudsPickerDialog
 import com.vortex.a3.ui.components.HintCard
+import com.vortex.a3.ui.components.OtherPeersCard
 import com.vortex.a3.ui.components.PeerDeviceCard
 import com.vortex.a3.ui.components.SurfaceCard
 import com.vortex.a3.ui.components.VortexDivider
@@ -90,6 +91,7 @@ fun HomeScreen(
     onAddPair: () -> Unit,
     onCancelAddPair: () -> Unit,
     onSwitchLaptop: () -> Unit,
+    onSwitchToPeer: (TrustedPeer) -> Unit,
     seekingLaptop: Boolean,
     onOpenAutostart: () -> Unit,
     onDismissAutostartHint: () -> Unit,
@@ -296,6 +298,17 @@ fun HomeScreen(
                         onRemoveSaved = onRemoveSavedEarbuds,
                     )
                 }
+
+                // Every other paired laptop, tappable to switch to it.
+                // Compact rows: a 180 dp card each would push the rest of the
+                // screen away for what is mostly "this one exists".
+                OtherPeersCard(
+                    peers = peers.filter { it !== primaryPeer },
+                    lastSeen = peerLastSeen,
+                    now = now,
+                    seeking = seekingLaptop,
+                    onSwitchTo = onSwitchToPeer,
+                )
 
                 // "Pair another laptop". A pairable window preempts the
                 // trusted-presence beacon (one advertising set), so it is
