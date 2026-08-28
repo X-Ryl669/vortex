@@ -1030,7 +1030,8 @@ pub(crate) async fn try_lan_reconnect(
                     dispatch_appstate_call(&state.call);
                     // Additive browsing-handoff path (LAN backstop): the page the
                     // phone is on → the "continue" pill survives a BLE drop and
-                    // stays fresh. Consumer dedups by URL.
+                    // stays fresh. Re-delivered on EVERY heartbeat, so a Share
+                    // carried here is opened once (consumer dedups by request id).
                     crate::handoff::dispatch_appstate_handoff(&state.handoff);
                     // Laptop→phone screen mirror: start/stop casting our screen
                     // off the phone's view-request level (edge-tracked).

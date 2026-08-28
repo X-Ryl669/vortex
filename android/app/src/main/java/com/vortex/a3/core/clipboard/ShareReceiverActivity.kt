@@ -38,7 +38,16 @@ class ShareReceiverActivity : Activity() {
                 val title = intent.getStringExtra(Intent.EXTRA_SUBJECT)
                     ?.takeIf { it.isNotBlank() } ?: ""
                 VortexService.handoffBus.tryEmit(
-                    com.vortex.a3.core.handoff.HandoffEvent(url = url, title = title, openNow = true),
+                    com.vortex.a3.core.handoff.HandoffEvent(
+                        url = url,
+                        title = title,
+                        openNow = true,
+                        // Identifies THIS share so the laptop opens it once, no
+                        // matter how many transports and heartbeats deliver it.
+                        // A fresh id per share is what keeps re-sharing the same
+                        // page working (the laptop dedups on the id, not the URL).
+                        id = java.util.UUID.randomUUID().toString(),
+                    ),
                 )
                 Log.i(TAG, "share: forwarded a page to the laptop")
                 Toast.makeText(this, "Opening on laptop…", Toast.LENGTH_SHORT).show()
