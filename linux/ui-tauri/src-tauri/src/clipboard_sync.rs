@@ -31,6 +31,19 @@ pub(crate) type ClipboardWriter = std::sync::Arc<
         + Sync,
 >;
 
+/// How often an undelivered copy is re-offered to the link.
+///
+/// Only does work when something is actually pending, so the cost of a short
+/// period is one comparison every couple of seconds.
+const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long an undelivered copy keeps trying before it is abandoned.
+///
+/// Long enough to outlast every ordinary gap — the BLE reconnect backoff caps
+/// at 60 s, plus scan time — and short enough that a copy made before lunch
+/// does not silently overwrite the phone's clipboard on the next reconnect.
+const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Whether laptop↔phone clipboard sync is on. Default ON (user decision).
 /// Local toggle in Settings; checked by both the send and receive paths.
 pub(crate) static CLIPBOARD_SYNC: AtomicBool = AtomicBool::new(true);
@@ -209,27 +222,58 @@ pub(crate) fn spawn_clipboard_sync(
     {
         let writer = writer.clone();
         tokio::spawn(async move {
-            while let Some(text) = send_rx.recv().await {
-                if !CLIPBOARD_SYNC.load(Ordering::Relaxed) {
+            // The newest copy that has not reached the phone yet.
+            //
+            // One slot rather than a queue, because a clipboard is
+            // last-write-wins: if three things were copied while the link was
+            // down, the phone wants the third — not all three arriving in a
+            // burst, with the oldest landing last.
+            let mut pending: Option<(String, String, std::time::Instant)> = None;
+            let mut retry = tokio::time::interval(RETRY_EVERY);
+            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    got = send_rx.recv() => {
+                        let Some(text) = got else { break };
+                        if !CLIPBOARD_SYNC.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let sig = sync_sig(&text);
+                        // Loop guard: don't bounce back what we just set from a
+                        // received sync.
+                        if LAST_SYNC_SIG.lock().map(|g| *g == sig).unwrap_or(false) {
+                            continue;
+                        }
+                        pending = Some((text, sig, std::time::Instant::now()));
+                    }
+                    _ = retry.tick() => {}
+                }
+                let Some((text, sig, queued_at)) = pending.clone() else { continue };
+                if queued_at.elapsed() > PENDING_TTL {
+                    tracing::info!("clipboard: copy too old to sync; dropped");
+                    pending = None;
                     continue;
                 }
-                let sig = sync_sig(&text);
-                // Loop guard: don't bounce back what we just set from a
-                // received sync.
-                if LAST_SYNC_SIG.lock().map(|g| *g == sig).unwrap_or(false) {
-                    continue;
-                }
-                let Some(w) = writer.lock().await.clone() else {
-                    continue; // no live link — drop (ephemeral)
-                };
+                // BLE is the ONLY laptop→phone clipboard transport (LAN carries
+                // the phone→laptop direction and images), and this writer exists
+                // only while the GATT link is up. It used to `continue` here and
+                // drop the copy, so anything copied while the link was down —
+                // reconnect backoff, an RPA rotation, the phone's screen off —
+                // vanished with no trace. That is why roughly one copy in ten
+                // arrived: the ones that happened to coincide with a live link.
+                // Now it waits for the link instead.
+                let Some(w) = writer.lock().await.clone() else { continue };
                 match w(ClipboardMirror::new(text, now_ms())).await {
                     Ok(()) => {
+                        pending = None;
                         if let Ok(mut g) = LAST_SYNC_SIG.lock() {
                             *g = sig;
                         }
                         tracing::debug!("→ clipboard synced to phone");
                     }
-                    Err(e) => tracing::warn!("clipboard sync send failed: {e}"),
+                    // Stays pending: a write that failed on a link which was up
+                    // a moment ago is the case most worth another attempt.
+                    Err(e) => tracing::warn!("clipboard sync send failed (will retry): {e}"),
                 }
             }
         });
@@ -275,24 +319,44 @@ pub(crate) fn spawn_clipboard_sync(
     {
         let img_writer = img_writer.clone();
         tokio::spawn(async move {
-            while let Some((sig, png)) = img_send_rx.recv().await {
-                if !CLIPBOARD_SYNC.load(Ordering::Relaxed) {
+            // Same hold-the-newest rule as the text path above, and the same
+            // reason. One image at a time: these are already capped at
+            // `MAX_BLE_IMAGE_BYTES`, so a single slot is bounded memory.
+            let mut pending: Option<(String, Vec<u8>, std::time::Instant)> = None;
+            let mut retry = tokio::time::interval(RETRY_EVERY);
+            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    got = img_send_rx.recv() => {
+                        let Some((sig, png)) = got else { break };
+                        if !CLIPBOARD_SYNC.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        if LAST_SYNC_IMG.lock().map(|g| *g == sig).unwrap_or(false) {
+                            continue; // loop guard — just set from a received sync
+                        }
+                        pending = Some((sig, png, std::time::Instant::now()));
+                    }
+                    _ = retry.tick() => {}
+                }
+                let Some((sig, png, queued_at)) = pending.clone() else { continue };
+                if queued_at.elapsed() > PENDING_TTL {
+                    tracing::info!("clipboard: copied image too old to sync; dropped");
+                    pending = None;
                     continue;
                 }
-                if LAST_SYNC_IMG.lock().map(|g| *g == sig).unwrap_or(false) {
-                    continue; // loop guard — just set from a received sync
-                }
-                let Some(w) = img_writer.lock().await.clone() else {
-                    continue; // no live link
-                };
+                let Some(w) = img_writer.lock().await.clone() else { continue };
                 match w(png).await {
                     Ok(()) => {
+                        pending = None;
                         if let Ok(mut g) = LAST_SYNC_IMG.lock() {
                             *g = sig;
                         }
                         tracing::debug!("→ clipboard image synced to phone");
                     }
-                    Err(e) => tracing::warn!("clipboard image sync send failed: {e}"),
+                    Err(e) => {
+                        tracing::warn!("clipboard image sync send failed (will retry): {e}")
+                    }
                 }
             }
         });

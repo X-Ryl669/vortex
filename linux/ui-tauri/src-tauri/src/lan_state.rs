@@ -127,6 +127,7 @@ pub(crate) fn dispatch_appstate_call(
 
 pub(crate) fn spawn_state_consumer(
     app: AppHandle,
+    peer_store: std::sync::Arc<dyn vortex_l3_daemon::core::storage::peers::PeerStore>,
 ) -> tokio::sync::mpsc::UnboundedSender<([u8; 32], vortex_l3_daemon::core::appstate::AppState)> {
             let (ble_state_tx, mut ble_state_rx) = tokio::sync::mpsc::unbounded_channel::<(
                 [u8; 32],
@@ -134,6 +135,7 @@ pub(crate) fn spawn_state_consumer(
             )>();
             {
                 let app_state = app.clone();
+                let peer_store = peer_store.clone();
                 tokio::spawn(async move {
                     use tauri::Emitter;
                     // One bluer adapter for the whole consumer (a fresh
@@ -156,6 +158,25 @@ pub(crate) fn spawn_state_consumer(
                         // BLE-carried hint is the only way the cache tracks a
                         // DHCP renew / network change.
                         crate::lan::note_peer_reported_ip(&state);
+                        // Bidirectional forget, on THIS path too. The phone sets
+                        // `revoked` in the snapshot it pushes over both
+                        // transports, but only the LAN heartbeat in `lan.rs` was
+                        // acting on it — so forgetting the laptop on the phone
+                        // left the laptop still trusting it whenever the revoke
+                        // did not happen to land over LAN inside the phone's
+                        // 1.5 s grace window (different network, mDNS not yet
+                        // resolved, or simply a BLE-only moment). BLE carries
+                        // the same flag reliably; honour it here and stop
+                        // reading the peer's own snapshots afterwards.
+                        if state.revoked {
+                            tracing::info!(
+                                "peer revoked us (via BLE); forgetting {}",
+                                hex::encode(&peer_pub[..8])
+                            );
+                            let _ = peer_store.forget(&peer_pub);
+                            crate::emit_peers(&app_state, peer_store.clone()).await;
+                            continue;
+                        }
                         // Vue UI — identical event to the LAN heartbeat path.
                         // Also feed the call carried in this STATE frame (a
                         // backstop if a dedicated CALL frame was dropped).
