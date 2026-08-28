@@ -317,12 +317,14 @@ async fn send_release(peer_pub: &[u8; 32], successor_name: Option<String>) {
     // "moved to <name>". Empty when unknown — the sub code is what carries
     // meaning, so an absent name must not change behaviour.
     let payload = successor_name.unwrap_or_default().into_bytes();
-    // The sealed writer takes only a frame type, so the kind rides as the first
-    // payload byte rather than Frame.sub. Receivers read it back the same way.
+    // The kind rides as the first payload byte rather than in Frame.sub. The
+    // sealed writer does now expose `sub` (the filesystem ops needed it), but
+    // this is a shipped wire format and both ends already read it back this
+    // way — changing it would only break compatibility for tidiness.
     let mut body = Vec::with_capacity(payload.len() + 1);
     body.push(sub::HANDOFF_RELEASE);
     body.extend_from_slice(&payload);
-    match writer(ty::PEER_HANDOFF, body).await {
+    match writer(ty::PEER_HANDOFF, 0, body).await {
         Ok(()) => tracing::info!(
             peer = %hex::encode(&peer_pub[..4]),
             "sent PeerHandoff.RELEASE to the displaced peer"

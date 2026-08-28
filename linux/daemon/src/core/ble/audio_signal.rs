@@ -135,7 +135,7 @@ pub async fn run_listener(
     // peer", which is unactionable without knowing whose statement it is.
     // Inferring it from "whoever is active right now" would be a guess.
     raw_frame_tx: Option<
-        tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)>,
+        tokio::sync::mpsc::UnboundedSender<crate::core::ble::frame::RawFrame>,
     >,
 ) -> Result<(), String> {
     if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
@@ -234,6 +234,10 @@ pub async fn run_listener(
             && frame.ty != ty::HANDOFF
             && frame.ty != ty::NOTES_SYNC
             && frame.ty != ty::PEER_HANDOFF
+            && frame.ty != ty::FS_REQ
+            && frame.ty != ty::FS_META
+            && frame.ty != ty::FS_DATA
+            && frame.ty != ty::FS_ERR
         {
             warn!(
                 "audio-signal unexpected frame ty=0x{:02x}; ignoring",
@@ -593,7 +597,12 @@ pub async fn run_listener(
         // forward it raw to its own module. No feature logic in this file.
         if frame.ty != ty::AUDIO_OP {
             if let Some(tx) = raw_frame_tx.as_ref() {
-                let _ = tx.send((peer_pub, frame.ty, plain[..n].to_vec()));
+                let _ = tx.send(crate::core::ble::frame::RawFrame {
+                    peer_pub,
+                    ty: frame.ty,
+                    sub: frame.sub,
+                    payload: plain[..n].to_vec(),
+                });
             }
             continue;
         }
@@ -776,6 +785,7 @@ pub async fn write_sealed(
     link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     ty: u8,
+    sub: u8,
     payload: &[u8],
 ) -> Result<(), String> {
     if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
@@ -787,7 +797,7 @@ pub async fn write_sealed(
         .write_message(payload, &mut ct)
         .map_err(|e| format!("sealed write_message: {e}"))?;
     ct.truncate(n);
-    let wire = Frame::new(ty, 0, ct).encode();
+    let wire = Frame::new(ty, sub, ct).encode();
     write_framed(link, &wire)
         .await
         .map_err(|e| format!("BLE write 0x{ty:02x} to AUDIO_SIGNAL: {e}"))?;
@@ -987,14 +997,14 @@ mod link_tests {
         link: Arc<FakeGattLink>,
         laptop: TransportState,
     ) -> (
-        tokio::sync::mpsc::UnboundedReceiver<([u8; 32], u8, Vec<u8>)>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::core::ble::frame::RawFrame>,
         tokio::task::JoinHandle<Result<(), String>>,
     ) {
         // Per-peer: the listener stamps every raw frame with the peer it came
         // from, so a multi-peer consumer knows whose statement it is. The
         // listener below is given the all-zero key, so that is what arrives.
         let (raw_tx, raw_rx) =
-            tokio::sync::mpsc::unbounded_channel::<([u8; 32], u8, Vec<u8>)>();
+            tokio::sync::mpsc::unbounded_channel::<crate::core::ble::frame::RawFrame>();
         let handle = tokio::spawn(async move {
             run_listener(
                 &*link,
@@ -1032,8 +1042,9 @@ mod link_tests {
             AUDIO_SIGNAL_UUID.as_u128(),
             phone_frame(&mut phone, ty::NOTES_SYNC, b"first"),
         );
+        let got = raw_rx.recv().await.unwrap();
         assert_eq!(
-            raw_rx.recv().await.unwrap(),
+            (got.peer_pub, got.ty, got.payload),
             ([0u8; 32], ty::NOTES_SYNC, b"first".to_vec())
         );
 
@@ -1046,11 +1057,11 @@ mod link_tests {
             AUDIO_SIGNAL_UUID.as_u128(),
             phone_frame(&mut phone, ty::NOTES_SYNC, b"third"),
         );
-        let (_peer, ty_byte, payload) = tokio::time::timeout(Duration::from_secs(2), raw_rx.recv())
+        let got = tokio::time::timeout(Duration::from_secs(2), raw_rx.recv())
             .await
             .expect("must not hang")
             .expect("must not close");
-        assert_eq!((ty_byte, payload), (ty::NOTES_SYNC, b"third".to_vec()));
+        assert_eq!((got.ty, got.payload), (ty::NOTES_SYNC, b"third".to_vec()));
         assert!(
             RESYNC_EVENTS.load(Ordering::Relaxed) > before,
             "the recovery must be counted, not silent"
@@ -1079,8 +1090,9 @@ mod link_tests {
             AUDIO_SIGNAL_UUID.as_u128(),
             phone_frame(&mut phone, ty::NOTES_SYNC, b"ok"),
         );
+        let got = raw_rx.recv().await.unwrap();
         assert_eq!(
-            raw_rx.recv().await.unwrap(),
+            (got.peer_pub, got.ty, got.payload),
             ([0u8; 32], ty::NOTES_SYNC, b"ok".to_vec())
         );
         handle.abort();

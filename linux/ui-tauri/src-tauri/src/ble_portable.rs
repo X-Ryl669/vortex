@@ -71,7 +71,7 @@ pub(crate) struct BleSinks {
     /// Additive frames, stamped with the peer they came from — the listener
     /// carries the sender's key so a multi-peer consumer knows whose statement
     /// it is rather than inferring it from whoever is active.
-    pub raw: tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)>,
+    pub raw: tokio::sync::mpsc::UnboundedSender<vortex_l3_daemon::core::ble::frame::RawFrame>,
 }
 
 /// The laptop→phone writer holders the features send through. Filled on connect,
@@ -351,15 +351,19 @@ async fn publish_writers(
     {
         let t = transport.clone();
         let l = link.clone();
-        let w: crate::SealedWriter = Arc::new(move |ty, payload| {
+        let w: crate::SealedWriter = Arc::new(move |ty, sub, payload| {
             let (t, l) = (t.clone(), l.clone());
-            Box::pin(async move { audio_signal::write_sealed(&*l, t, ty, &payload).await })
+            Box::pin(async move { audio_signal::write_sealed(&*l, t, ty, sub, &payload).await })
         });
         *writers.sealed.lock().await = Some(w);
     }
 }
 
 async fn clear_writers(writers: &BleWriterSlots) {
+    // Session over: the phone's handles on our files no longer resolve, and our
+    // own in-flight requests will never be answered. Fail both loudly rather
+    // than leaving a mount blocked forever.
+    crate::fs_link::clear_handles();
     *writers.notif.lock().await = None;
     *writers.clipboard.lock().await = None;
     *writers.clipboard_image.lock().await = None;

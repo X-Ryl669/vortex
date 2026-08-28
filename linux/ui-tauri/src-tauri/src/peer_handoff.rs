@@ -25,21 +25,32 @@ use vortex_l3_daemon::core::storage::peers::PeerStore;
 pub(crate) fn spawn_dispatcher(
     app: AppHandle,
     peer_store: Arc<dyn PeerStore>,
-    notes_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)>,
-) -> tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)> {
+    notes_tx: tokio::sync::mpsc::UnboundedSender<vortex_l3_daemon::core::ble::frame::RawFrame>,
+) -> tokio::sync::mpsc::UnboundedSender<vortex_l3_daemon::core::ble::frame::RawFrame> {
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<([u8; 32], u8, Vec<u8>)>();
+        tokio::sync::mpsc::unbounded_channel::<vortex_l3_daemon::core::ble::frame::RawFrame>();
     tokio::spawn(async move {
-        while let Some((peer_pub, frame_ty, payload)) = rx.recv().await {
-            if frame_ty != ty::PEER_HANDOFF {
-                // Not ours — pass it along. A closed notes channel means the
-                // app is shutting down; stop rather than spin.
-                if notes_tx.send((peer_pub, frame_ty, payload)).is_err() {
-                    break;
-                }
+        while let Some(f) = rx.recv().await {
+            if f.ty == ty::PEER_HANDOFF {
+                handle(&app, &peer_store, f.peer_pub, &f.payload).await;
                 continue;
             }
-            handle(&app, &peer_store, peer_pub, &payload).await;
+            // Filesystem ops (both an inbound request to serve and a reply to
+            // one of ours) go to their own module. Routed here rather than
+            // downstream of notes so a large READ reply never queues behind a
+            // notes merge.
+            if matches!(
+                f.ty,
+                ty::FS_REQ | ty::FS_META | ty::FS_DATA | ty::FS_ERR
+            ) {
+                crate::fs_link::dispatch(f);
+                continue;
+            }
+            // Not ours — pass it along. A closed notes channel means the
+            // app is shutting down; stop rather than spin.
+            if notes_tx.send(f).is_err() {
+                break;
+            }
         }
     });
     tx
