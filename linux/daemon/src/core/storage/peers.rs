@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use secret_service::{EncryptionType, SecretService};
 
-use super::{StorageError, StorageResult};
+use super::{unlocked_default_collection, StorageError, StorageResult};
 
 const SCHEMA: &str = "com.vortex.peer.v1";
 const LABEL: &str = "Vortex V1 trusted peer";
@@ -297,10 +297,7 @@ impl SecretServicePeerStore {
             let svc = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| StorageError::Backend(format!("connect: {e}")))?;
-            let coll = svc
-                .get_default_collection()
-                .await
-                .map_err(|e| StorageError::Backend(format!("collection: {e}")))?;
+            let coll = unlocked_default_collection(&svc).await?;
             let mut search = svc
                 .search_items(attrs_ref.clone())
                 .await
@@ -367,10 +364,7 @@ impl PeerStore for SecretServicePeerStore {
             let svc = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| StorageError::Backend(format!("connect: {e}")))?;
-            let coll = svc
-                .get_default_collection()
-                .await
-                .map_err(|e| StorageError::Backend(format!("collection: {e}")))?;
+            let coll = unlocked_default_collection(&svc).await?;
             // Dedupe: explicitly remove any prior items for this
             // peer_static_pub before creating. The `replace=true` flag
             // on create_item alone is unreliable across Secret Service
@@ -613,10 +607,7 @@ impl PeerStore for SecretServicePeerStore {
             let svc = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| StorageError::Backend(format!("connect: {e}")))?;
-            let coll = svc
-                .get_default_collection()
-                .await
-                .map_err(|e| StorageError::Backend(format!("collection: {e}")))?;
+            let coll = unlocked_default_collection(&svc).await?;
             // Single-record upsert: drop any existing then create one.
             let mut existing = svc
                 .search_items(attrs_ref)
@@ -653,10 +644,7 @@ impl PeerStore for SecretServicePeerStore {
             let svc = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| StorageError::Backend(format!("connect: {e}")))?;
-            let coll = svc
-                .get_default_collection()
-                .await
-                .map_err(|e| StorageError::Backend(format!("collection: {e}")))?;
+            let coll = unlocked_default_collection(&svc).await?;
             // Read current.
             let mut search = svc
                 .search_items(attrs_ref.clone())

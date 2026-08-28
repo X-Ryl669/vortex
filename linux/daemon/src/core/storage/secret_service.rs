@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use secret_service::{EncryptionType, SecretService};
 
-use super::{IdentityStore, StorageError, StorageResult};
+use super::{unlocked_default_collection, IdentityStore, StorageError, StorageResult};
 use crate::core::crypto::x25519::{X25519Pub, X25519Sec, X25519SecBytes};
 use crate::core::identity::{IdentityRecord, Platform, IDENTITY_VERSION};
 
@@ -97,10 +97,7 @@ impl IdentityStore for SecretServiceIdentityStore {
             let service = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| StorageError::Backend(format!("connect: {e}")))?;
-            let collection = service
-                .get_default_collection()
-                .await
-                .map_err(|e| StorageError::Backend(format!("collection: {e}")))?;
+            let collection = unlocked_default_collection(&service).await?;
             collection
                 .create_item(LABEL, attrs(), &payload, true /* replace */, CONTENT_TYPE)
                 .await

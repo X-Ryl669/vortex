@@ -68,6 +68,11 @@ where
 pub enum StorageError {
     NotFound,
     Backend(String),
+    /// The desktop keyring is locked and the unlock was refused, dismissed,
+    /// or impossible (no prompter on the session bus). Distinct from
+    /// [`Self::Backend`] because it is the one storage failure the *user*
+    /// can fix, so callers surface it instead of dying silently.
+    Locked(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -75,6 +80,7 @@ impl std::fmt::Display for StorageError {
         match self {
             Self::NotFound => write!(f, "not found"),
             Self::Backend(msg) => write!(f, "backend error: {msg}"),
+            Self::Locked(msg) => write!(f, "keyring locked: {msg}"),
         }
     }
 }
@@ -82,6 +88,56 @@ impl std::fmt::Display for StorageError {
 impl std::error::Error for StorageError {}
 
 pub type StorageResult<T> = Result<T, StorageError>;
+
+/// Fetch the default collection, unlocking it first when the session's
+/// keyring has it locked.
+///
+/// **Why this is not just `get_default_collection()`:** that call succeeds
+/// on a *locked* collection — only the write that follows fails, with
+/// `org.freedesktop.Secret.Error.IsLocked`. So the availability probe in
+/// each store's `new()` passes and the process dies later, at first save,
+/// with an error nobody attributes to the keyring.
+///
+/// That is the *normal* state on any session whose `default` alias points
+/// at a keyring PAM does not unlock at login. Live-hit on Manjaro/KDE
+/// 2026-08-25: gnome-keyring owned `org.freedesktop.secrets` (its D-Bus
+/// service file wins over KDE's ksecretd), its `login` keyring was
+/// unlocked, but the `default` alias pointed at a second, password-
+/// protected keyring. Identity init failed, the Tauri worker returned
+/// before it ever opened the BLE adapter, and the pairing radar sat
+/// silently empty — the phone was advertising correctly the whole time.
+///
+/// [`secret_service::Collection::unlock`] drives the Secret Service
+/// Unlock + Prompt handshake, so the desktop's own prompter asks for the
+/// password (gcr on GNOME, ksecretd/KWallet on KDE). Two constraints
+/// follow from the D-Bus API and both are satisfied by construction here:
+///
+/// 1. The prompt object is owned by the **calling connection** and is
+///    destroyed with it, so the unlock must share one connection with the
+///    write it enables — i.e. live inside the same [`secret_block_on`]
+///    future. (Splitting them across two `busctl` calls fails with
+///    "no such object", which is how this was first confirmed.)
+/// 2. It costs one extra round trip, not a prompt, once the collection is
+///    unlocked: the service returns the path in `unlocked` and
+///    `lock_or_unlock` skips the prompt entirely. Safe to call before
+///    every write rather than tracking unlock state ourselves.
+// `::secret_service` — the absolute crate path is required here: the sibling
+// module `storage::secret_service` shadows the crate name inside this module.
+pub(crate) async fn unlocked_default_collection<'a>(
+    service: &'a ::secret_service::SecretService<'a>,
+) -> StorageResult<::secret_service::Collection<'a>> {
+    let collection = service
+        .get_default_collection()
+        .await
+        .map_err(|e| StorageError::Backend(format!("default collection: {e}")))?;
+    if collection.is_locked().await.unwrap_or(false) {
+        collection
+            .unlock()
+            .await
+            .map_err(|e| StorageError::Locked(format!("unlock refused or unavailable: {e}")))?;
+    }
+    Ok(collection)
+}
 
 /// Storage backend for local Vortex identity (private + public material).
 ///
