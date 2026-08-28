@@ -14,6 +14,25 @@
 /// Header size in bytes.
 pub const FRAME_HEADER_LEN: usize = 4;
 
+/// An additive feature frame, opened and forwarded to whichever module owns it.
+///
+/// A named struct rather than a tuple because `sub` had to be threaded through
+/// for the filesystem ops (`FS_REQ` carries its op there), and a signature with
+/// two adjacent `u8`s is a transposition waiting to happen — `(ty, sub)` and
+/// `(sub, ty)` both compile and only one is right.
+///
+/// `peer_pub` is part of it because a frame's meaning can depend on WHO sent
+/// it: `PEER_HANDOFF` says "you are no longer my active peer", which is
+/// unactionable without knowing whose statement it is, and an `FS_REQ` handle
+/// belongs to one peer's table and not another's.
+#[derive(Debug, Clone)]
+pub struct RawFrame {
+    pub peer_pub: [u8; 32],
+    pub ty: u8,
+    pub sub: u8,
+    pub payload: Vec<u8>,
+}
+
 /// Per spec §11. Larger frames are a `bad-frame` error. Sized to admit a
 /// 48 KiB LAN file-transfer chunk + AEAD tag (BLE notifies stay MTU-small
 /// regardless; the `length` field is u16 so the hard ceiling is 65535).

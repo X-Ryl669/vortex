@@ -743,7 +743,7 @@ pub(crate) async fn run_ble_persistent_loop(
     >,
     // Generic additive-frame channel (e.g. NOTES_SYNC) — the listener forwards
     // (frame_ty, payload) here; the owning feature module filters + handles it.
-    raw_frame_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)>,
+    raw_frame_tx: tokio::sync::mpsc::UnboundedSender<vortex_l3_daemon::core::ble::frame::RawFrame>,
     notif_writer: Arc<tokio::sync::Mutex<Option<NotifWriter>>>,
     clipboard_writer: Arc<tokio::sync::Mutex<Option<crate::ClipboardWriter>>>,
     clipboard_image_writer: Arc<tokio::sync::Mutex<Option<crate::ClipboardImageWriter>>>,
@@ -1064,11 +1064,11 @@ pub(crate) async fn run_ble_persistent_loop(
         {
             let sw_transport = transport.clone();
             let sw_client = link_arc.clone();
-            let writer: crate::SealedWriter = Arc::new(move |ty, payload| {
+            let writer: crate::SealedWriter = Arc::new(move |ty, sub, payload| {
                 let transport = sw_transport.clone();
                 let link = sw_client.clone();
                 Box::pin(async move {
-                    audio_signal::write_sealed(&*link, transport, ty, &payload).await
+                    audio_signal::write_sealed(&*link, transport, ty, sub, &payload).await
                 })
             });
             *sealed_writer.lock().await = Some(writer);
@@ -1293,6 +1293,10 @@ pub(crate) async fn run_ble_persistent_loop(
         *clipboard_image_writer.lock().await = None;
         // Drop the call-control writer too.
         *call_writer.lock().await = None;
+        // Every filesystem handle the phone held is now unresolvable, and
+        // anything waiting on a reply will never get one. Dropping both turns
+        // what would be a hung mount into an honest I/O error.
+        crate::fs_link::clear_handles();
 
         // Wake the LAN heartbeat NOW: with BLE down it's the only liveness /
         // hand-off path again, and its relaxed BLE-alive cadence would

@@ -385,6 +385,10 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // The generic additive-frame channel is single-consumer and notes used to
         // own it. Put the peer-handoff dispatcher in front: it takes the frames it
         // handles and forwards the rest to notes unchanged.
+        // Ranged filesystem, both ways: serves the phone's FS_REQs against
+        // this laptop's roots, and correlates replies to requests we issue.
+        // Shares the same sealed writer — the ops are just frames.
+        crate::fs_link::init(ble_sealed_writer.clone());
         let ble_raw_tx = crate::peer_handoff::spawn_dispatcher(
             app.clone(),
             peer_store.clone(),

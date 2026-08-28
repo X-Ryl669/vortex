@@ -305,6 +305,16 @@ pub fn encode_data(id: u32, offset: u64, eof: bool, bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// An owned read result, so a consumer is not tied to the frame buffer's
+/// lifetime. Mirrors Kotlin `FsData`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FsData {
+    pub id: u32,
+    pub offset: u64,
+    pub eof: bool,
+    pub bytes: Vec<u8>,
+}
+
 /// Parse an `FS_DATA` payload into `(id, offset, eof, bytes)`.
 pub fn decode_data(p: &[u8]) -> Option<(u32, u64, bool, &[u8])> {
     if p.len() < DATA_HEADER_LEN {

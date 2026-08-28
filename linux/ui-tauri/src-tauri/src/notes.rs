@@ -260,7 +260,7 @@ async fn send_full(writer: &Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>>
     let w = { writer.lock().await.clone() };
     let Some(w) = w else { return };
     for chunk in build_chunks(items) {
-        if w(NOTES_FRAME, chunk).await.is_err() {
+        if w(NOTES_FRAME, 0, chunk).await.is_err() {
             break;
         }
     }
@@ -273,7 +273,7 @@ async fn send_full(writer: &Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>>
 pub(crate) fn spawn_sync(
     app: AppHandle,
     writer: Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>>,
-) -> tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)> {
+) -> tokio::sync::mpsc::UnboundedSender<vortex_l3_daemon::core::ble::frame::RawFrame> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let _ = NOTES_DIRTY.set(notify.clone());
 
@@ -289,15 +289,16 @@ pub(crate) fn spawn_sync(
         });
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<([u8; 32], u8, Vec<u8>)>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<vortex_l3_daemon::core::ble::frame::RawFrame>();
     tokio::spawn(async move {
         let mut asm = Assembler::default();
         // Notes are one shared list across devices, so WHICH peer sent a
         // chunk does not change the merge — ignore the identity here.
-        while let Some((_peer_pub, ty, payload)) = rx.recv().await {
-            if ty != NOTES_FRAME {
+        while let Some(f) = rx.recv().await {
+            if f.ty != NOTES_FRAME {
                 continue; // the raw channel is generic — ignore other features
             }
+            let payload = f.payload;
             let Some((total, idx, data)) = parse_chunk(&payload) else {
                 continue;
             };

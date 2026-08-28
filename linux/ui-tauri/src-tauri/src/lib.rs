@@ -100,6 +100,8 @@ mod arbiter;
 mod mirror_inject;
 mod peer_cache;
 mod peer_handoff;
+/// The laptop's end of the ranged-filesystem protocol (serves and consumes).
+mod fs_link;
 #[cfg(target_os = "linux")]
 mod mirror_window;
 mod notes;
@@ -128,11 +130,16 @@ pub(crate) use clipboard_sync::{ClipboardImageWriter, ClipboardWriter};
 pub(crate) use ipc::{app_state_to_dto, emit_peers, CmdChannel, UiCmd};
 pub(crate) use notifications::{NotifWriter, ACTIVE_CHAT};
 
-/// Generic laptop→phone sealed-frame writer: `(frame_ty, payload)` → an AEAD-
-/// sealed BLE frame. The BLE persistent loop fills the holder on connect; any
-/// feature (e.g. notes) sends through it without its own transport plumbing.
+/// Generic laptop→phone sealed-frame writer: `(frame_ty, sub, payload)` → an
+/// AEAD-sealed BLE frame. The BLE persistent loop fills the holder on connect;
+/// any feature (e.g. notes) sends through it without its own transport plumbing.
+///
+/// `sub` is exposed because the filesystem ops carry their op there — it has
+/// always been in the wire format, this writer just used to hardcode it to 0.
+/// Pass 0 for frame types that do not use it.
 pub(crate) type SealedWriter = Arc<
     dyn Fn(
+            u8,
             u8,
             Vec<u8>,
         )
