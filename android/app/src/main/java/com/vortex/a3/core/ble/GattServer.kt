@@ -737,6 +737,18 @@ class GattServer(
                 // state is preserved; reconnect state is dead either way.)
                 pairingOrchestrator?.forgetDeviceOnDisconnect(device)
                 reconnectOrchestrator?.forgetDevice(device)
+                // A CCCD subscription dies with the link: the central never gets
+                // to write 0x0000 on its way out. Leaving the device in these
+                // sets is not merely untidy — `linkedProvider` is keyed on
+                // [hasAudioSignalSubscriber], so a phantom subscriber makes the
+                // presence loop suspend advertising FOREVER. The phone then
+                // cannot be found by the very laptop it is waiting for, and
+                // only an app restart (which calls stop()) breaks the tie.
+                // Observed live: laptop app restarted at 20:08, phone silent
+                // for the next ten hours while LAN heartbeats kept flowing.
+                pairingSubscribers.remove(device)
+                reconnectSubscribers.remove(device)
+                audioSignalSubscribers.remove(device)
                 try { onPeerDisconnected(device) } catch (e: Exception) {
                     Log.w(TAG, "onPeerDisconnected hook threw: ${e.message}")
                 }
