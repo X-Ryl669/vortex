@@ -153,6 +153,27 @@ object FrameType {
      *  Additive: both sides log-and-ignore unknown frame types, so a peer
      *  without this build is unaffected. Mirrors Rust `ty::PEER_HANDOFF`. */
     const val PEER_HANDOFF: Byte = 0x4F
+    /** Ranged-filesystem request. `sub` carries the op
+     *  ([com.vortex.a3.core.fs.FsOp]), the payload a JSON request — plus a
+     *  binary byte tail for WRITE.
+     *
+     *  BIDIRECTIONAL and symmetric: this phone both serves these (so the
+     *  laptop can browse its storage) and sends them (so it can browse the
+     *  laptop's). Neither the frame nor its handler names a side. See
+     *  `docs/design/file-browsing.md`. Mirrors Rust `ty::FS_REQ`. */
+    const val FS_REQ: Byte = 0x50
+    /** Successful non-data reply — directory page, stat, open result, write
+     *  ack. Carries `FsReply` JSON. Mirrors Rust `ty::FS_META`. */
+    const val FS_META: Byte = 0x51
+    /** Read result: `[id u32 BE][offset u64 BE][flags u8][bytes]`. Binary, not
+     *  JSON: base64 would cost 33% on the protocol's hottest path. Mirrors
+     *  Rust `ty::FS_DATA`. */
+    const val FS_DATA: Byte = 0x52
+    /** A definite failure for one request id (`FsErr` JSON). Every failing op
+     *  answers with one — a file manager blocked on a read that will never be
+     *  answered is this feature's worst outcome, so silence is never valid.
+     *  Mirrors Rust `ty::FS_ERR`. */
+    const val FS_ERR: Byte = 0x53
     const val ERROR: Byte = 0x7F
 }
 

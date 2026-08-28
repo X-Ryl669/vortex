@@ -25,6 +25,10 @@ pub mod earbuds_store;
 pub mod smart_switch_store;
 pub mod clipboard_mirror;
 pub mod file_progress;
+/// Ranged-filesystem wire protocol (see `docs/design/file-browsing.md`).
+pub mod fs_proto;
+/// Serves [`fs_proto`] against this machine's files.
+pub mod fs_server;
 pub mod wifi_direct;
 pub mod outgoing_share;
 pub mod mirror_session;

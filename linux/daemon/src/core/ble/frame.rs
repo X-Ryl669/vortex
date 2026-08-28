@@ -183,6 +183,31 @@ pub mod ty {
     /// a peer without this build is unaffected. Mirrors Kotlin
     /// `FrameType.PEER_HANDOFF`.
     pub const PEER_HANDOFF: u8 = 0x4F;
+    /// Ranged-filesystem request. `sub` carries the op (`core::fs_proto::op`),
+    /// the payload a JSON request — plus a binary byte tail for `WRITE`.
+    ///
+    /// **Bidirectional and symmetric**: both peers serve these and both send
+    /// them. The laptop browses the phone's storage with the same frames the
+    /// phone browses the laptop's, so neither the frame nor its handler names a
+    /// side. See `docs/design/file-browsing.md`.
+    ///
+    /// Additive: an unknown frame type is logged and ignored on both sides, so
+    /// a peer without this build simply never answers and the requester times
+    /// out. Mirrors Kotlin `FrameType.FS_REQ`.
+    pub const FS_REQ: u8 = 0x50;
+    /// Successful non-data reply to an `FS_REQ` — directory page, stat, open
+    /// result or write ack. Carries `core::fs_proto::FsReply` JSON. Mirrors
+    /// Kotlin `FrameType.FS_META`.
+    pub const FS_META: u8 = 0x51;
+    /// Read result: `[id u32 BE][offset u64 BE][flags u8][bytes]`. Binary
+    /// rather than JSON because base64 would cost 33% on the hottest path in
+    /// the protocol. Mirrors Kotlin `FrameType.FS_DATA`.
+    pub const FS_DATA: u8 = 0x52;
+    /// A definite failure for one request id (`core::fs_proto::FsErr` JSON).
+    /// Every failing op answers with one: a file manager blocked on a read
+    /// that will never be answered is the worst outcome in this feature, so
+    /// silence is never a valid response. Mirrors Kotlin `FrameType.FS_ERR`.
+    pub const FS_ERR: u8 = 0x53;
     pub const ERROR: u8 = 0x7F;
 }
 
