@@ -82,6 +82,9 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      */
     @Volatile internal var activePeerPub: ByteArray? = null
     internal var gattServer: GattServer? = null
+    /** Open read handles held for the current peer's filesystem session, so
+     *  they can be dropped when the link goes. Null until [startFsServer]. */
+    internal var fsHandles: com.vortex.a3.core.fs.FsHandles? = null
     /** Buffers phone→laptop notifications that fail to send while BLE is down;
      *  flushed when the peer re-subscribes to AUDIO_SIGNAL. */
     internal val notificationOutbox = com.vortex.a3.core.notif.NotificationOutbox()
@@ -516,6 +519,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         }
         gattServer = server
         startNotesSync() // notes/todos bidirectional sync (NOTES_SYNC)
+        startFsServer() // serve shared folders to the laptop (FS_REQ)
 
         // BLE-WRITE reverse channel: when the laptop AEAD-seals an
         // AudioOpFrame and WRITEs it to AUDIO_SIGNAL, the GattServer decrypts
@@ -693,6 +697,10 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         server.onPeerDisconnected = { _ ->
             mirrorRefreshJob?.cancel()
             lanServer?.setBleLinked(false)
+            // Handles belong to the session that opened them: the ids mean
+            // nothing to a new one, and waiting for the 5-minute idle sweep
+            // would hold a descriptor per file the laptop was mid-copy on.
+            stopFsServer()
             // Engage the reconnect-seeking LOW_LATENCY advertising NOW —
             // waiting for the next 60s rotation cost the whole first
             // reconnect window after a walk-away.

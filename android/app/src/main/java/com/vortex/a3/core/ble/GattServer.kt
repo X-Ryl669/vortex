@@ -186,6 +186,14 @@ class GattServer(
     @Volatile var onNotesSyncReceived: (peerStaticPub: ByteArray, chunk: ByteArray) -> Unit =
         { _, _ -> }
 
+    /** Invoked when the laptop WRITES an FS_REQ (0x50): a filesystem op against
+     *  the folders this phone shares. `op` is the frame's `sub` byte — unlike
+     *  every other frame here the type alone does not say what was asked, so it
+     *  has to travel through. The handler must not block: it runs on the GATT
+     *  callback thread, and a document provider can stall for seconds. */
+    @Volatile var onFsRequest: (peerStaticPub: ByteArray, op: Byte, payload: ByteArray) -> Unit =
+        { _, _, _ -> }
+
     /** Invoked when a device (the laptop) ENABLES notifications on the
      *  AUDIO_SIGNAL characteristic — i.e. the BLE notify path just became
      *  deliverable. VortexStack uses this to flush any notifications that
@@ -540,6 +548,12 @@ class GattServer(
      *  full item set. Bidirectional LWW sync; see NoteSync. */
     fun sendNotesSyncEncrypted(peerStaticPub: ByteArray, chunkPayload: ByteArray): Boolean =
         sealAndNotify(peerStaticPub, FrameType.NOTES_SYNC, chunkPayload, "sendNotesSync")
+
+    /** One filesystem reply — FS_META (0x51), FS_DATA (0x52) or FS_ERR (0x53).
+     *  Replies carry no `sub`: the frame type says which of the three this is,
+     *  and the request id inside the payload correlates it. */
+    fun sendFsReply(peerStaticPub: ByteArray, frameType: Byte, payload: ByteArray): Boolean =
+        sealAndNotify(peerStaticPub, frameType, payload, "sendFsReply")
 
     /**
      * Session-ownership handoff (PEER_HANDOFF 0x4F) — tell [peerStaticPub] it is
@@ -1004,6 +1018,14 @@ class GattServer(
                         Log.w(TAG, "AudioSignal WRITE: no recv cipher for $addr; drop")
                         return
                     }
+                    // Allowlist of frame types this characteristic accepts.
+                    // It must list every type with a dispatch arm below: a type
+                    // missing here is rejected before dispatch, so its handler
+                    // is dead code that looks wired. PEER_HANDOFF was exactly
+                    // that — the laptop sends it through this path
+                    // (cmd_pairing), the arm below handles it, and this guard
+                    // silently dropped every one, so a displaced phone never
+                    // learned it had lost ownership.
                     if (frame.type != FrameType.AUDIO_OP &&
                         frame.type != FrameType.NOTIFICATION &&
                         frame.type != FrameType.STATE &&
@@ -1011,7 +1033,9 @@ class GattServer(
                         frame.type != FrameType.CLIPBOARD &&
                         frame.type != FrameType.CLIPBOARD_IMAGE &&
                         frame.type != FrameType.CLIPBOARD_TEXT &&
-                        frame.type != FrameType.NOTES_SYNC
+                        frame.type != FrameType.NOTES_SYNC &&
+                        frame.type != FrameType.PEER_HANDOFF &&
+                        frame.type != FrameType.FS_REQ
                     ) {
                         Log.w(TAG, "AudioSignal WRITE: unexpected frame type ${frame.type}")
                         return
@@ -1139,6 +1163,18 @@ class GattServer(
                                 onNotesSyncReceived(peerPub, jsonBytes)
                             } catch (e: Exception) {
                                 Log.w(TAG, "onNotesSyncReceived threw: ${e.message}")
+                            }
+                        }
+                        FrameType.FS_REQ -> {
+                            // Laptop→phone filesystem op. The op rides in the
+                            // frame's `sub`, so pass it on: FS_REQ is the one
+                            // inbound type whose payload cannot be interpreted
+                            // without it. Paths are not logged — they are the
+                            // user's folder names.
+                            try {
+                                onFsRequest(peerPub, frame.sub, jsonBytes)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "onFsRequest threw: ${e.message}")
                             }
                         }
                         FrameType.PEER_HANDOFF -> {

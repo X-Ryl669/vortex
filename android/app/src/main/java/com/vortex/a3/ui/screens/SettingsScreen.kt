@@ -100,6 +100,8 @@ fun SettingsScreen(
     onPickSharedFolder: () -> Unit,
     screenControlOn: Boolean,
     onScreenControlClick: () -> Unit,
+    sharedFolderCount: Int,
+    onSharedFoldersClick: () -> Unit,
     onBack: () -> Unit,
 ) {
     Column(
@@ -301,6 +303,18 @@ fun SettingsScreen(
                     else "Off — tap to enable in Accessibility",
                     status = if (screenControlOn) "On" else "Off",
                     onClick = onScreenControlClick,
+                )
+                ActionRow(
+                    icon = Icons.Outlined.FolderOpen,
+                    title = "Shared folders",
+                    // Names the read-only limit up front: a user who shares a
+                    // folder expecting the laptop to save into it would
+                    // otherwise only find out when a copy fails.
+                    hint = if (sharedFolderCount > 0)
+                        "The laptop can browse these, read-only — tap to add another"
+                    else "Off — tap to pick a folder the laptop may browse",
+                    status = if (sharedFolderCount > 0) "$sharedFolderCount" else "Off",
+                    onClick = onSharedFoldersClick,
                 )
             }
         }

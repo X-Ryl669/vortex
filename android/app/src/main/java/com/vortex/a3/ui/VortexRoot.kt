@@ -188,6 +188,11 @@ fun VortexRoot(
                 val screenControlOn = remember(showSettings) {
                     com.vortex.a3.service.VortexInputService.isEnabled(activity)
                 }
+                // Re-read when Settings opens: the user may have added or
+                // revoked a grant since, including from system settings.
+                val sharedFolderCount = remember(showSettings) {
+                    com.vortex.a3.core.fs.FsRoots(activity).roots().size
+                }
                 if (showNotes) {
                     // System back pops to Home instead of leaving the app.
                     // NotesScreen's own handlers (close the editor) compose
@@ -250,6 +255,8 @@ fun VortexRoot(
                         onPickSharedFolder = actions.onPickSharedFolder,
                         screenControlOn = screenControlOn,
                         onScreenControlClick = actions.onOpenScreenControl,
+                        sharedFolderCount = sharedFolderCount,
+                        onSharedFoldersClick = actions.onPickSharedFolder,
                         onBack = { showSettings = false },
                     )
                 } else {

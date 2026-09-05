@@ -244,6 +244,39 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { /* no-op */ }
 
+    /**
+     * Folder picker for filesystem sharing (design doc §5).
+     *
+     * SAF trees rather than `MANAGE_EXTERNAL_STORAGE`: pairing a laptop proves
+     * identity, not authorisation, and it should not follow that the laptop can
+     * read the whole phone. The user picks exactly what is shared, and the
+     * grant Android persists IS the allowlist the server enforces — there is no
+     * second list of ours that could drift from it.
+     */
+    internal val sharedFolderLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult // user backed out
+        if (com.vortex.a3.core.fs.FsRoots(this).grant(uri)) {
+            android.widget.Toast.makeText(
+                this,
+                "Shared with your laptop, read-only",
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
+    /** Open the folder picker. Adding is the only action here: revoking is
+     *  Android's own "remove permission" in app settings, and duplicating it
+     *  would give two places that must agree about what is shared. */
+    internal fun pickSharedFolder() {
+        try {
+            sharedFolderLauncher.launch(null)
+        } catch (e: Exception) {
+            android.util.Log.w("VortexFs", "no document picker available: ${e.message}")
+        }
+    }
+
     /** Dedicated READ_PHONE_STATE request used on the trusted-launch path
      *  (which starts the service directly, bypassing the BLE permission
      *  flow). On any result we nudge the service to (re)register the
