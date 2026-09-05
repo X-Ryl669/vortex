@@ -76,19 +76,22 @@ pub(crate) fn take_peer_addr(peer_pub: &[u8; 32]) -> Option<bluer::Address> {
 /// Mirror of `bin/ui.rs::PRESENCE_ROTATION_SEC`. Both binaries
 /// MUST share this value with the Android publisher in spec §7.3.
 const PRESENCE_ROTATION_SEC: u64 = 60;
-
-/// The presence tokens we'd accept RIGHT NOW from any trusted peer: each
-/// peer's PRS-derived token for the current bucket ±2. ±1 was the spec
-/// minimum (spec §6.5.2) but left the phone unreachable over BLE when its
-/// clock skewed / Doze deferred a rotation past one bucket; ±2 tolerates
-/// 2–3 minutes of drift. Security-wise the token is a privacy/anti-DoS
-/// filter, not authentication (IK still gates trust), so widening the
-/// accept set from 3 to 5 of 2^64 values is immaterial. Recompute at every
-/// validation — buckets rotate every 60 s, so a set captured at wait-start
-/// goes stale.
-pub(crate) fn expected_presence_tokens(
+/// Every trusted peer's ±2-bucket presence tokens, mapped to the peer that
+/// owns them.
+///
+/// Flattened, this answers "is *a* trusted peer nearby",
+/// which was a complete answer while a laptop could only trust one phone. With
+/// several it is not: this loop authenticates *as* the peer it selected, so
+/// seeing B's beacon and running IK with A's static key fails every time. The
+/// failure is also sticky rather than self-correcting — the address we just
+/// connected to is remembered as the fast path's `last_rpa`, so every
+/// subsequent cycle re-dials the same wrong phone ahead of scanning.
+///
+/// Carrying the owner alongside the token is what lets the caller hand the
+/// handshake the identity that actually answered.
+pub(crate) fn presence_token_owners(
     peers: &[vortex_l3_daemon::core::storage::peers::TrustedPeer],
-) -> std::collections::HashSet<[u8; 8]> {
+) -> std::collections::HashMap<[u8; 8], [u8; 32]> {
     use std::time::{SystemTime, UNIX_EPOCH};
     use vortex_l3_daemon::core::crypto::presence::{current_bucket, derive_presence_token};
     let now_sec = SystemTime::now()
@@ -99,9 +102,12 @@ pub(crate) fn expected_presence_tokens(
     peers
         .iter()
         .flat_map(|p| {
-            [-2i64, -1, 0, 1, 2]
-                .iter()
-                .map(move |d| derive_presence_token(&p.prs, (bucket_now as i64 + *d) as u64))
+            [-2i64, -1, 0, 1, 2].iter().map(move |d| {
+                (
+                    derive_presence_token(&p.prs, (bucket_now as i64 + *d) as u64),
+                    p.peer_static_pub,
+                )
+            })
         })
         .collect()
 }
@@ -145,10 +151,9 @@ pub(crate) struct PeerCandidate {
 
 /// Scan for trusted-presence beacons from trusted peers OTHER than `exclude`.
 ///
-/// [`expected_presence_tokens`] flattens every peer's tokens into one set,
-/// which answers "is any trusted peer nearby" — enough for reconnect, but not
-/// for a switch, which has to know *which* peer it found so it can leave the
-/// active one out. So this builds the token→peer map instead.
+/// The reconnect path asks [`presence_token_owners`] "who is nearby" and takes
+/// whoever answers. A switch cannot: it has to leave the active peer out, so it
+/// filters the peer set first and scans only for the rest.
 ///
 /// Excluding the active peer is what makes "Switch" coherent: the user pressed
 /// it precisely because they do not want the device they are already on
@@ -255,7 +260,7 @@ pub(crate) async fn find_trusted_presence_peer(
     adapter: &bluer::Adapter,
     peer_store: &Arc<dyn PeerStore>,
     wait: Duration,
-) -> Option<bluer::Address> {
+) -> Option<(bluer::Address, [u8; 32])> {
     // Load trusted peers off the runtime — secret-service is blocking.
     let peers = {
         let store = peer_store.clone();
@@ -266,9 +271,11 @@ pub(crate) async fn find_trusted_presence_peer(
     if peers.is_empty() {
         return None;
     }
-    let expected = expected_presence_tokens(&peers);
+    // Owner map, not a flat token set: the caller has to authenticate as
+    // whichever peer answered, not as whichever one happens to be stored first.
+    let owners = presence_token_owners(&peers);
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<bluer::Address>(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(bluer::Address, [u8; 32])>(1);
     let scan = {
         let adapter = adapter.clone();
         tokio::spawn(async move {
@@ -276,18 +283,18 @@ pub(crate) async fn find_trusted_presence_peer(
                 if !c.payload.flags.is_trusted_presence() {
                     return;
                 }
-                if !expected.contains(&c.payload.payload_8) {
+                let Some(peer_pub) = owners.get(&c.payload.payload_8).copied() else {
                     // Flag set but token doesn't match any of our
                     // trusted peers' current ±1 bucket — could be a
                     // rogue advertiser trying to burn our IK budget,
                     // or a stale phone whose clock drifted out of
                     // the ±1 window. Drop either way.
                     return;
-                }
+                };
                 // Validated trusted-presence advert. try_send into a
                 // bounded(1) channel: subsequent valid hits drop —
                 // we only need the first.
-                let _ = tx.try_send(c.address);
+                let _ = tx.try_send((c.address, peer_pub));
             })
             .await;
         })
@@ -360,8 +367,9 @@ static MONITOR_UNSUPPORTED: std::sync::atomic::AtomicBool =
 
 /// What ended one presence wait.
 enum PresenceWait {
-    /// A validated trusted-presence advertiser is on air at this address.
-    Found(bluer::Address),
+    /// A validated trusted-presence advertiser is on air at this address,
+    /// and its token identified it as this trusted peer.
+    Found(bluer::Address, [u8; 32]),
     /// No find, but the caller should re-evaluate (LAN saw the phone /
     /// periodic trust re-check) and call again.
     Reevaluate,
@@ -377,14 +385,18 @@ async fn validate_presence_candidate(
     adapter: &bluer::Adapter,
     peers: &[vortex_l3_daemon::core::storage::peers::TrustedPeer],
     addr: bluer::Address,
-) -> bool {
+) -> Option<[u8; 32]> {
     use vortex_l3_daemon::core::ble::{AdvPayload, VORTEX_SERVICE_UUID};
-    let Ok(device) = adapter.device(addr) else { return false };
-    let Ok(Some(sd)) = device.service_data().await else { return false };
-    let Some(bytes) = sd.get(&VORTEX_SERVICE_UUID) else { return false };
-    let Ok(payload) = AdvPayload::decode(bytes) else { return false };
-    payload.flags.is_trusted_presence()
-        && expected_presence_tokens(peers).contains(&payload.payload_8)
+    let device = adapter.device(addr).ok()?;
+    let sd = device.service_data().await.ok()??;
+    let bytes = sd.get(&VORTEX_SERVICE_UUID)?;
+    let payload = AdvPayload::decode(bytes).ok()?;
+    if !payload.flags.is_trusted_presence() {
+        return None;
+    }
+    presence_token_owners(peers)
+        .get(&payload.payload_8)
+        .copied()
 }
 
 /// Wait until the trusted phone is on-air, the seamless-continuity way: a BlueZ
@@ -444,10 +456,16 @@ async fn monitor_presence_wait(
         tokio::select! {
             ev = handle.next() => match ev {
                 Some(MonitorEvent::DeviceFound(id)) => {
-                    if validate_presence_candidate(adapter, peers, id.device).await {
-                        tracing::info!(addr = %id.device, "presence monitor: trusted peer on air");
+                    if let Some(peer_pub) =
+                        validate_presence_candidate(adapter, peers, id.device).await
+                    {
+                        tracing::info!(
+                            addr = %id.device,
+                            peer = %hex::encode(&peer_pub[..4]),
+                            "presence monitor: trusted peer on air"
+                        );
                         crate::presence::touch_presence();
-                        return PresenceWait::Found(id.device);
+                        return PresenceWait::Found(id.device, peer_pub);
                     }
                     // A Vortex advertiser that didn't validate: usually the
                     // BlueZ service-data cache lagging a token rotation (the
@@ -456,10 +474,10 @@ async fn monitor_presence_wait(
                     // foreign device the scan rejects it too and we keep
                     // waiting on the monitor.
                     tracing::debug!(addr = %id.device, "presence monitor: candidate failed token gate; one scan round");
-                    if let Some(a) =
+                    if let Some((a, peer_pub)) =
                         find_trusted_presence_peer(adapter, peer_store, Duration::from_secs(15)).await
                     {
-                        return PresenceWait::Found(a);
+                        return PresenceWait::Found(a, peer_pub);
                     }
                 }
                 Some(MonitorEvent::DeviceLost(_)) => {}
@@ -496,10 +514,10 @@ async fn monitor_unsupported_wait(
     let started = tokio::time::Instant::now();
     let mut backoff = Duration::from_secs(5);
     loop {
-        if let Some(a) =
+        if let Some((a, peer_pub)) =
             find_trusted_presence_peer(adapter, peer_store, Duration::from_secs(15)).await
         {
-            return PresenceWait::Found(a);
+            return PresenceWait::Found(a, peer_pub);
         }
         if started.elapsed() > Duration::from_secs(300) {
             return PresenceWait::Reevaluate;
@@ -523,7 +541,7 @@ pub(crate) async fn wait_for_presence(
     adapter: &bluer::Adapter,
     peer_store: &Arc<dyn PeerStore>,
     retry_nudge: &tokio::sync::Notify,
-) -> Option<bluer::Address> {
+) -> Option<(bluer::Address, [u8; 32])> {
     use std::sync::atomic::Ordering;
     // Trust snapshot for this wait (token sets are recomputed per event; the
     // 5-minute re-evaluation refreshes the peer list itself).
@@ -546,15 +564,15 @@ pub(crate) async fn wait_for_presence(
     // away. Worst-case coverage bonus: every ~5 min re-evaluation passes
     // through here, so even a missed monitor event self-heals (15 s scan
     // per ~5 min ≈ 5% duty vs the old always-on ~65%).
-    if let Some(a) =
+    if let Some(found) =
         find_trusted_presence_peer(adapter, peer_store, Duration::from_secs(15)).await
     {
-        return Some(a);
+        return Some(found);
     }
     // Phase 2 — patient watch.
     if !MONITOR_UNSUPPORTED.load(Ordering::Relaxed) {
         match monitor_presence_wait(adapter, peer_store, &peers, retry_nudge).await {
-            PresenceWait::Found(a) => return Some(a),
+            PresenceWait::Found(a, peer_pub) => return Some((a, peer_pub)),
             PresenceWait::Reevaluate => return None,
             PresenceWait::Unsupported => {
                 MONITOR_UNSUPPORTED.store(true, Ordering::Relaxed);
@@ -562,7 +580,7 @@ pub(crate) async fn wait_for_presence(
         }
     }
     match monitor_unsupported_wait(adapter, peer_store, retry_nudge).await {
-        PresenceWait::Found(a) => Some(a),
+        PresenceWait::Found(a, peer_pub) => Some((a, peer_pub)),
         _ => None,
     }
 }
@@ -584,7 +602,11 @@ pub(crate) async fn wait_for_presence(
 pub(crate) async fn connect_bonded_or_scan(
     adapter: &bluer::Adapter,
     peer_store: &Arc<dyn PeerStore>,
-    last_rpa: &mut Option<bluer::Address>,
+    // Last address we completed a handshake against, WITH the peer it proved
+    // to be. The identity has to travel with the address: re-dialling a
+    // remembered RPA is only a shortcut if we also authenticate as the peer
+    // that answered there last time.
+    last_rpa: &mut Option<(bluer::Address, [u8; 32])>,
     retry_nudge: &tokio::sync::Notify,
     // Running count of consecutive *connect attempts that failed* (the
     // abort-by-local / services-not-resolved BlueZ wedge). Bumped only when a
@@ -592,7 +614,7 @@ pub(crate) async fn connect_bonded_or_scan(
     // absent (no presence to connect to) — so the caller's power-cycle escalation
     // never fires just because the phone walked away. Reset to 0 on any success.
     consec_connect_fail: &mut u32,
-) -> Option<VortexClient> {
+) -> Option<(VortexClient, [u8; 32])> {
     // ----- Learn-latest-RPA fast path -----
     //
     // Most BLE link drops aren't from the phone rotating its RPA — they're
@@ -604,7 +626,7 @@ pub(crate) async fn connect_bonded_or_scan(
     // really did rotate, this fails fast (5 s cap) and we fall through to the
     // scan, which then refreshes `last_rpa`. This is the bondless reconnect
     // model the old project shipped stably (learn-latest-RPA + persistent link).
-    if let Some(addr) = *last_rpa {
+    if let Some((addr, peer_pub)) = *last_rpa {
         match tokio::time::timeout(
             // 3s, not 5s: a present RPA connects at the LE layer in <1-2s
             // (even in Doze — the controller answers, not the app), so this
@@ -621,7 +643,7 @@ pub(crate) async fn connect_bonded_or_scan(
             Ok(Ok(client)) => {
                 tracing::info!(addr = %addr, "BLE persistent: last-RPA direct-connect succeeded");
                 *consec_connect_fail = 0;
-                return Some(client);
+                return Some((client, peer_pub));
             }
             Ok(Err(e)) => {
                 tracing::debug!(addr = %addr, "BLE persistent: last-RPA connect failed: {e}; scanning");
@@ -642,8 +664,8 @@ pub(crate) async fn connect_bonded_or_scan(
     // Block until the phone's trusted-presence beacon is on air (passive
     // advertisement monitor; adaptive scan loop on hosts without it), then
     // connect to its current RPA and remember it for the fast path above.
-    let addr = match wait_for_presence(adapter, peer_store, retry_nudge).await {
-        Some(a) => a,
+    let (addr, peer_pub) = match wait_for_presence(adapter, peer_store, retry_nudge).await {
+        Some(found) => found,
         None => {
             // Re-evaluate signal (LAN nudge / periodic) — the caller loops,
             // which re-runs the direct-connect fast path first.
@@ -677,14 +699,14 @@ pub(crate) async fn connect_bonded_or_scan(
     };
     match connect {
         Ok(client) => {
-            *last_rpa = Some(addr);
+            *last_rpa = Some((addr, peer_pub));
             *consec_connect_fail = 0;
-            Some(client)
+            Some((client, peer_pub))
         }
         Err(e) => {
             // Stale cache or a flaky connect — drop the remembered RPA so the
             // next pass scans fresh rather than retrying a dead address.
-            if *last_rpa == Some(addr) {
+            if last_rpa.map(|(a, _)| a) == Some(addr) {
                 *last_rpa = None;
             }
             clear_pending_connect(adapter, addr).await;
@@ -794,7 +816,7 @@ pub(crate) async fn run_ble_persistent_loop(
     use vortex_l3_daemon::core::audio_op::AudioOpFrame;
     // Last RPA we successfully connected to — the learn-latest-RPA fast path
     // (see connect_bonded_or_scan) retries it directly before scanning.
-    let mut last_rpa: Option<bluer::Address> = None;
+    let mut last_rpa: Option<(bluer::Address, [u8; 32])> = None;
     // Consecutive IK handshake failures against a reachable phone — e.g. the
     // phone dropped its trust record (user un-paired there). Escalating
     // backoff so we don't hammer connect+IK every few seconds forever.
@@ -809,32 +831,51 @@ pub(crate) async fn run_ble_persistent_loop(
         // Same blocking-pool offload as the LAN heartbeat: libsecret
         // calls block their executor thread, and this loop ran on
         // every restart, doubling the contention.
-        let peer = {
+        // Trust gate only. WHICH peer this cycle authenticates as is decided by
+        // whichever one actually answers — its presence token names it (see
+        // `presence_token_owners`) — not by the store's iteration order. Taking
+        // `list().next()` here was a single-peer assumption: with a second
+        // laptop paired it would find B's beacon and then run IK with A's
+        // static key, failing every time, and remember B's address as the fast
+        // path so the next cycle re-dialled it.
+        let peers = {
             let store = peer_store.clone();
-            let first = tokio::task::spawn_blocking(move || {
-                store.list().unwrap_or_default().into_iter().next()
-            })
-            .await
-            .unwrap_or(None);
-            match first {
-                Some(p) => {
-                    announced_no_peer = false;
-                    p
-                }
-                None => {
-                    // Announce once, not every 10 s. Without it, a loop idling
-                    // for want of a trusted peer and a loop failing to connect
-                    // look identical in the log — both are silence. The portable
-                    // loop already says this; the BlueZ one did not.
-                    if !announced_no_peer {
-                        tracing::info!("no trusted peer yet; BLE loop idle until pairing");
-                        announced_no_peer = true;
-                    }
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    continue;
+            tokio::task::spawn_blocking(move || store.list().unwrap_or_default())
+                .await
+                .unwrap_or_default()
+        };
+        if peers.is_empty() {
+            // Announce once, not every 10 s. Without it, a loop idling
+            // for want of a trusted peer and a loop failing to connect
+            // look identical in the log — both are silence. The portable
+            // loop already says this; the BlueZ one did not.
+            if !announced_no_peer {
+                tracing::info!("no trusted peer yet; BLE loop idle until pairing");
+                announced_no_peer = true;
+            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        }
+        announced_no_peer = false;
+
+        // Honour an explicit switch. The fast path re-dials whoever answered
+        // last, which straight after a switch is the peer the user just moved
+        // away from — it is still trusted, still nearby and still connectable,
+        // so the shortcut would win the race and quietly undo the switch.
+        // Ownership is the arbiter's call, so drop the shortcut and let
+        // discovery find the peer that now owns the session.
+        if let Some(active) = crate::arbiter::active() {
+            if let Some((_, remembered)) = last_rpa {
+                if remembered != active && peers.iter().any(|p| p.peer_static_pub == active) {
+                    tracing::info!(
+                        remembered = %hex::encode(&remembered[..4]),
+                        active = %hex::encode(&active[..4]),
+                        "BLE persistent: active peer changed — dropping the last-RPA shortcut"
+                    );
+                    last_rpa = None;
                 }
             }
-        };
+        }
 
         // Self-heal: power the adapter on if it's off (soft rfkill / user
         // toggle / post-suspend). Linux allows this programmatically with no
@@ -876,7 +917,7 @@ pub(crate) async fn run_ble_persistent_loop(
         // Step 1+2 — open a GATT session. Tries a direct connect to the
         // last-known-good RPA first (no scan, no SCAN+A2DP radio conflict),
         // falling back to presence-scan + RPA connect when the phone rotated.
-        let client = match connect_bonded_or_scan(
+        let (client, peer) = match connect_bonded_or_scan(
             &adapter,
             &peer_store,
             &mut last_rpa,
@@ -885,7 +926,21 @@ pub(crate) async fn run_ble_persistent_loop(
         )
         .await
         {
-            Some(c) => c,
+            Some((c, peer_pub)) => {
+                // Trust can be revoked while a connect is in flight (Forget on
+                // either end). Re-resolving the record here rather than reusing
+                // a snapshot means we never hand IK a peer we no longer trust.
+                match peers.iter().find(|p| p.peer_static_pub == peer_pub) {
+                    Some(p) => (c, p.clone()),
+                    None => {
+                        tracing::warn!(
+                            peer = %hex::encode(&peer_pub[..4]),
+                            "BLE persistent: answered by a peer we no longer trust; dropping"
+                        );
+                        continue;
+                    }
+                }
+            }
             None => {
                 // The phone is present but connects keep aborting. Drop the
                 // cached address and wait longer before trying again — the

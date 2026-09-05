@@ -122,8 +122,14 @@ pub(crate) async fn run_portable_ble_loop(
         // connect to, so wait rather than scan.
         let peer = {
             let store = peer_store.clone();
+            // The arbiter's active peer, not the store's first record. This
+            // loop authenticates *as* whichever peer it picks, and unlike the
+            // BlueZ path its scan cannot name the device it found — the
+            // portable seam reports an address, not a presence token — so the
+            // choice made here is the only one there is. `next()` meant a
+            // second paired laptop could never be the one we reconnected.
             match tokio::task::spawn_blocking(move || {
-                store.list().unwrap_or_default().into_iter().next()
+                crate::arbiter::preferred_peer(store.list().unwrap_or_default())
             })
             .await
             {

@@ -65,6 +65,34 @@ pub(crate) fn is_active(peer_pub: &[u8; 32]) -> bool {
     active().as_ref() == Some(peer_pub)
 }
 
+/// Choose which trusted peer a transport loop should target.
+///
+/// The active peer wins whenever it is still in the store. It owns the
+/// mirrored state the UI is showing, so a loop that dialled anyone else would
+/// reconnect a phone the user is not looking at — and, because each loop
+/// authenticates *as* the peer it picked, hand the wrong static key to the IK
+/// handshake.
+///
+/// Falls back to the first stored peer, which covers both the single-peer case
+/// and the cold start before anything has claimed ownership. That fallback was
+/// the whole selection rule until multi-peer landed: with one trusted phone
+/// `next()` and "the active peer" are always the same record, so the
+/// assumption stayed invisible until a second laptop was paired.
+// Only the portable BLE loop selects a peer this way. The BlueZ loop learns
+// the identity from the presence token that answered, which is strictly better
+// — it cannot pick a peer that isn't actually on air — so this is dead there.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn preferred_peer(
+    peers: Vec<vortex_l3_daemon::core::storage::peers::TrustedPeer>,
+) -> Option<vortex_l3_daemon::core::storage::peers::TrustedPeer> {
+    if let Some(a) = active() {
+        if let Some(i) = peers.iter().position(|p| p.peer_static_pub == a) {
+            return peers.into_iter().nth(i);
+        }
+    }
+    peers.into_iter().next()
+}
+
 /// Ask to become the active peer.
 ///
 /// Idempotent for the peer that already owns the session, so a reconnect of
@@ -187,8 +215,10 @@ mod tests {
         [n; 32]
     }
 
-    // NOTE: the arbiter is process-global, so these run in one test to keep a
-    // deterministic order rather than racing each other through the statics.
+    // NOTE: the arbiter is process-global, so this is deliberately ONE test —
+    // cargo runs #[test] fns in parallel threads of a single process, so a
+    // second test would race these statics rather than following them. Add new
+    // sections here; do not add a sibling #[test].
     #[test]
     fn ownership_lifecycle() {
         let a = peer(1);
@@ -220,10 +250,43 @@ mod tests {
         assert!(is_active(&b));
         release(&b);
         assert_eq!(active(), None);
-    }
 
-    #[test]
-    fn switch_window_expires_on_read() {
+        // ---- peer selection follows ownership -------------------------
+        use vortex_l3_daemon::core::storage::peers::TrustedPeer;
+        let rec = |p: [u8; 32]| TrustedPeer {
+            peer_static_pub: p,
+            prs: [0u8; 32],
+            paired_at: 0,
+            peer_name: None,
+        };
+        let both = vec![rec(a), rec(b)];
+
+        // Nothing owns the session yet: the first stored record wins. This is
+        // the single-peer case and every cold start.
+        assert_eq!(preferred_peer(both.clone()).unwrap().peer_static_pub, a);
+
+        // Once a peer owns the session it is chosen regardless of store order
+        // — the regression this exists to prevent, where `list().next()` kept
+        // dialling A after the user switched to B.
+        assert_eq!(claim(&b), Claim::Granted);
+        assert_eq!(preferred_peer(both.clone()).unwrap().peer_static_pub, b);
+
+        // An active peer that is no longer trusted (forgotten while linked)
+        // must not strand the loop with nothing to dial: fall back to a peer
+        // we do still trust.
+        assert_eq!(preferred_peer(vec![rec(a)]).unwrap().peer_static_pub, a);
+
+        // No trust at all is the one case with no answer.
+        assert!(preferred_peer(vec![]).is_none());
+        release(&b);
+
+        // ---- the switch window ----------------------------------------
+        // Folded in rather than left as its own #[test]: the NOTE above says
+        // these must not race through the statics, but two tests DID race, and
+        // this pair in particular. `force_activate` above clears
+        // `switching_until`, so run in parallel it could blank the window this
+        // section had just opened — a flaky failure seen once for real, and one
+        // that gets likelier as either test grows.
         begin_switch(Duration::from_secs(60));
         assert!(is_switching());
         end_switch();
