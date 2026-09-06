@@ -82,6 +82,7 @@ mod cmd_earbuds;
 mod send_to_phone;
 mod share;
 mod file_consent;
+mod fs_cli;
 mod contacts;
 mod desktop_apps;
 mod diagnostics;
@@ -437,6 +438,11 @@ pub fn run() {
                         window::present(&w);
                     }
                 }
+            } else if fs_cli::dispatch(&argv) {
+                // `--fs-ls` / `--fs-stat` / `--fs-get`: drive the filesystem
+                // client over whatever session is already up. Same rationale as
+                // `--mirror` below — without a mount adapter or any browsing UI
+                // yet, this is the only way to exercise the path at all.
             } else if argv.iter().any(|a| a == "--clipboard") {
                 clipboard_window::show_clipboard_window(app);
             } else if argv.iter().any(|a| a == "--mirror") {
