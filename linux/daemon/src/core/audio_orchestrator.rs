@@ -1040,7 +1040,7 @@ const CONNECT_RETRY_PAUSE_MS: u64 = 280;
 const DONE_WAIT_MS: u64 = 4_000;
 /// Background confirm window for the release path — matches
 /// `audio_switch::DISCONNECT_TIMEOUT`. Does not gate the phone.
-const DISCONNECT_TIMEOUT_MS: u64 = 1_000;
+const DISCONNECT_TIMEOUT_MS: u64 = 3_000;
 const FAILED_RESET_MS: u64 = 3_000;
 /// Hard ceiling on how long a single switch flow may sit in a
 /// non-terminal in-flight state before the watchdog force-resets it to

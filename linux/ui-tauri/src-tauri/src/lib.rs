@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 
 use vortex_l3_daemon::core::pairing::handshake::LocalDecision;
 
+mod applog;
 mod ble;
 mod call;
 mod call_log;
@@ -146,12 +147,12 @@ pub(crate) struct PairDecisionState(pub(crate) Mutex<Option<oneshot::Sender<Loca
 // --------------------------------------------------------------------------
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Logs go to stderr AND to a file — the packaged launch paths discard
+    // stderr, so without the file a normal user's run leaves no trace at all.
+    match applog::init() {
+        Some(p) => tracing::info!("logging to {}", p.display()),
+        None => tracing::warn!("could not open the log file; stderr only"),
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<UiCmd>();
     // Tray heartbeat: the 5-second local-earbuds rescan used to live in the

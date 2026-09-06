@@ -452,6 +452,25 @@ class VortexService : Service() {
         val pendingAudioClaim: java.util.concurrent.atomic.AtomicBoolean =
             java.util.concurrent.atomic.AtomicBoolean(false)
 
+        /** True while a text field holds input focus on this phone. Written by
+         *  the accessibility service, read by the AppState builder; the laptop
+         *  uses it to decide whether Esc dismisses the field or hands the
+         *  pointer back. See [VortexInputService.trackInputFocus]. */
+        val inputFocused: java.util.concurrent.atomic.AtomicBoolean =
+            java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /** Ship the AppState now instead of on the next heartbeat. Used for
+         *  state the laptop may act on within a second of it changing. */
+        @Volatile
+        var appStateNudge: (() -> Unit)? = null
+
+        fun nudgeAppState() {
+            try {
+                appStateNudge?.invoke()
+            } catch (_: Throwable) {
+            }
+        }
+
         /** Phase 2 — current call phase shipped on every outgoing AppState
          *  until cleared. Linux pauses MPRIS on `null` → `ringing`/`active`
          *  and resumes on `*` → `null`. Volatile so the writer

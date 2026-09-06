@@ -13,6 +13,7 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import kotlin.math.abs
 
 /**
@@ -76,6 +77,24 @@ class VortexInputService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        // Ask for the event types WE need, at runtime, instead of trusting the
+        // XML config to have been reloaded.
+        //
+        // Android caches an accessibility service's AccessibilityServiceInfo
+        // and does not necessarily re-read the manifest XML when the app is
+        // updated: after adding `typeViewFocused` to the config, `dumpsys
+        // accessibility` still reported the OLD mask on the running service —
+        // eventTypes=[TYPE_WINDOW_STATE_CHANGED, TYPE_WINDOW_CONTENT_CHANGED]
+        // — so the focus tracking never ran. Setting it here applies to the
+        // live binding, so an update takes effect without the user having to
+        // toggle the service off and on in Settings.
+        try {
+            serviceInfo = serviceInfo?.apply {
+                eventTypes = eventTypes or AccessibilityEvent.TYPE_VIEW_FOCUSED
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "could not extend the event mask: ${t.message}")
+        }
         cacheDisplaySize()
         main.postDelayed(handoffHeartbeat, HANDOFF_HEARTBEAT_MS)
         Log.i(TAG, "input service connected (${dispW.toInt()}x${dispH.toInt()})")
@@ -123,6 +142,73 @@ class VortexInputService : AccessibilityService() {
         } catch (_: Throwable) {
             // never let an accessibility read crash the (control) service
         }
+        try {
+            trackInputFocus()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** Tell the laptop whether a TEXT FIELD currently has focus here.
+     *
+     *  Universal Control uses it to decide what Esc means: with the pointer on
+     *  the phone Esc normally hands control back, but while the user is typing
+     *  into a field Esc should do what it does everywhere else and dismiss the
+     *  field. `findFocus(FOCUS_INPUT)` is the direct answer — it is the node
+     *  the system itself considers focused for input — and `isEditable`
+     *  separates a text field from a focused button or list row.
+     *
+     *  Pushed only on CHANGE, and with an immediate nudge rather than waiting
+     *  for the next heartbeat: the user can tap a field and reach for Esc
+     *  inside a second. */
+    private fun trackInputFocus() {
+        val node = try {
+            findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                ?: rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        } catch (_: Throwable) {
+            null
+        }
+        val focused = node?.let { editableNode(it) } ?: false
+        val seen = node?.className?.toString().orEmpty()
+        try {
+            node?.recycle()
+        } catch (_: Throwable) {
+        }
+        if (VortexService.inputFocused.getAndSet(focused) != focused) {
+            Log.i(TAG, "input focus -> $focused (node=${seen.ifEmpty { "none" }})")
+            VortexService.nudgeAppState()
+        } else if (seen.isNotEmpty() && focusProbeLogged.compareAndSet(false, true)) {
+            // One line per service lifetime, so a focused node that we do NOT
+            // classify as a text field can still be identified from a single
+            // real interaction rather than another round of guessing.
+            Log.i(TAG, "input focus probe: node=$seen editable=$focused")
+        }
+    }
+
+    /** Is this focused node a text field?
+     *
+     *  `isEditable` is the right answer and the one to prefer, but it is set by
+     *  the app, and toolkits that draw their own text (WebView inputs, Flutter,
+     *  some MIUI system UI) routinely leave it false on a node the user is very
+     *  much typing into. The class name is the fallback: an EditText, or
+     *  anything derived from it, is a text field whatever the flag says. */
+    private fun editableNode(node: AccessibilityNodeInfo): Boolean {
+        // Never the lock screen. The keyguard's PIN entry is a focused text
+        // field by every test below (measured:
+        // com.android.keyguard.PasswordTextView), but the laptop must not treat
+        // it as one: the user is not typing into an app, and Esc there should
+        // still bring the pointer home. It is also not somewhere we would ever
+        // want to send a synthetic BACK.
+        val pkg = node.packageName?.toString().orEmpty()
+        if (pkg == "com.android.systemui" || pkg.contains("keyguard")) return false
+        if (node.className?.toString()?.contains("keyguard", ignoreCase = true) == true) {
+            return false
+        }
+        if (node.isEditable) return true
+        val cls = node.className?.toString() ?: return false
+        return cls.endsWith("EditText") ||
+            cls.contains("EditText") ||
+            cls.contains("TextField") ||
+            cls.contains("SearchView")
     }
 
     override fun onInterrupt() {}
@@ -378,6 +464,9 @@ class VortexInputService : AccessibilityService() {
 
     companion object {
         private const val TAG = "VortexInput"
+
+        /** One-shot guard for the focus diagnostic below. */
+        private val focusProbeLogged = java.util.concurrent.atomic.AtomicBoolean(false)
 
         /** Min gap between address-bar reads — the content-changed stream is very
          *  noisy (scroll, animations); we only need the URL when it changes. */

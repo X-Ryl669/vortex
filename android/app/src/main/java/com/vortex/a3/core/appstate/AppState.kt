@@ -192,11 +192,20 @@ data class AppState(
      *  120 Hz panel or asks a 60 Hz one for frames it will never make.
      *  null = unknown (older build, or no display). */
     val displayHz: Int? = null,
+    /** True while a TEXT FIELD holds input focus on this device.
+     *
+     *  Read by Universal Control on the laptop: Esc there is the manual
+     *  "give me my pointer back", but when the user is typing into a field on
+     *  the phone, Esc means what it means everywhere else — dismiss the field
+     *  first. Without this the laptop cannot tell the two situations apart.
+     *  Reported by the accessibility service, which sees focus directly. */
+    val inputFocused: Boolean = false,
     val ts: Long = System.currentTimeMillis() / 1000L,
 ) {
     fun toJsonBytes(): ByteArray {
         val obj = JSONObject()
         obj.put("v", v)
+        if (inputFocused) obj.put("input_focused", true)
         battery?.let { obj.put("battery", it) }
         obj.put("class", deviceClass)
         name?.let { obj.put("name", it) }
@@ -367,6 +376,7 @@ data class AppState(
                 ringSeq = obj.optLong("ring_seq", 0L),
                 wifiIp = obj.optString("wifi_ip", "").takeIf { it.isNotBlank() },
                 displayHz = obj.optInt("display_hz", 0).takeIf { it > 0 },
+                inputFocused = obj.optBoolean("input_focused", false),
                 cameraFacing = obj.optString("camera_facing", ""),
                 cameraOffer = obj.optJSONObject("camera_offer")?.let { c ->
                     val port = c.optInt("port", 0)

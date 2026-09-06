@@ -1134,6 +1134,9 @@ pub(crate) async fn try_lan_reconnect(
                     // Owner-present gate: record the phone's unlock state for
                     // proximity auto-unlock.
                     crate::proximity::note_phone_unlocked(state.unlocked);
+                    // Universal Control's Esc: dismiss a focused field on the
+                    // phone before handing the pointer back.
+                    crate::universal_control::note_phone_input_focused(state.input_focused);
                     // A LAN sync proves we're in live contact (any-transport) —
                     // gates the disconnect-clear of mirror pills.
                     crate::ble::touch_peer_contact();

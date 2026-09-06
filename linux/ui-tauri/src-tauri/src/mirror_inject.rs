@@ -139,9 +139,12 @@ const REDIAL_COOLDOWN: Duration = Duration::from_secs(10);
 /// When the last redial was attempted, successful or not.
 static LAST_REDIAL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-/// Read the attached transports and pick one, USB first.
-fn scan_transports() -> Option<String> {
-    let out = Command::new("adb").arg("devices").output().ok()?;
+/// Split `adb devices` into (USB serial, network serial). A network transport
+/// is "host:port"; USB serials have no colon.
+fn transports() -> (Option<String>, Option<String>) {
+    let Ok(out) = Command::new("adb").arg("devices").output() else {
+        return (None, None);
+    };
     let text = String::from_utf8_lossy(&out.stdout);
     let (mut usb, mut net) = (None, None);
     for line in text.lines().skip(1) {
@@ -149,10 +152,15 @@ fn scan_transports() -> Option<String> {
         let (Some(serial), Some("device")) = (it.next(), it.next()) else {
             continue;
         };
-        // A network transport is "host:port"; USB serials have no colon.
         let slot = if serial.contains(':') { &mut net } else { &mut usb };
         slot.get_or_insert_with(|| serial.to_string());
     }
+    (usb, net)
+}
+
+/// Read the attached transports and pick one, USB first.
+fn scan_transports() -> Option<String> {
+    let (usb, net) = transports();
     // Whatever port the network transport is on is the one worth redialling —
     // `rsplit` also handles the bracketed IPv6 form (`[::1]:37129`).
     if let Some(port) = net
@@ -163,6 +171,100 @@ fn scan_transports() -> Option<String> {
         remember_adb_port(port);
     }
     usb.or(net)
+}
+
+/// Did WE put the phone's adbd on TCP? Only then may we put it back — a port
+/// the user opened for their own work is theirs to close.
+static WE_OPENED_TCPIP: AtomicBool = AtomicBool::new(false);
+
+fn tcpip_marker_path() -> Option<std::path::PathBuf> {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    p.push(".cache/vortex/opened_adb_tcpip");
+    Some(p)
+}
+
+/// Bootstrap wireless adb from a cable that is plugged in RIGHT NOW.
+///
+/// On Android 10 there is no *Wireless debugging* pairing flow — the only way
+/// to reach adbd over Wi-Fi is legacy `adb tcpip 5555`, which needs an existing
+/// transport to issue it on. So the useful moment is while the cable is still
+/// in: run it then, and Universal Control keeps working after the user unplugs.
+///
+/// The port this opens is the reason [`close_wireless_adb`] exists. It listens
+/// on every interface for the rest of the phone's uptime, and although adbd
+/// still enforces its RSA key check (an unknown host gets the "Allow USB
+/// debugging?" prompt, not a shell), an open port on a café network is not
+/// something to leave behind. So we open it only while Universal Control is on,
+/// and close it again the moment it is switched off — see [`close_wireless_adb`].
+///
+/// Returns true when a wireless transport is available afterwards.
+pub fn ensure_wireless_adb() -> bool {
+    let (usb, net) = transports();
+    if net.is_some() {
+        return true; // already reachable without the cable
+    }
+    let Some(usb) = usb else { return false };
+    tracing::info!("mirror inject: enabling wireless adb over the cable (adb tcpip {WIRELESS_PORT})");
+    let mut cmd = if have_timeout_bin() {
+        let mut c = Command::new("timeout");
+        c.args(["--kill-after=1", ADB_TIMEOUT_SECS, "adb"]);
+        c
+    } else {
+        Command::new("adb")
+    };
+    let ok = cmd
+        .args(["-s", &usb, "tcpip", &WIRELESS_PORT.to_string()])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        tracing::warn!("mirror inject: `adb tcpip` failed — staying on the cable");
+        return false;
+    }
+    WE_OPENED_TCPIP.store(true, Ordering::SeqCst);
+    if let Some(p) = tcpip_marker_path() {
+        let _ = vortex_l3_daemon::core::fs_private::write_private(&p, b"1");
+    }
+    remember_adb_port(WIRELESS_PORT);
+    // adbd restarts on the far side; the old USB transport goes away and the
+    // listener needs a moment before it answers.
+    std::thread::sleep(Duration::from_millis(1200));
+    // A fresh bootstrap must not be blocked by the redial cooldown.
+    if let Ok(mut last) = LAST_REDIAL.lock() {
+        *last = None;
+    }
+    forget_adb_serial();
+    redial()
+}
+
+/// Put the phone's adbd back on USB-only, closing the TCP port.
+///
+/// Called when Universal Control is switched off and on app shutdown, so the
+/// port is open only while the one feature that needs it is enabled. A crash
+/// can still leave it open, which is what the on-disk marker is for: the next
+/// launch sees it and closes the port if Universal Control is off.
+pub fn close_wireless_adb() {
+    let ours = WE_OPENED_TCPIP.swap(false, Ordering::SeqCst)
+        || tcpip_marker_path().is_some_and(|p| p.exists());
+    if !ours {
+        return;
+    }
+    if let Some(p) = tcpip_marker_path() {
+        let _ = std::fs::remove_file(p);
+    }
+    // Issue it on whatever transport answers — after an unplug that is the
+    // network one, and `adb usb` over TCP is exactly how the port gets closed
+    // remotely. With no transport at all there is nothing to do; the port dies
+    // with the phone's next reboot.
+    if scan_transports().is_none() {
+        tracing::debug!("mirror inject: no transport to close wireless adb on");
+        return;
+    }
+    if adb(&["usb"]) {
+        tracing::info!("mirror inject: wireless adb closed (adbd back to USB-only)");
+    } else {
+        tracing::warn!("mirror inject: could not close wireless adb");
+    }
+    forget_adb_serial();
 }
 
 /// Dial the phone's wireless adb back up.
@@ -299,6 +401,20 @@ fn adb_command(args: &[&str]) -> Command {
     }
     cmd.args(args);
     cmd
+}
+
+/// `adb …` against an EXPLICIT serial, bypassing the cached one — for cleaning
+/// up state on a transport that is not the one we would otherwise address.
+fn adb_raw(args: &[&str]) -> bool {
+    let mut cmd = if have_timeout_bin() {
+        let mut c = Command::new("timeout");
+        c.args(["--kill-after=1", ADB_TIMEOUT_SECS, "adb"]);
+        c
+    } else {
+        Command::new("adb")
+    };
+    cmd.args(args);
+    cmd.output().is_ok_and(|o| o.status.success())
 }
 
 fn adb(args: &[&str]) -> bool {
@@ -604,10 +720,10 @@ pub fn start() -> bool {
         tracing::warn!("mirror inject: adb push failed — using accessibility fallback");
         return false;
     }
-    // Tunnel the device's abstract socket to a host TCP port. Remove any stale
-    // forward we created last time, then let adb allocate a FREE port (tcp:0 →
-    // it prints the chosen port) instead of a fixed 28250 that might be taken.
-    let _ = adb(&["forward", "--remove", &format!("tcp:{}", ACTIVE_PORT.load(Ordering::SeqCst))]);
+    // Tunnel the device's abstract socket to a host TCP port. Clear every
+    // forward of OURS first, then let adb allocate a FREE port (tcp:0 → it
+    // prints the chosen port) instead of a fixed 28250 that might be taken.
+    remove_our_forwards();
     let port = match adb_capture(&["forward", "tcp:0", SOCKET_NAME])
         .and_then(|s| s.parse::<u16>().ok())
     {
@@ -629,12 +745,27 @@ pub fn start() -> bool {
              no touch injection"
         );
     }
-    // Launch the injector (it binds the abstract socket and listens).
-    let mut argv = vec!["shell", REMOTE_PATH];
-    if soft_keyboard_survives_hardware() {
-        argv.push("--keep-keys");
-    }
-    let spawn = adb_command(&argv)
+    // Launch the injector DETACHED from the shell session that starts it.
+    //
+    // It used to run as a plain foreground `adb shell`, with the local child
+    // process as its lifetime handle. But adbd kills every shell on a
+    // connection when that connection goes away, and over a WIRELESS transport
+    // the host connection is re-established regularly — the phone's own log
+    // shows it plainly:
+    //
+    //     BlockingConnectionAdapter(host-14): destructed
+    //     host-8 : read thread spawning
+    //
+    // Each of those took the injector with it. The tunnel stayed installed, so
+    // adb went on accepting connections and closing them, and Universal Control
+    // looked armed while nothing reached the phone. `nohup … &` reparents the
+    // injector to init, so it now survives its launching shell — and the
+    // control socket is the only thing that has to be re-established.
+    //
+    // The local child no longer owns its life, so `stop()` pkills it by name.
+    let keep = if soft_keyboard_survives_hardware() { " --keep-keys" } else { "" };
+    let launch = format!("nohup {REMOTE_PATH}{keep} >/dev/null 2>&1 </dev/null &");
+    let spawn = adb_command(&["shell", &launch])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -668,13 +799,34 @@ pub fn start() -> bool {
 
 /// Connect to the adb-forwarded injector socket, retrying while the device-side
 /// helper finishes binding (it needs ~700ms to set up the uinput device).
+/// Connect to the tunnelled control socket, and prove something is behind it.
+///
+/// A TCP connect alone proves nothing: with the tunnel installed but the
+/// injector gone, adb accepts the connection and then closes it, so `start()`
+/// would report success and Universal Control would arm with nothing at the far
+/// end. Two writes a moment apart settle it — the first can land in the buffer
+/// of a doomed socket, the second cannot, because the reset has arrived by then.
 fn connect_socket() -> Option<TcpStream> {
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(80));
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", ACTIVE_PORT.load(Ordering::SeqCst))) {
-            let _ = s.set_nodelay(true);
-            return Some(s);
+        let Ok(s) = TcpStream::connect(("127.0.0.1", ACTIVE_PORT.load(Ordering::SeqCst))) else {
+            continue;
+        };
+        let _ = s.set_nodelay(true);
+        let mut s = s;
+        // An EMPTY line, for the same reason the health check uses one: `V 0`
+        // destroys the phone's mouse device, and a writer reconnect can happen
+        // while the cursor is on the phone, which would delete it mid-session.
+        // The injector matches on the first character, so an empty line is no
+        // command at all — and it still writes a byte, which is all this needs.
+        if !write_line(&mut s, "") {
+            continue;
         }
+        std::thread::sleep(Duration::from_millis(60));
+        if !write_line(&mut s, "") {
+            continue;
+        }
+        return Some(s);
     }
     None
 }
@@ -694,6 +846,26 @@ fn write_line(stream: &mut TcpStream, line: &str) -> bool {
 /// and kick ONE background re-establish to win real-touch back. Exits cleanly
 /// on `Quit` or when the queue's sender is dropped (stopped / replaced).
 fn writer_loop(mut stream: TcpStream, rx: Receiver<Cmd>) {
+    // Reconnects since the last line that actually got through.
+    //
+    // A reconnect that fails again on the very next line is not a recovery:
+    // when the injector PROCESS on the phone is dead but `adb forward` is still
+    // installed, adb accepts the local connection and then closes it, so every
+    // single line "reconnects" and none is delivered. The loop below used to
+    // `continue` on that forever — logging "control socket reconnected" once
+    // per line, never reaching `on_injector_lost`, which is the only path that
+    // RELAUNCHES the injector. That is what made the cursor stop crossing until
+    // the app was restarted, most often right after the transport the injector
+    // was launched on went away (cable out, or adbd restarted for wireless).
+    const MAX_RECONNECTS: u32 = 3;
+    // A write into a socket adb is about to close still succeeds — it lands in
+    // the buffer. So one success proves nothing and the burst counter must not
+    // be reset by it, or it oscillates 1,0,1,0 and never trips. A RUN of them
+    // does prove it: motion sends many lines a second, so a healthy link clears
+    // this in a fraction of a second and a dead tunnel never does.
+    const HEALTHY_RUN: u32 = 20;
+    let mut reconnects: u32 = 0;
+    let mut run: u32 = 0;
     loop {
         let line = match rx.recv() {
             Ok(Cmd::Line(l)) => l,
@@ -705,6 +877,13 @@ fn writer_loop(mut stream: TcpStream, rx: Receiver<Cmd>) {
             Err(_) => return, // sender dropped — session stopped or replaced
         };
         if write_line(&mut stream, &line) {
+            if reconnects > 0 {
+                run += 1;
+                if run >= HEALTHY_RUN {
+                    reconnects = 0;
+                    run = 0;
+                }
+            }
             continue;
         }
         // Write failed — try to reconnect the adb tunnel for ~2s.
@@ -714,12 +893,23 @@ fn writer_loop(mut stream: TcpStream, rx: Receiver<Cmd>) {
             if let Ok(s) = TcpStream::connect(("127.0.0.1", ACTIVE_PORT.load(Ordering::SeqCst))) {
                 let _ = s.set_nodelay(true);
                 stream = s;
-                let _ = write_line(&mut stream, &line); // replay the lost line
-                recovered = true;
+                // The replayed line is the test: a tunnel with nothing behind
+                // it accepts the connection and fails the write.
+                recovered = write_line(&mut stream, &line);
                 break;
             }
         }
         if recovered {
+            reconnects += 1;
+            run = 0;
+            if reconnects > MAX_RECONNECTS {
+                tracing::warn!(
+                    "mirror inject: socket reconnects but delivers nothing \
+                     ({reconnects}×) — the injector is gone; relaunching"
+                );
+                on_injector_lost();
+                return;
+            }
             tracing::info!("mirror inject: control socket reconnected");
             continue;
         }
@@ -733,6 +923,26 @@ fn writer_loop(mut stream: TcpStream, rx: Receiver<Cmd>) {
 /// `active()` flips false (→ accessibility control, no freeze), then kick ONE
 /// delayed re-establish so real-touch returns if the device is still reachable.
 /// No-op re-launch if a concurrent `stop()` is tearing down.
+/// Drop every adb forward pointing at OUR socket, on every transport.
+///
+/// Removing only `ACTIVE_PORT` leaked one forward per restart that landed on a
+/// different port, and each is a listening socket on the host. Scoped to
+/// `localabstract:vortex_inject` on purpose — `adb forward --remove-all` would
+/// take out forwards the user set up for their own work.
+fn remove_our_forwards() {
+    let Some(out) = adb_capture(&["forward", "--list"]) else { return };
+    for line in out.lines() {
+        // "<serial> tcp:<port> localabstract:vortex_inject"
+        let mut it = line.split_whitespace();
+        let (Some(serial), Some(local), Some(remote)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        if remote == SOCKET_NAME {
+            let _ = adb_raw(&["-s", serial, "forward", "--remove", local]);
+        }
+    }
+}
+
 fn on_injector_lost() {
     if let Some(mut inj) = INJECT.lock().ok().and_then(|mut g| g.take()) {
         // Our own worker handle lives in here — detach (never join ourselves),
@@ -745,7 +955,55 @@ fn on_injector_lost() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(1));
         if !STOPPING.load(Ordering::SeqCst) && !active() {
-            let _ = start(); // best-effort; leaves accessibility in charge if adb is gone
+            // Through `start_async`, NOT `start` — the direct call bypassed the
+            // in-flight guard, so this relaunch could run concurrently with one
+            // the capture loop had already kicked off. Each `start` begins by
+            // pkill-ing `vortex_inject`, so the two killed each other's freshly
+            // launched injector, roughly every ten seconds.
+            start_async();
+        }
+    });
+}
+
+/// Keep the injector alive while Universal Control is armed but idle.
+///
+/// The writer only discovers a dead injector when it has something to write —
+/// and it has nothing to write while the cursor is on the laptop. So the
+/// injector would die during a quiet spell and the loss surfaced as the user's
+/// NEXT crossing silently failing: the push is refused (nothing may block while
+/// the pointer is captured), the cursor stays put, and only the push after that
+/// works. That is the "sometimes it just doesn't go across".
+///
+/// A harmless line every few seconds gives the writer something to fail on, so
+/// the existing detect-and-relaunch path runs in the quiet time instead of on
+/// the user's hand.
+///
+/// The line is EMPTY, and that matters. It was `V 0` — described here as an
+/// idempotent way to hide the phone-side cursor. It is not: on the phone `V 0`
+/// DESTROYS the mouse device, which is how "no cursor while control is on the
+/// laptop" is implemented. So every five seconds this reached in and deleted
+/// the pointer the user was at that moment using, and whether a crossing
+/// survived came down to where the tick happened to land — "sometimes it works,
+/// sometimes the cursor just disappears". Verified on the phone: with a client
+/// holding the socket and `V 1` sent, `dumpsys input` listed `vortex-touch` and
+/// `vortex-keyboard` and no `vortex-mouse`; with the health check out of the
+/// way, `vortex-mouse` is there.
+///
+/// An empty line parses to no command at all on the injector, so it costs a
+/// write on the socket — which is the entire point — and nothing else.
+pub fn spawn_health_check(armed: impl Fn() -> bool + Send + 'static) {
+    const EVERY: Duration = Duration::from_secs(5);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(EVERY);
+        if !armed() || STOPPING.load(Ordering::SeqCst) {
+            continue;
+        }
+        if INJECT.lock().map(|g| g.is_some()).unwrap_or(false) {
+            send("");
+        } else if !active() {
+            // No injector at all: try to get one back, so the next crossing
+            // finds a live transport rather than starting one from scratch.
+            start_async();
         }
     });
 }
@@ -803,7 +1061,30 @@ pub fn active() -> bool {
 }
 
 /// Proactively connect paired Bluetooth devices when approaching screen edge.
+/// Floor between HID connect attempts. Without it this fired on every single
+/// edge crossing, so a phone that simply is not bonded as an input device got
+/// a fresh connect attempt every few seconds.
+const BT_CONNECT_COOLDOWN: Duration = Duration::from_secs(60);
+static LAST_BT_CONNECT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Ask the paired phone to bring the Bluetooth HID link up.
+///
+/// Bluetooth HID is the FALLBACK for when adb cannot be reached, so this is a
+/// no-op while the uinput injector is live: reaching for a second input
+/// transport that is already unnecessary is how the phone ended up being asked
+/// to connect over and over while the cursor was crossing perfectly well over
+/// Wi-Fi.
 pub fn trigger_bt_connect() {
+    if INJECT.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return; // adb injector is up — the fallback is not needed
+    }
+    {
+        let mut last = LAST_BT_CONNECT.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < BT_CONNECT_COOLDOWN) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
     if let Ok(g) = BT_HID.lock() {
         if let Some(hid) = g.as_ref() {
             if !hid.is_connected() {
@@ -842,11 +1123,6 @@ pub fn has_transport() -> bool {
         }
     }
     false
-}
-
-/// Get a clone of the registered Bluetooth HID server, if any.
-pub fn get_bt_hid() -> Option<vortex_l3_daemon::core::bt_hid::BtHidServer> {
-    BT_HID.lock().ok().and_then(|g| g.clone())
 }
 
 /// Send one protocol line (`D slot nx ny`, `M slot nx ny`, `U slot`,
@@ -920,7 +1196,10 @@ pub fn stop() {
         let _ = inj.child.kill();
         let _ = inj.child.wait();
     }
-    let _ = adb(&["forward", "--remove", &format!("tcp:{}", ACTIVE_PORT.load(Ordering::SeqCst))]);
+    remove_our_forwards();
+    // The injector outlives the shell that launched it (see `start`), so
+    // killing the local child no longer stops it — name it explicitly.
+    let _ = adb(&["shell", "pkill", "-f", "vortex_inject"]);
 }
 
 #[cfg(test)]

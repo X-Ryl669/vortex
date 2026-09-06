@@ -363,7 +363,18 @@ class AudioDeviceController(private val appContext: Context) : AudioDeviceHandle
         const val CONNECT_SETTLE_MS: Long = 4_500
 
         /** Same idea for disconnect — usually faster than connect. */
-        const val DISCONNECT_SETTLE_MS: Long = 1_000
+        /** How long a profile disconnect may take to reach DISCONNECTED.
+         *
+         *  Was 1 s, which real earbuds routinely miss — the ACL teardown plus
+         *  the profile state change is often 1.5-3 s. Missing it made the phone
+         *  report "disconnect did not settle" for a disconnect that was simply
+         *  still in progress, and the laptop then tried to connect buds the
+         *  phone had not let go of yet, which the controller answers with
+         *  `br-connection-page-timeout`. Both showed up in one morning's log.
+         *
+         *  Raising the ceiling costs nothing when the buds are quick: the poll
+         *  returns the moment the state flips, so only the slow case waits. */
+        const val DISCONNECT_SETTLE_MS: Long = 3_000
 
         /** isConnected cache TTL. Long enough that a UI polling at 4 Hz
          *  hits cache 80 %+ of the time, short enough that a real

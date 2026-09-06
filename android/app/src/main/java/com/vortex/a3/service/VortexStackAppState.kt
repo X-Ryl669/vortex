@@ -55,6 +55,7 @@ internal fun VortexStack.buildLocalAppState(): com.vortex.a3.core.appstate.AppSt
         name = friendlyDeviceName(),
         earbuds = earbuds,
         revoked = revokeNow,
+        inputFocused = VortexService.inputFocused.get(),
         audioClaimRequest = claimNow,
         callPhase = phaseNow,
         // Call mirror additively over AppState (BLE+LAN) so the laptop

@@ -874,7 +874,14 @@ const A2DP_TRANSIENT_PAUSE: Duration = Duration::from_millis(220);
 
 /// Disconnect is usually faster than connect. 1 s is enough for both
 /// profiles to drop in practice.
-const DISCONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
+/// How long the laptop waits for ITS audio link to actually go away.
+///
+/// The same 1 s the phone used, and wrong for the same reason: a real headset's
+/// teardown is often 1.5-3 s, and falling short of it turns a slow disconnect
+/// into a hard `SwitchError::Timeout`. The wait polls, so a quick headset still
+/// returns immediately and only the slow case uses the extra room. Stays well
+/// inside the orchestrator's 14 s flow watchdog.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_millis(3000);
 
 /// Poll interval while awaiting a state flip. 40 ms keeps the
 /// release/connect confirmation tight (the reference build polled at

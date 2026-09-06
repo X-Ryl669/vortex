@@ -975,6 +975,18 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // (and don't toast a failure for a file that plainly arrived).
         lan.onFileServed = { token -> noteFileServed(token) }
         lanServer = lan
+        // Let code with no handle on the stack ship a snapshot immediately —
+        // the accessibility service reporting an input-focus change, which the
+        // laptop may act on within a second.
+        //
+        // Over BLE, NOT `lanServer.nudge()`. That name is misleading: nudge()
+        // re-announces the mDNS record, it does not send an AppState. The LAN
+        // exchange is laptop-initiated ("← app-state from peer" then "→
+        // app-state sent"), roughly every twelve seconds, so a focus change
+        // that way reached the laptop long after the user had pressed Esc —
+        // measured at five seconds on the first real attempt. The BLE write is
+        // ours to make and lands in a couple of hundred milliseconds.
+        VortexService.appStateNudge = { pushStateViaBle() }
     }
 
     /**

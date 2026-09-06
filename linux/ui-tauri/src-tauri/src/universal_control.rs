@@ -45,8 +45,103 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// the portal and exits.
 static STOP: AtomicBool = AtomicBool::new(false);
 
-/// Push back past the entry edge by this many delta units → return to laptop.
-const RETURN_MARGIN: f32 = 60.0;
+// ---------------------------------------------------------------------------
+// The return gesture
+//
+// Symmetry with the entry detector below is the whole design. Coming back has
+// to be measured the way going across is measured — an eased distance, a
+// direction test, an idle timeout — because a single accumulated distance with
+// a hair-trigger reset is what made returning unreliable, and unreliable in the
+// worst way: the pointer sat on the phone with no way home but Esc.
+//
+// The numbers here are four times the entry's for one concrete reason. The
+// entry measures REAL motion against a REAL barrier the compositor is holding.
+// The return measures a DEAD-RECKONED position pinned against a clamp we never
+// observe: the injector re-homes the cursor for ~500 ms after arrival, and the
+// acceleration curve is undone using the laptop's send gaps rather than the
+// phone's, so the reckoned position carries tens of pixels of error. The
+// threshold has to sit above that noise.
+
+/// Outward push needed to return when pushing SLOWLY, in delta units.
+///
+/// Far larger than the crossing's, and it has to be. The crossing is measured
+/// against a barrier the compositor is holding the pointer against, so the user
+/// feels the resistance and 10 px means something. The return is measured
+/// against a clamp on a screen they are looking at, with the pointer already
+/// pinned there — every further pixel of hand movement counts, and drifting 40
+/// px up the phone's top edge while reaching for something is nothing at all.
+/// It measured 22-36 px on ordinary use in the log. A push meant as "send me
+/// home" is a shove of several centimetres, which is thousands of counts.
+const RETURN_PUSH_SLOW: f32 = 200.0;
+/// …and when pushing fast. Eased between the two by outward speed, exactly as
+/// [`PUSH_THROUGH`]/[`PUSH_THROUGH_FAST`] are for the crossing.
+const RETURN_PUSH_FAST: f32 = 100.0;
+
+/// Floor on the interval the return's push SPEED is measured over.
+///
+/// Without it the first tick divides by ~0 and reports an infinite speed, so
+/// the easing sat at its fast end always and the slow threshold never applied.
+const RETURN_SPEED_WINDOW: f32 = 0.10;
+
+/// Give up on a half-finished return after this long with no outward progress.
+///
+/// The old rule reset the accumulator on ANY tick whose outward component was
+/// zero. That is what actually trapped the pointer: at 2 ms ticks a slow,
+/// slightly diagonal push yields `dy = 0, dx = 1` on most ticks, so the
+/// accumulator was cleared far more often than it advanced and the threshold
+/// was unreachable however long the user pushed. Nothing is held frozen on the
+/// laptop while a return is measured — unlike the crossing, where the pointer
+/// is pinned and a long timeout would be felt — so this can be generous.
+const RETURN_IDLE: Duration = Duration::from_millis(120);
+
+/// An inward tick this large is a real reversal: drop the accumulated push.
+const RETURN_REVERSAL: f32 = 4.0;
+
+/// Ignore a crossing that arrives this soon after a release.
+///
+/// A return leaves the hand still moving toward the barrier, and the crossing
+/// detector needs only [`PUSH_THROUGH_FAST`] from a hand already in motion. The
+/// log shows the result: returns at 09:37:33.253 and 09:37:34.891 were each
+/// followed by a fresh barrier touch 16 and 22 ms later, and the pointer bounced
+/// straight back onto the phone — landing at its top edge, which is what the
+/// user saw as "it reappears at the top". A human reversing and deliberately
+/// pushing again takes far longer than this.
+const RE_ENTRY_COOLDOWN: Duration = Duration::from_millis(250);
+
+/// Does the phone currently have a text field focused? Fed by both AppState
+/// ingress paths (LAN heartbeat and BLE STATE), which is why it lives here as a
+/// global rather than in the capture loop's locals.
+static PHONE_INPUT_FOCUSED: AtomicBool = AtomicBool::new(false);
+
+/// Record the phone's input-focus state. Called from the AppState consumers.
+pub(crate) fn note_phone_input_focused(focused: bool) {
+    if PHONE_INPUT_FOCUSED.swap(focused, Ordering::Relaxed) != focused {
+        tracing::info!(focused, "universal-control: phone input focus");
+    }
+}
+
+/// Two Esc presses inside this window ALWAYS return, whatever the phone says
+/// about focus.
+///
+/// Esc is the guaranteed way back — the one thing that works when the edge
+/// gesture is awkward or the pointer has ended up somewhere confusing. Making
+/// it conditional on a flag the PHONE reports means a stale or wrong flag traps
+/// the user, which is worse than not having the feature. So the condition only
+/// ever costs the first press: press it twice and control comes back, always.
+const ESC_DOUBLE_WINDOW: Duration = Duration::from_millis(600);
+
+/// How often to re-ask the phone for its rotation while the pointer is on it.
+const ROTATION_POLL: Duration = Duration::from_secs(2);
+
+/// Keep the arrival landing this far from the phone's side edges, so the
+/// pointer never appears already touching a wall.
+const ENTRY_INSET: f32 = 24.0;
+
+/// How long the phone-side injector spends re-homing the cursor after `V 1`
+/// (80 ms settle + 6 retries × 70 ms). Dead reckoning is meaningless during it
+/// — the injector is slamming the pointer to the entry point the whole time —
+/// so we neither send motion nor advance the reckoning until it is over.
+const HOME_SETTLE: Duration = Duration::from_millis(500);
 
 /// How far you have to keep pushing past the barrier before control crosses,
 /// when you are moving SLOWLY — Apple's "push the cursor all the way through".
@@ -266,6 +361,13 @@ fn remember_enabled(on: bool) {
 /// into "remember it only when the phone happens to be plugged in".
 pub(crate) fn restore(app: tauri::AppHandle) {
     if !enabled_path().is_some_and(|p| p.exists()) {
+        // Universal Control is off. If a previous run was killed before it
+        // could close the adb TCP port it opened, close it now — otherwise a
+        // crash would leave the port listening for the phone's whole uptime,
+        // long after the feature that wanted it was switched off.
+        std::thread::spawn(|| {
+            crate::mirror_inject::close_wireless_adb();
+        });
         return;
     }
     tracing::info!("universal-control: was left on — arming the edge again");
@@ -310,6 +412,16 @@ pub(crate) async fn uc_start(app: tauri::AppHandle) -> Result<(), String> {
 /// it is not yet worth mentioning.
 static BT_HID_INIT: AtomicBool = AtomicBool::new(false);
 
+/// One health-check thread for the app's lifetime; it only acts while armed.
+static HEALTH_INIT: AtomicBool = AtomicBool::new(false);
+
+fn ensure_injector_health() {
+    if HEALTH_INIT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    crate::mirror_inject::spawn_health_check(|| RUNNING.load(Ordering::SeqCst));
+}
+
 pub(crate) fn ensure_bt_hid() {
     if BT_HID_INIT.swap(true, Ordering::SeqCst) {
         return;
@@ -318,7 +430,9 @@ pub(crate) fn ensure_bt_hid() {
         let server = vortex_l3_daemon::core::bt_hid::BtHidServer::new();
         if let Ok(conn) = zbus::connection::Connection::system().await {
             if server.register(&conn).await.is_ok() {
-                server.try_connect_paired_devices(&conn).await;
+                // Register only. Connecting is the gated path
+                // (`trigger_bt_connect`) — registering the SDP record costs the
+                // phone nothing, reaching out to it does.
                 crate::mirror_inject::set_bt_hid(server);
                 tracing::info!("universal-control: Bluetooth HID registered as ADB-free fallback");
             }
@@ -336,6 +450,26 @@ fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
     // acquire it). Started lazily here, lives for the app's lifetime.
     ensure_cursor_publisher();
     ensure_bt_hid();
+    ensure_injector_health();
+
+    // Wireless adb, bootstrapped from a cable that is plugged in RIGHT NOW.
+    // Doing it here — while Universal Control is being switched on and the
+    // cable may still be in — is the only moment it can be done on Android 10,
+    // and it is what makes the feature keep working after the user unplugs.
+    // The matching close is in `uc_stop`, so the port is open only while this
+    // feature is on. Off the caller's thread: it restarts adbd and waits.
+    std::thread::spawn(|| {
+        crate::mirror_inject::ensure_wireless_adb();
+        // Warm the injector up NOW, while arming, instead of on the first
+        // barrier touch. The crossing itself must never block (the pointer is
+        // captured at that instant), so a push that arrives before the injector
+        // is up is simply refused — which is why the first crossing after a
+        // restart or a login so often did nothing at all. Starting it here
+        // costs nothing and is finished long before a hand reaches the edge.
+        if !crate::mirror_inject::has_transport() {
+            crate::mirror_inject::start_async();
+        }
+    });
 
     // The native-cursor path needs either the ADB uinput injector or Bluetooth HID server.
     if require_injector && !crate::mirror_inject::has_transport() && !crate::mirror_inject::start() {
@@ -345,13 +479,9 @@ fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
         }
     }
 
-    if let Some(hid) = crate::mirror_inject::get_bt_hid() {
-        tauri::async_runtime::spawn(async move {
-            if let Ok(conn) = zbus::connection::Connection::system().await {
-                hid.try_connect_paired_devices(&conn).await;
-            }
-        });
-    }
+    // Through the same gate as every other call site: skipped entirely while
+    // the adb injector is up, and rate-limited when it is not.
+    crate::mirror_inject::trigger_bt_connect();
     // libei's stream is !Send → own thread + current-thread runtime.
     std::thread::spawn(move || {
         // Clears RUNNING even if the loop panics. Without it a single panic
@@ -447,6 +577,11 @@ fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
 pub(crate) fn uc_stop() {
     remember_enabled(false);
     STOP.store(true, Ordering::SeqCst);
+    // Close the adb TCP port we opened for this feature. Off-thread: `adb usb`
+    // is a subprocess with a timeout in front of it, and this is a UI command.
+    std::thread::spawn(|| {
+        crate::mirror_inject::close_wireless_adb();
+    });
 }
 
 /// Whether a capture session is currently running.
@@ -615,7 +750,21 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     // Dead-reckoned position of the phone's cursor, and how far the motion has
     // tried to push it back out through the edge it entered from.
     let (mut px, mut py) = (0f32, 0f32);
-    let mut overpush = 0f32;
+    // Return-gesture state: accumulated outward push, the sideways motion it is
+    // measured against, when it started (for the speed easing) and when it last
+    // advanced (for the idle reset).
+    let mut return_push = 0f32;
+    let mut return_slide = 0f32;
+    let mut return_started = Instant::now();
+    let mut rotation_polled = Instant::now();
+    let mut last_esc = Instant::now() - ESC_DOUBLE_WINDOW;
+    // Keys currently held down ON THE PHONE, so they can be released before the
+    // session ends rather than left stuck.
+    let mut held_keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut return_progress = Instant::now();
+    // When control last came back to the laptop, so a crossing cannot fire on
+    // the tail of the motion that produced the return.
+    let mut released_at = Instant::now() - RE_ENTRY_COOLDOWN;
     // The sub-pixel remainder of dividing Android's acceleration curve out of
     // the motion we forward, and the gap Android will see between one delta and
     // the next — which is what the curve is a function of, so it moves only when
@@ -721,6 +870,29 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                 Some(act) => {
                     entry = act.cursor_position().unwrap_or((0.0, 0.0));
                     activation_id = act.activation_id();
+                    // A barrier touch on the tail of the motion that just
+                    // brought the pointer back is not a new crossing. The hand
+                    // is still travelling toward the edge and the crossing
+                    // detector needs almost nothing from a hand already moving,
+                    // so without this the pointer bounced straight back onto the
+                    // phone — 16 ms after one return in the log, 22 ms after the
+                    // next. Release at once and let the pointer settle.
+                    if released_at.elapsed() < RE_ENTRY_COOLDOWN {
+                        tracing::debug!("universal-control: re-entry within cooldown — ignored");
+                        if let Err(e) = ic
+                            .release(
+                                &session,
+                                act.activation_id(),
+                                Some(abandon_pos(edge, entry, 0.0, (x, y, w, h))),
+                            )
+                            .await
+                        {
+                            tracing::warn!("universal-control: release: {e}");
+                        }
+                        captured = false;
+                        pending = false;
+                        continue;
+                    }
                     // Touching the barrier only starts the measurement — the
                     // crossing itself happens in the flush tick, once the push
                     // is deliberate enough. Nothing is hidden and nothing is
@@ -745,6 +917,7 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                     if active {
                         // Re-activated without our release having landed: the
                         // phone still owns a cursor device nobody will remove.
+                        release_held_keys(&mut held_keys);
                         crate::mirror_inject::send("V 0");
                     }
                     active = false;
@@ -873,9 +1046,34 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                         // escape, in case the edge return-gesture is awkward).
                         // Also cancels a half-finished push.
                         if k.key == 1 && v == 1 && (active || pending) {
+                            // Typing into a field on the phone? Then Esc means
+                            // what it means everywhere else — dismiss the field
+                            // — not "give me my pointer back". BACK is
+                            // Android's own way to do that: it closes the IME
+                            // and drops the focus.
+                            //
+                            // Only ever the FIRST press: a second Esc inside
+                            // ESC_DOUBLE_WINDOW returns unconditionally, so a
+                            // stale flag can cost one keystroke and never a way
+                            // out. The flag is also cleared optimistically here
+                            // — the phone's next snapshot may be a beat away,
+                            // and the second press must not be swallowed too.
+                            let double = last_esc.elapsed() < ESC_DOUBLE_WINDOW;
+                            last_esc = Instant::now();
+                            if active
+                                && !double
+                                && PHONE_INPUT_FOCUSED.swap(false, Ordering::Relaxed)
+                            {
+                                tracing::info!(
+                                    "universal-control: Esc → dismissing the phone's text field"
+                                );
+                                crate::mirror_inject::send("K back");
+                                continue;
+                            }
                             tracing::info!("universal-control: Esc → return to laptop");
                             if active {
-                                crate::mirror_inject::send("V 0");
+                                release_held_keys(&mut held_keys);
+                        crate::mirror_inject::send("V 0");
                             }
                             match ic
                                 .release(&session, activation_id, Some(return_pos(edge, entry)))
@@ -886,13 +1084,27 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             active = false;
                             pending = false;
-                            overpush = 0.0;
+                            return_push = 0.0;
+                            return_slide = 0.0;
+                            released_at = Instant::now();
                             set_cursor(false);
                             continue;
                         }
                         if active {
                             // libei reports evdev keycodes — the injector speaks the same.
                             crate::mirror_inject::send(&format!("E {} {v}", k.key));
+                            // Remember what is down. A key still held when the
+                            // pointer goes home never got its release: the `E`
+                            // path only runs while `active`, and the phone's
+                            // `V 0` tears down the MOUSE device only, so with
+                            // `--keep-keys` the keyboard device outlives the
+                            // session with the key stuck down. Shift held
+                            // through a drag-and-push was enough to do it.
+                            if v == 1 {
+                                held_keys.insert(k.key);
+                            } else {
+                                held_keys.remove(&k.key);
+                            }
                         }
                     }
                     EiEvent::Disconnected(_) => {
@@ -906,6 +1118,39 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
             _ = flush.tick() => {
                 if STOP.load(Ordering::SeqCst) {
                     break; // cleanup below releases + disables + closes
+                }
+                // Rotation, while the pointer is ON the phone.
+                //
+                // `refresh_rotation` is fire-and-forget and takes a `dumpsys`
+                // round trip, but `rotation_cached` is an atomic load, so this
+                // costs nothing per tick. It used to be read exactly once, at
+                // the crossing, 5-50 ms after the fetch was kicked — far too
+                // soon — so every crossing ran on the PREVIOUS crossing's
+                // rotation. Get it wrong and the reckoned bounds are the other
+                // way round from the real ones: the pointer either returns from
+                // an edge it is nowhere near, or has to be pushed a thousand
+                // pixels past a wall before the reckoning agrees it is there,
+                // which is a trap Esc is the only way out of.
+                if active {
+                    let now_rot = crate::mirror_inject::rotation_cached();
+                    if now_rot != rot {
+                        rot = now_rot;
+                        (pw, ph) = match rot {
+                            1 | 3 => (phys.1, phys.0),
+                            _ => phys,
+                        };
+                        px = px.clamp(0.0, (pw - 1) as f32);
+                        py = py.clamp(0.0, (ph - 1) as f32);
+                        return_push = 0.0;
+                        return_slide = 0.0;
+                        tracing::info!(rot, "universal-control: phone rotated → {pw}x{ph}");
+                    }
+                    // …and keep the cached value itself moving, so a rotation
+                    // that happens with the pointer already across is noticed.
+                    if rotation_polled.elapsed() >= ROTATION_POLL {
+                        rotation_polled = Instant::now();
+                        crate::mirror_inject::refresh_rotation();
+                    }
                 }
                 let dx = acc_dx.round() as i32;
                 let dy = acc_dy.round() as i32;
@@ -965,7 +1210,9 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             pending = false;
                             active = true;
-                            overpush = 0.0;
+                            return_push = 0.0;
+                            return_slide = 0.0;
+                            return_progress = Instant::now();
                             entered_at = Instant::now();
                             set_cursor(true);
                             crate::mirror_inject::send(&format!("V 1 {ox} {oy} {sx} {sy}"));
@@ -995,12 +1242,44 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                         // Re-read per tick, not cached: the real curve arrives
                         // from the phone in the background, some way into the
                         // session.
+                        // Nothing moves until the phone has finished parking
+                        // the cursor at the entry point.
+                        //
+                        // `V 1` makes the injector create the mouse device and
+                        // then slam it home: an 80 ms settle plus six retries
+                        // 70 ms apart, all of it `usleep` on the single thread
+                        // that reads our socket. Motion sent during that window
+                        // does not arrive late — it QUEUES, and is then applied
+                        // back-to-back with no gap between deltas. Android reads
+                        // zero elapsed time as infinite speed, so every one of
+                        // those queued deltas gets the curve's saturated 3x, all
+                        // at once. A small push right after crossing therefore
+                        // fired the cursor off across a 2340 px screen, and the
+                        // user's next move — hunting for it — swept up through
+                        // the top edge and sent control back to the laptop. That
+                        // is "I push down a little and it disappears".
+                        //
+                        // The injector is re-homing the pointer for this whole
+                        // window anyway, so any motion we send is overwritten
+                        // regardless. Drop it, and hold the reckoning at the
+                        // entry point so it still matches the screen.
+                        let homing = entered_at.elapsed() < HOME_SETTLE;
+                        if homing {
+                            // Swallow the motion whole: no send, and no
+                            // advance of the reckoning, which is still sitting
+                            // where the injector keeps putting the cursor.
+                            send_x = 0.0;
+                            send_y = 0.0;
+                            last_motion = Instant::now();
+                        }
                         let curve = crate::mirror_inject::pointer_curve();
                         let dt = last_motion.elapsed().as_secs_f32();
                         let want = (dx as f32).hypot(dy as f32);
                         let ratio = curve.undo(want, dt) / want.max(f32::EPSILON);
-                        send_x += dx as f32 * ratio;
-                        send_y += dy as f32 * ratio;
+                        if !homing {
+                            send_x += dx as f32 * ratio;
+                            send_y += dy as f32 * ratio;
+                        }
                         let (ex, ey) = (send_x.round(), send_y.round());
                         if ex != 0.0 || ey != 0.0 {
                             send_x -= ex;
@@ -1013,7 +1292,11 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                         // its own pointer, so `px`/`py` stay in step with what
                         // is on screen. In the movement we asked for, which is
                         // the movement that happens now the curve is undone.
-                        let (nx, ny) = (px + dx as f32, py + dy as f32);
+                        let (nx, ny) = if homing {
+                            (px, py)
+                        } else {
+                            (px + dx as f32, py + dy as f32)
+                        };
                         px = nx.clamp(0.0, (pw - 1) as f32);
                         py = ny.clamp(0.0, (ph - 1) as f32);
                         // Where the pointer would re-enter the laptop from here.
@@ -1024,24 +1307,79 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                         // second monitor would.
                         entry = laptop_point(edge, (px, py), (pw, ph), span, (x, y, w, h));
                         // Motion that Android threw away because the pointer is
-                        // already against the edge it came in from = pushing
-                        // back towards the laptop. Only a sustained push counts,
-                        // so a jitter at the edge cannot bounce you out.
+                        // already hard against the edge it came in from = a push
+                        // back towards the laptop.
+                        //
+                        // ONLY the entry edge. The other three are walls, the
+                        // way the far edges of a second monitor are. Counting
+                        // them was tried and was worse: the phone is 1080 px
+                        // wide, ordinary work touches its side edges constantly,
+                        // and the entry point routinely lands within ~60 px of
+                        // the right clamp — so the pointer was thrown back to
+                        // the laptop mid-gesture, twice inside two seconds in
+                        // the log. Being trapped on the phone was a real bug,
+                        // but its cause was in this detector (below), not in
+                        // which edges it watched.
                         let over = match edge {
                             Edge::Right => -nx.min(0.0),
                             Edge::Left => (nx - (pw - 1) as f32).max(0.0),
                             Edge::Bottom => -ny.min(0.0),
                             Edge::Top => (ny - (ph - 1) as f32).max(0.0),
                         };
-                        if entered_at.elapsed() >= Duration::from_millis(350) {
-                            overpush = if over > 0.0 { overpush + over } else { 0.0 };
-                        } else {
-                            overpush = 0.0;
+                        // How much of this tick went ALONG the edge rather than
+                        // out through it — the same test the crossing makes, so
+                        // reaching across the status bar is not a return.
+                        let along = along_delta(edge, dx, dy).abs();
+                        // Inward = a genuine reversal, and only a decisive one:
+                        // sub-pixel noise must not undo a push in progress.
+                        let inward = inward_delta(edge, dx, dy);
+                        if over > 0.0 {
+                            if return_push == 0.0 {
+                                return_started = Instant::now();
+                            }
+                            return_push += over;
+                            return_slide += along;
+                            return_progress = Instant::now();
+                        } else if inward >= RETURN_REVERSAL
+                            || return_progress.elapsed() >= RETURN_IDLE
+                        {
+                            // Reset ONLY on a real reversal or on going quiet.
+                            // Never on a tick that merely had no outward
+                            // component: at 2 ms ticks a slow diagonal push
+                            // produces those constantly, and clearing on them is
+                            // what made the threshold unreachable.
+                            return_push = 0.0;
+                            return_slide = 0.0;
                         }
-                        if overpush >= RETURN_MARGIN {
-                            tracing::info!("universal-control: return → laptop (edge push)");
+                        // Eased by outward speed, exactly as the crossing is.
+                        // Speed over a REAL interval. `return_started` is set
+                        // on the same tick the first outward motion lands, so
+                        // an unfloored elapsed is ~0 and the division reports an
+                        // infinite push speed — which pinned the easing to its
+                        // fast end from the very first tick and let a 22-unit
+                        // nudge come home. The log caught it exactly:
+                        // `push=22.0 needed=20.0`, three times in a row.
+                        let rsecs = return_started
+                            .elapsed()
+                            .as_secs_f32()
+                            .max(RETURN_SPEED_WINDOW);
+                        let rt = ((return_push / rsecs - PUSH_SLOW) / (PUSH_FAST - PUSH_SLOW))
+                            .clamp(0.0, 1.0);
+                        let rneeded =
+                            RETURN_PUSH_SLOW + (RETURN_PUSH_FAST - RETURN_PUSH_SLOW) * rt;
+                        let returning = entered_at.elapsed() >= HOME_SETTLE
+                            && return_push >= rneeded
+                            && return_push >= return_slide * PUSH_INWARD_RATIO;
+                        if returning {
+                            tracing::info!(
+                                push = return_push,
+                                needed = rneeded,
+                                secs = rsecs,
+                                "universal-control: return → laptop (edge push)"
+                            );
                             lift_scroll(&mut scroll_finger, SCROLL_SLOT);
-                            crate::mirror_inject::send("V 0");
+                            release_held_keys(&mut held_keys);
+                        crate::mirror_inject::send("V 0");
                             match ic
                                 .release(&session, activation_id, Some(return_pos(edge, entry)))
                                 .await
@@ -1050,7 +1388,9 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                                 Err(e) => tracing::warn!("universal-control: release: {e}"),
                             }
                             active = false;
-                            overpush = 0.0;
+                            return_push = 0.0;
+                            return_slide = 0.0;
+                            released_at = Instant::now();
                             set_cursor(false);
                         }
                     }
@@ -1162,7 +1502,9 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => tracing::warn!("universal-control: release: {e}"),
                     }
                     active = false;
-                    overpush = 0.0;
+                    return_push = 0.0;
+                    return_slide = 0.0;
+                    released_at = Instant::now();
                     set_cursor(false);
                 }
                 // A push that stalls or turns away hands the pointer straight
@@ -1203,6 +1545,7 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                 if captured && last_input.elapsed() >= IDLE_RELEASE_AFTER {
                     tracing::info!("universal-control: idle release → laptop (at {px},{py})");
                     if active {
+                        release_held_keys(&mut held_keys);
                         crate::mirror_inject::send("V 0");
                     }
                     match ic
@@ -1214,7 +1557,9 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     active = false;
                     pending = false;
-                    overpush = 0.0;
+                    return_push = 0.0;
+                    return_slide = 0.0;
+                    released_at = Instant::now();
                     set_cursor(false);
                 }
                 // Wi-Fi power-save keepalive (see KEEPALIVE_GAP). Covers both
@@ -1242,6 +1587,7 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     // finger left down here would stay down — the phone stuck mid-drag.
     lift_scroll(&mut scroll_finger, SCROLL_SLOT);
     if active {
+        release_held_keys(&mut held_keys);
         crate::mirror_inject::send("V 0");
     }
     // UNCONDITIONAL: guarding this on our own flags is exactly the bug it is
@@ -1340,6 +1686,18 @@ fn along_delta(edge: Edge, dx: i32, dy: i32) -> f32 {
 
 /// Where to drop the laptop cursor when a push is abandoned: where the pointer
 /// would have got to had we not been holding it still while we measured.
+/// Send an explicit key-up for every key still held on the phone.
+///
+/// The injector has no idea the session is ending, and with `--keep-keys` its
+/// keyboard device survives `V 0`, so a key we never released stays down —
+/// which on the phone means a modifier silently rewriting everything the user
+/// types next, on their own device, with nothing to point at.
+fn release_held_keys(held: &mut std::collections::HashSet<u32>) {
+    for key in held.drain() {
+        crate::mirror_inject::send(&format!("E {key} 0"));
+    }
+}
+
 fn abandon_pos(
     edge: Edge,
     entry: (f32, f32),
@@ -1422,11 +1780,21 @@ fn entry_point(edge: Edge, pw: i32, ph: i32, entry: (f32, f32), span: (i32, i32)
             ((v - origin as f32) / len as f32).clamp(0.0, 1.0)
         }
     };
+    // Keep the landing off the side walls. The armed span is a fraction of the
+    // laptop edge (400 px of 1920 here) stretched over the phone's full width,
+    // so the ends of the span map hard into the corners — and the end people
+    // actually use is wherever their hand comes down. A cursor that arrives
+    // already touching a wall has nowhere to go in that direction and is half
+    // off-screen while it sits there.
+    let inset = |v: f32, max: i32| {
+        let m = (max - 1).max(1) as f32;
+        v.clamp(ENTRY_INSET.min(m / 2.0), m - ENTRY_INSET.min(m / 2.0)) as i32
+    };
     match edge {
-        Edge::Right => (0, (frac(entry.1) * (ph - 1) as f32) as i32),
-        Edge::Left => (pw - 1, (frac(entry.1) * (ph - 1) as f32) as i32),
-        Edge::Bottom => ((frac(entry.0) * (pw - 1) as f32) as i32, 0),
-        Edge::Top => ((frac(entry.0) * (pw - 1) as f32) as i32, ph - 1),
+        Edge::Right => (0, inset(frac(entry.1) * (ph - 1) as f32, ph)),
+        Edge::Left => (pw - 1, inset(frac(entry.1) * (ph - 1) as f32, ph)),
+        Edge::Bottom => (inset(frac(entry.0) * (pw - 1) as f32, pw), 0),
+        Edge::Top => (inset(frac(entry.0) * (pw - 1) as f32, pw), ph - 1),
     }
 }
 
@@ -1528,7 +1896,9 @@ fn ensure_cursor_publisher() {
             .and_then(|b| {
                 b.serve_at(
                     "/org/vortex/UniversalControl",
-                    UcDbus { cursor_hidden: false },
+                    UcDbus {
+                        cursor_hidden: false,
+                    },
                 )
             }) {
             Ok(b) => match b.build().await {
@@ -1561,7 +1931,9 @@ fn ensure_cursor_publisher() {
             let mut iface = iface_ref.get_mut().await;
             if iface.cursor_hidden != hidden {
                 iface.cursor_hidden = hidden;
-                let _ = iface.cursor_hidden_changed(iface_ref.signal_emitter()).await;
+                let _ = iface
+                    .cursor_hidden_changed(iface_ref.signal_emitter())
+                    .await;
                 tracing::info!("universal-control: CursorHidden → {hidden} (emitted)");
             }
         }
@@ -1679,8 +2051,14 @@ mod tests {
                 let (o, l) = barrier_span(seg, (0, len));
                 assert!(l >= 1, "len {len}: zero-length barrier");
                 assert!(l <= len.max(1), "len {len}: longer than the edge");
-                assert!(l * 2 <= len || l == 1, "len {len}: took more than half ({l})");
-                assert!(o >= 0 && o + l <= len.max(1), "len {len}: {o}+{l} off the edge");
+                assert!(
+                    l * 2 <= len || l == 1,
+                    "len {len}: took more than half ({l})"
+                );
+                assert!(
+                    o >= 0 && o + l <= len.max(1),
+                    "len {len}: {o}+{l} off the edge"
+                );
             }
         }
     }

@@ -206,6 +206,9 @@ pub(crate) fn spawn_state_consumer(
                         // Owner-present gate: record the phone's unlock state for
                         // proximity auto-unlock.
                         crate::proximity::note_phone_unlocked(state.unlocked);
+                        // Universal Control's Esc: dismiss a focused field on the
+                        // phone before handing the pointer back.
+                        crate::universal_control::note_phone_input_focused(state.input_focused);
                         let dto = app_state_to_dto(hex::encode(peer_pub), state.clone());
                         let _ = app_state.emit("vortex:peer_state", dto);
                         // Auto-pin the peer's earbuds locally so the card shows

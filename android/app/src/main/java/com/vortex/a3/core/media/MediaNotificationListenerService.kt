@@ -575,6 +575,65 @@ class MediaNotificationListenerService : NotificationListenerService() {
         @Volatile
         private var callNotifKey: String? = null
 
+        /** CAL-13 — second connect signal, for dialers whose notification never
+         *  sets `EXTRA_SHOW_CHRONOMETER` (MIUI's does not: every poll of a real
+         *  28-second call logged `chrono=false`, so the laptop pill sat on
+         *  "Calling…" for the whole call).
+         *
+         *  The telephony stack moves the audio mode to `MODE_IN_CALL` when the
+         *  voice path is actually opened — i.e. when the callee answers. That is
+         *  a locale-free, ROM-independent signal, but only as a TRANSITION: on
+         *  some ROMs the mode is already `MODE_IN_CALL` while dialing (ringback
+         *  played through the call path). So we take a baseline the first time
+         *  we see a dialing outgoing call, and only a non-IN_CALL → IN_CALL
+         *  change counts as connect. When the baseline is already IN_CALL we
+         *  learn nothing from the mode and fall back to the chronometer alone. */
+        @Volatile
+        private var callModeBaselineTaken = false
+        @Volatile
+        private var callModeUsable = false
+        /** Log the dialer notification's extras once per call, so a dialer that
+         *  answers neither signal can still be diagnosed from one real call. */
+        @Volatile
+        private var callExtrasLogged = false
+
+        /** Call id the connect-detection state above belongs to, so a new call
+         *  takes a fresh audio-mode baseline instead of inheriting the previous
+         *  call's (which would make every later call connect instantly). */
+        @Volatile
+        private var connectStateCallId: String? = null
+
+        /** Reset the per-call connect-detection state when the call changes. */
+        private fun resetCallConnectStateIfNew(id: String) {
+            if (connectStateCallId == id) return
+            connectStateCallId = id
+            callModeBaselineTaken = false
+            callModeUsable = false
+            callExtrasLogged = false
+        }
+
+        /** Current audio mode, or null when unreadable. */
+        private fun audioMode(): Int? = try {
+            instance?.getSystemService(android.media.AudioManager::class.java)?.mode
+        } catch (t: Throwable) {
+            Log.w(TAG, "audio mode unreadable: ${t.message}")
+            null
+        }
+
+        /** True once the voice path has opened since this call started dialing. */
+        private fun audioPathOpened(): Boolean {
+            val mode = audioMode() ?: return false
+            val inCall = mode == android.media.AudioManager.MODE_IN_CALL ||
+                mode == android.media.AudioManager.MODE_IN_COMMUNICATION
+            if (!callModeBaselineTaken) {
+                callModeBaselineTaken = true
+                callModeUsable = !inCall
+                Log.i(TAG, "call connect: audio-mode baseline=$mode usable=$callModeUsable")
+                return false
+            }
+            return callModeUsable && inCall
+        }
+
         /** True if [sbn] is the system/dialer ongoing-call notification. Works
          *  even when `sbn.notification` is null (common on removal), via package. */
         private fun isCallNotification(sbn: StatusBarNotification): Boolean {
@@ -593,6 +652,7 @@ class MediaNotificationListenerService : NotificationListenerService() {
             if (!isCallNotification(sbn)) return
             val cur = VortexService.currentCall ?: return
             if (cur.phase == com.vortex.a3.core.call.CallEvent.PHASE_ENDED) return
+            resetCallConnectStateIfNew(cur.id)
             callNotifKey = sbn.key
             val n = sbn.notification ?: return
             // Fill in who is calling when telephony would not say.
@@ -624,14 +684,100 @@ class MediaNotificationListenerService : NotificationListenerService() {
             val chrono = n.extras?.getBoolean(android.app.Notification.EXTRA_SHOW_CHRONOMETER, false) ?: false
             val whenMs = n.`when`
             Log.i(TAG, "call notif: chrono=$chrono when=$whenMs phase=${cur.phase} outgoing=${cur.outgoing} connected=${cur.connected}")
-            if (chrono && whenMs > 0L &&
-                cur.phase == com.vortex.a3.core.call.CallEvent.PHASE_ACTIVE &&
-                !(cur.connected && cur.startedAt == whenMs)
-            ) {
+            if (!callExtrasLogged) {
+                callExtrasLogged = true
+                logCallExtras(n)
+            }
+            if (cur.phase != com.vortex.a3.core.call.CallEvent.PHASE_ACTIVE) return
+            // Signal 1 — the dialer's own chronometer (AOSP/Pixel, and the only
+            // one that also carries the true connect instant).
+            if (chrono && whenMs > 0L && !(cur.connected && cur.startedAt == whenMs)) {
                 val updated = cur.copy(connected = true, startedAt = whenMs)
                 VortexService.currentCall = updated
                 VortexService.callEventBus.tryEmit(updated)
-                Log.i(TAG, "call connected (dialer chronometer) → started_at=$whenMs")
+                Log.i(TAG, "call connected (dialer chronometer) -> started_at=$whenMs")
+                return
+            }
+            if (cur.connected || !cur.outgoing) return
+            // Signal 2 — the dialer renders a running duration in the
+            // notification's own text once the callee answers ("0:07"), where
+            // before connect it reads "Dialing"/its localisation. Matching the
+            // shape, not the words, keeps this locale-free.
+            val elapsed = durationShownBy(n)
+            if (elapsed != null) {
+                markConnected(cur, System.currentTimeMillis() - elapsed, "dialer duration text")
+                return
+            }
+            // Signal 3 — the voice audio path opened (CAL-13). Carries no
+            // connect instant of its own, so the timer starts at "now" (the
+            // poll runs every 1.5s, so it is late by at most that).
+            if (audioPathOpened()) {
+                markConnected(cur, System.currentTimeMillis(), "voice audio path opened")
+            }
+        }
+
+        private fun markConnected(
+            cur: com.vortex.a3.core.call.CallEvent,
+            startedAt: Long,
+            how: String,
+        ) {
+            val updated = cur.copy(connected = true, startedAt = startedAt)
+            VortexService.currentCall = updated
+            VortexService.callEventBus.tryEmit(updated)
+            Log.i(TAG, "call connected ($how) -> started_at=$startedAt")
+        }
+
+        /** A running call duration ("7:04", "01:12:33") shown in the dialer's
+         *  notification text, in milliseconds — or null when the text is not a
+         *  bare duration. Deliberately strict: the WHOLE trimmed string must be
+         *  the duration, so a mirrored message body that happens to contain a
+         *  time never reads as a connected call. */
+        private fun durationShownBy(n: android.app.Notification): Long? {
+            val e = n.extras ?: return null
+            for (key in arrayOf(
+                android.app.Notification.EXTRA_TEXT,
+                android.app.Notification.EXTRA_SUB_TEXT,
+                android.app.Notification.EXTRA_BIG_TEXT,
+            )) {
+                val t = e.getCharSequence(key)?.toString()?.trim() ?: continue
+                val m = DURATION_RE.matchEntire(t) ?: continue
+                val parts = m.groupValues.drop(1).filter { it.isNotEmpty() }.map { it.toLong() }
+                val secs = when (parts.size) {
+                    2 -> parts[0] * 60 + parts[1]
+                    3 -> parts[0] * 3600 + parts[1] * 60 + parts[2]
+                    else -> continue
+                }
+                return secs * 1000L
+            }
+            return null
+        }
+
+        private val DURATION_RE = Regex("""(?:(\d{1,2}):)?(\d{1,2}):(\d{2})""")
+
+        /** One-shot dump of what the dialer's call notification actually
+         *  exposes. Without this a dialer that sets neither signal leaves no
+         *  way to tell what it DOES set, and every diagnosis needs the phone on
+         *  a cable. Keys only, plus the handful of booleans/ints that could
+         *  carry a connect state — never the call's text or the caller. */
+        private fun logCallExtras(n: android.app.Notification) {
+            try {
+                val e = n.extras ?: return
+                val keys = e.keySet().sorted().joinToString(",")
+                val template = e.getCharSequence("android.template")?.toString() ?: "-"
+                val callType = if (android.os.Build.VERSION.SDK_INT >= 31) {
+                    e.getInt("android.callType", -1)
+                } else {
+                    -1
+                }
+                Log.i(
+                    TAG,
+                    "call notif extras: template=$template callType=$callType " +
+                        "showWhen=${e.getBoolean(android.app.Notification.EXTRA_SHOW_WHEN, false)} " +
+                        "usesChrono=${e.getBoolean(android.app.Notification.EXTRA_SHOW_CHRONOMETER, false)} " +
+                        "audioMode=${audioMode()} durMs=${durationShownBy(n)} keys=[$keys]"
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "call notif extras unreadable: ${t.message}")
             }
         }
 

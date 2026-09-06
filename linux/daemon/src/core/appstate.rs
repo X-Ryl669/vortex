@@ -119,6 +119,15 @@ pub struct AppState {
     /// Mirror of `locale_changed_at` for theme.
     #[serde(default)]
     pub theme_changed_at: u64,
+    /// True while a TEXT FIELD holds input focus on the sending device.
+    ///
+    /// Universal Control reads it to decide what Esc means with the pointer on
+    /// the phone: normally "hand control back", but while the user is typing
+    /// into a field, what Esc means everywhere else is "dismiss the field".
+    /// Reported by the phone's accessibility service, which sees focus
+    /// directly, and pushed the moment it changes rather than on the next beat.
+    #[serde(default)]
+    pub input_focused: bool,
     /// Earbuds info (if any).
     #[serde(default)]
     pub earbuds: Option<EarbudsInfo>,
@@ -401,6 +410,9 @@ impl AppState {
         AppState {
             v: APPSTATE_SCHEMA_V,
             battery,
+            // The laptop never reports this: it is the phone telling US whether
+            // a field is focused there, not the other way round.
+            input_focused: false,
             class: DeviceClass::Laptop,
             name,
             locale: None,

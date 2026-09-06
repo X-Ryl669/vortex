@@ -367,6 +367,26 @@ impl BtHidServer {
     }
 
     /// Attempt to trigger Connect on paired Classic Bluetooth devices so HID connects seamlessly.
+    /// BR/EDR major device class "Phone". BlueZ's `Class` property packs the
+    /// major class in bits 8..12, so `(class >> 8) & 0x1f`.
+    const MAJOR_CLASS_PHONE: u32 = 0x02;
+
+    /// Connect the Bluetooth HID link to the paired PHONE, if there is one.
+    ///
+    /// Three rules, each of them a bug this had:
+    ///
+    ///  * **Never initiate pairing.** It used to call `Pair()` on any device
+    ///    whose name merely contained "redmi" — which on a bus with a stranger's
+    ///    Redmi in range means putting a pairing prompt on someone else's phone,
+    ///    and on the user's own phone means the "connect?" prompt kept coming
+    ///    back on every crossing. Pairing the laptop as an input device is the
+    ///    user's deliberate act, made once in the phone's Bluetooth settings.
+    ///  * **Only phones.** The target test used to be `is_paired || is_bonded`,
+    ///    i.e. EVERY paired device — so it also called plain `Connect()` on the
+    ///    user's earbuds, which connects every profile they have and can pull
+    ///    the audio route out from under whatever is playing.
+    ///  * **Only the HID profile.** `ConnectProfile(HID)` and nothing else; the
+    ///    bare `Connect()` fallback is what made the above destructive.
     pub async fn try_connect_paired_devices(&self, connection: &Connection) {
         if self.is_connected() {
             return;
@@ -394,9 +414,10 @@ impl BtHidServer {
                     let is_paired = dev_props.get("Paired").and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
                     let is_bonded = dev_props.get("Bonded").and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
                     let is_connected = dev_props.get("Connected").and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
-                    let name = dev_props.get("Name").and_then(|v| <&str>::try_from(v).ok()).unwrap_or_default();
-                    let alias = dev_props.get("Alias").and_then(|v| <&str>::try_from(v).ok()).unwrap_or_default();
-                    let is_target = is_paired || is_bonded || name.to_lowercase().contains("redmi") || alias.to_lowercase().contains("redmi");
+                    let class = dev_props.get("Class").and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+                    let is_phone = (class >> 8) & 0x1f == Self::MAJOR_CLASS_PHONE;
+                    // Already bonded, and a phone. Nothing else is ever touched.
+                    let is_target = (is_paired || is_bonded) && is_phone;
 
                     if is_target && !is_connected {
                         if let Ok(dev_proxy) = zbus::Proxy::new(
@@ -405,14 +426,11 @@ impl BtHidServer {
                             path.as_str(),
                             "org.bluez.Device1",
                         ).await {
-                            if !is_paired && !is_bonded {
-                                tracing::info!(device = %path, "Auto-pairing with Vortex device over Bluetooth");
-                                let _ : Result<(), _> = dev_proxy.call("Pair", &()).await;
-                            }
-                            tracing::info!(device = %path, "Attempting Connect for Classic Bluetooth HID");
-                            let res: Result<(), _> = dev_proxy.call("ConnectProfile", &(HID_UUID,)).await;
-                            if res.is_err() {
-                                let _ : Result<(), _> = dev_proxy.call("Connect", &()).await;
+                            tracing::info!(device = %path, "connecting the Bluetooth HID profile");
+                            let res: Result<(), zbus::Error> =
+                                dev_proxy.call("ConnectProfile", &(HID_UUID,)).await;
+                            if let Err(e) = res {
+                                tracing::debug!(device = %path, "HID profile connect failed: {e}");
                             }
                         }
                     }
