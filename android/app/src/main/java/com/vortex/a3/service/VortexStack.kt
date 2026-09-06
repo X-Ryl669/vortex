@@ -85,6 +85,12 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     /** Open read handles held for the current peer's filesystem session, so
      *  they can be dropped when the link goes. Null until [startFsServer]. */
     internal var fsHandles: com.vortex.a3.core.fs.FsHandles? = null
+
+    /** The filesystem serve function, kept here because the two transports are
+     *  started at different times: BLE comes up before the LAN server exists,
+     *  and `restartBleComponents` replaces the server (and its handle table)
+     *  without touching the LAN side. Whoever starts second installs it. */
+    internal var fsServeFn: ((Byte, ByteArray) -> Pair<Byte, ByteArray>)? = null
     /** Buffers phone→laptop notifications that fail to send while BLE is down;
      *  flushed when the peer re-subscribes to AUDIO_SIGNAL. */
     internal val notificationOutbox = com.vortex.a3.core.notif.NotificationOutbox()
@@ -1181,6 +1187,9 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // measured at five seconds on the first real attempt. The BLE write is
         // ours to make and lands in a couple of hundred milliseconds.
         VortexService.appStateNudge = { pushStateViaBle() }
+        // BLE started first, so the serve function already exists; install it
+        // now that there is a LAN server to hang it on.
+        lan.fsServe = fsServeFn
     }
 
     /**

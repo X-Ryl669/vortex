@@ -236,10 +236,15 @@ This is where these features usually fail, and it is all daemon-side:
    `init_logging` rolled the log on every forwarding CLI launch, destroying the
    running app's file.
 
-   Measured throughput was 30-41 KiB/s, which is BLE. Content is supposed to
-   ride Wi-Fi (§6) and does not yet — `fs_link` sends over the sealed BLE
-   writer only. Fine for metadata and small files; it is what step 3/4 has to
-   fix before this is a mount anyone would enjoy using.
+   Wi-Fi is now the preferred transport, with BLE as the fallback (§6). Same
+   482 KB file, same phone, same session: **41 KiB/s over BLE, 931 KiB/s over
+   LAN** — 23x — and a directory listing went from ~2.5 s to 11 ms. Both
+   byte-identical. The gain is mostly framing: a BLE notify caps at 512 bytes,
+   so a 48 KiB read is ~96 fragments paced 10 ms apart, against one TCP frame.
+
+   The LAN session is opened lazily, kept for 60 s of idleness, and both
+   transports serve from ONE handle table on the phone — a handle minted by
+   OPEN over Wi-Fi must still be readable by a READ that fell back to BLE.
 2. **Rework large-file transfer onto ranged reads.** Removes `MAX_FILE_BYTES`
    and the buffer-the-whole-file crash. Ships value before any mount exists.
 3. **Daemon cache layer** — metadata, readahead, content budget.

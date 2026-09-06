@@ -171,6 +171,23 @@ async fn serve_request(state: Arc<State>, f: RawFrame) {
 }
 
 async fn send(state: &State, ty_byte: u8, sub: u8, payload: Vec<u8>) {
+    // Wi-Fi first, Bluetooth second (design doc §6). The two carry identical
+    // frames, so this is only a routing choice — but a 48 KiB read is one TCP
+    // frame and ~96 paced BLE fragments, which is the difference between a
+    // copy taking a second and taking minutes.
+    if let Some(w) = crate::fs_lan::writer().await {
+        match w(ty_byte, sub, payload.clone()).await {
+            Ok(()) => return,
+            Err(e) => {
+                // The session looked alive and wasn't — a phone that changed
+                // network, or a socket the peer dropped. Fall through to BLE
+                // rather than failing the request: the caller cannot retry a
+                // transport it does not know about.
+                tracing::warn!("fs: LAN send failed ({e}); falling back to BLE");
+                crate::fs_lan::close().await;
+            }
+        }
+    }
     let w = { state.writer.lock().await.clone() };
     let Some(w) = w else {
         tracing::debug!("fs: no writer (link down); dropping a reply");

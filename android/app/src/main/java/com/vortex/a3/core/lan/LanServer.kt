@@ -101,6 +101,18 @@ class LanServer(
      *  the stack can gate the redundant BLE burst. */
     var onBulkDelivered: (key: String, hash: String) -> Unit = { _, _ -> }
 
+    /**
+     * Serve one filesystem op (FS_REQ 0x50) and return the reply as
+     * `(frame type, payload)`, or null when there is no server wired.
+     *
+     * Wired by VortexStack to the SAME [com.vortex.a3.core.fs.FsServer] the BLE
+     * path uses, deliberately: handles are minted by OPEN and used by later
+     * READs, and the laptop may switch transports between the two — it prefers
+     * Wi-Fi and falls back to Bluetooth on failure. A per-transport handle
+     * table would turn that fallback into a BADF in the middle of a file.
+     */
+    var fsServe: ((op: Byte, payload: ByteArray) -> Pair<Byte, ByteArray>)? = null
+
     /** Fired after an instant-share FILE blob has been written to the peer,
      *  with the content token it pulled by. Closes the loop the outgoing-offer
      *  watchdog waits on: an offer is only really done once the laptop has the
@@ -992,6 +1004,30 @@ class LanServer(
                                 FrameType.BULK_SYNC, 0x02,
                                 status.toString().toByteArray(Charsets.UTF_8),
                             )
+                        }
+                        frame.type == FrameType.FS_REQ -> {
+                            // Ranged filesystem op over Wi-Fi. The laptop
+                            // prefers this transport because BLE caps a notify
+                            // at 512 bytes: a 48 KiB read is ~96 paced
+                            // fragments there and a single frame here.
+                            val plain = runCatching {
+                                aeadOpen(pair.receiver, frame.payload)
+                            }.getOrNull()
+                            if (plain == null) {
+                                Log.w(TAG, "fs: AEAD decrypt failed")
+                                continue
+                            }
+                            val serve = fsServe
+                            if (serve == null) {
+                                Log.w(TAG, "fs: no server wired; ignoring op 0x${"%02x".format(frame.sub)}")
+                                continue
+                            }
+                            // Serving touches the disk and runs on this
+                            // connection's thread, which is what we want: it
+                            // serialises the ops on this socket and cannot
+                            // stall any other peer's connection.
+                            val (type, bytes) = serve(frame.sub, plain)
+                            lockedSealAndWrite(type, 0x00, bytes)
                         }
                         frame.type == FrameType.AUDIO_OP -> {
                             // Earbuds-switch frame (Phase 1). AEAD-decrypt

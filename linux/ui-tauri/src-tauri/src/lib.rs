@@ -83,6 +83,7 @@ mod send_to_phone;
 mod share;
 mod file_consent;
 mod fs_cli;
+mod fs_lan;
 mod contacts;
 mod desktop_apps;
 mod diagnostics;

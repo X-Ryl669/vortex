@@ -509,6 +509,9 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // this laptop's roots, and correlates replies to requests we issue.
         // Shares the same sealed writer — the ops are just frames.
         crate::fs_link::init(ble_sealed_writer.clone());
+        // Wi-Fi is preferred for the same frames; this hands it the
+        // credentials a TCP+IK session needs (design doc §6).
+        crate::fs_lan::init(identity.clone(), peer_store.clone());
         let ble_raw_tx = crate::peer_handoff::spawn_dispatcher(
             app.clone(),
             peer_store.clone(),

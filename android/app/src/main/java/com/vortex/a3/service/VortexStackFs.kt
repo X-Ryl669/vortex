@@ -25,6 +25,32 @@ internal fun VortexStack.startFsServer() {
     val server = FsServer(ctx, roots, handles)
     fsHandles = handles
 
+    // Wi-Fi path. The laptop prefers it and falls back to BLE, so BOTH
+    // transports serve from this one server and one handle table: a handle is
+    // minted by OPEN and used by later READs, and a fallback between the two
+    // would otherwise answer BADF halfway through a file.
+    //
+    // Runs on the LanServer connection's own thread rather than being hopped
+    // onto Dispatchers.IO: that thread exists to serialise this socket's
+    // frames, and the reply must be written before the next op is read.
+    val serve: (Byte, ByteArray) -> Pair<Byte, ByteArray> = { op, payload ->
+        val srv = try {
+            server.serve(op, payload)
+        } catch (e: Exception) {
+            FsServer.Served.Err(FsErr(0, FsCode.IO, e.message ?: "serve failed"))
+        }
+        when (srv) {
+            is FsServer.Served.Meta -> FrameType.FS_META to srv.reply.toJsonBytes()
+            is FsServer.Served.Data -> FrameType.FS_DATA to srv.bytes
+            is FsServer.Served.Err -> FrameType.FS_ERR to srv.err.toJsonBytes()
+        }
+    }
+    fsServeFn = serve
+    // Null on first start (BLE comes up before the LAN server, which installs
+    // it itself); non-null on a BLE restart, which replaces the server and
+    // handle table the LAN side was still pointing at.
+    lanServer?.fsServe = serve
+
     gattServer?.onFsRequest = { peerPub, op, payload ->
         // Off the GATT callback thread, always. A document provider can stall
         // for seconds — a cloud-backed one indefinitely — and blocking here

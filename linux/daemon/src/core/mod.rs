@@ -21,6 +21,7 @@ pub mod ble;
 pub mod crypto;
 #[cfg(target_os = "linux")]
 pub mod earbuds;
+pub mod fs_lan;
 pub mod fs_private;
 pub mod earbuds_store;
 pub mod phone_files;
