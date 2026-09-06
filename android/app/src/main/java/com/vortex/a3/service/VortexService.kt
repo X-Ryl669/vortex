@@ -405,7 +405,7 @@ class VortexService : Service() {
                 // cannot be served anyway, so more slots than the store holds
                 // would only queue offers that are certain to fail.
                 extraBufferCapacity =
-                    com.vortex.a3.core.clipboard.ClipboardBlobStore.MAX_ENTRIES,
+                    com.vortex.a3.core.fs.ShareGrants.MAX_ENTRIES,
                 onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.SUSPEND,
             )
 

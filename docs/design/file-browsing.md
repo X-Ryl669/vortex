@@ -247,6 +247,17 @@ This is where these features usually fail, and it is all daemon-side:
    OPEN over Wi-Fi must still be readable by a READ that fell back to BLE.
 2. **Rework large-file transfer onto ranged reads.** Removes `MAX_FILE_BYTES`
    and the buffer-the-whole-file crash. Ships value before any mount exists.
+   **Done.** A share now registers a *grant* (a URI plus a random token) instead
+   of reading the file, and the laptop pulls it through `FS_OPEN`/`FS_READ`/
+   `FS_CLOSE` straight to disk. `MAX_FILE_BYTES` is deleted on both sides.
+   Verified on the device with a 151 MB APK — 2.4x the old cap, so previously
+   refused outright: byte-identical in 73 s, and the phone's Java heap stayed at
+   16-23 MB throughout, where the old path would have had to hold all 151 MB.
+
+   A share-sheet file is authorised differently from a browsed one, so it gets
+   its own gate ([`ShareGrants`]): the act of sharing IS the authorisation,
+   scoped to that one file, addressed by an unguessable token, revoked when the
+   laptop closes it. It is not, and cannot become, a root.
 3. **Daemon cache layer** — metadata, readahead, content budget.
 4. **WebDAV loopback gateway**, both OSes.
 5. **`FS_WRITE` / `FS_SETMETA`** for real, once read-only is solid.

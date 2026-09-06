@@ -28,6 +28,17 @@ class FsServer(
     private val handles: FsHandles,
 ) {
 
+    /**
+     * Called with a share token when the peer CLOSEs a share-sheet file it was
+     * reading — the one unambiguous "the laptop has the bytes" moment on this
+     * device, and what advances the share queue's progress.
+     *
+     * The old transfer got this from having just written the whole file onto
+     * the socket. A ranged pull has no such moment, so CLOSE stands in for it.
+     */
+    @Volatile
+    var onShareDelivered: (token: String) -> Unit = {}
+
     /** What one served op produced. The caller turns this into frames — this
      *  class knows nothing about framing or transports. */
     sealed class Served {
@@ -56,7 +67,14 @@ class FsServer(
                 FsOp.READ -> doRead(ReadReq.from(json()))
                 FsOp.CLOSE -> {
                     val r = CloseReq.from(json())
-                    handles.remove(r.handle)
+                    handles.remove(r.handle)?.let { token ->
+                        ShareGrants.revoke(token)
+                        try {
+                            onShareDelivered(token)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "onShareDelivered threw: ${e.message}")
+                        }
+                    }
                     // Not BADF for an unknown handle: we expire handles
                     // ourselves, so "already gone" is the state the caller
                     // asked for.
@@ -129,6 +147,8 @@ class FsServer(
             is FsRoots.Result.Ok -> when (val t = res.target) {
                 is FsRoots.Target.Doc -> listChildren(r.id, t.uri, r.cursor)
                 is FsRoots.Target.Local -> listLocal(r.id, t.file, r.cursor)
+                // A shared file is one file, by construction.
+                is FsRoots.Target.Shared -> err(r.id, FsCode.INVAL, "not a directory")
             }
         }
     }
@@ -202,6 +222,12 @@ class FsServer(
         return when (val res = roots.resolve(r.path, forWrite = false)) {
             is FsRoots.Result.Err -> err(r.id, res.code, "refused")
             is FsRoots.Result.Ok -> when (val t = res.target) {
+                is FsRoots.Target.Shared -> Served.Meta(
+                    FsReply.Stat(
+                        r.id,
+                        FsEntry(name = t.name, isDir = false, size = t.size, readonly = true, path = r.path),
+                    ),
+                )
                 is FsRoots.Target.Local ->
                     if (!t.file.exists()) err(r.id, FsCode.NOENT, "no such file")
                     else Served.Meta(FsReply.Stat(r.id, localEntry(t.file)))
@@ -232,7 +258,32 @@ class FsServer(
         return when (target) {
             is FsRoots.Target.Local -> openLocal(r.id, target.file)
             is FsRoots.Target.Doc -> openDoc(r.id, target.uri)
+            is FsRoots.Target.Shared ->
+                openShared(r.id, target.uri, target.size, target.token)
         }
+    }
+
+    /**
+     * Open a share-sheet file. Straight to the resolver: no document query
+     * first, because the URI may be a MediaStore or FileProvider one that
+     * answers none of the Document columns.
+     */
+    private fun openShared(id: Int, uri: Uri, declaredSize: Long, token: String): Served {
+        val pfd = try {
+            context.contentResolver.openFileDescriptor(uri, "r")
+        } catch (e: SecurityException) {
+            // The one-off grant the share gave us has lapsed — Android drops it
+            // when the sharing task finishes.
+            return err(id, FsCode.ACCES, "share permission expired")
+        } catch (e: java.io.FileNotFoundException) {
+            return err(id, FsCode.NOENT, "shared file is gone")
+        } catch (e: Exception) {
+            return err(id, FsCode.IO, e.message ?: "open failed")
+        } ?: return err(id, FsCode.IO, "provider returned no descriptor")
+        // Prefer what the descriptor says over what the provider claimed at
+        // share time: statSize is the length we will actually be able to read.
+        val size = try { pfd.statSize.coerceAtLeast(0) } catch (_: Exception) { 0 }
+        return finishOpen(id, pfd, if (size > 0) size else declaredSize.coerceAtLeast(0), token)
     }
 
     private fun openLocal(id: Int, f: File): Served {
@@ -277,8 +328,13 @@ class FsServer(
         return finishOpen(id, pfd, size)
     }
 
-    private fun finishOpen(id: Int, pfd: ParcelFileDescriptor, size: Long): Served {
-        val handle = handles.insert(pfd, size)
+    private fun finishOpen(
+        id: Int,
+        pfd: ParcelFileDescriptor,
+        size: Long,
+        shareToken: String? = null,
+    ): Served {
+        val handle = handles.insert(pfd, size, shareToken)
         if (handle == null) {
             // Close what we just opened: refusing the request must not also
             // leak the descriptor that made us refuse it.

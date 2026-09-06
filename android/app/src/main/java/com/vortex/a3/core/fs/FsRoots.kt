@@ -66,6 +66,19 @@ class FsRoots(private val context: Context) {
     sealed class Target {
         data class Doc(val uri: Uri) : Target()
         data class Local(val file: File) : Target()
+        /**
+         * A share-sheet file. Kept apart from [Doc] because it is usually NOT
+         * a SAF document URI at all — a share commonly hands over a MediaStore
+         * or FileProvider URI, which has no document id and cannot be asked
+         * for children. Only opening and stat'ing it makes sense.
+         */
+        data class Shared(
+            val uri: Uri,
+            val name: String,
+            val size: Long,
+            /** Echoed back on CLOSE so the sender learns the file landed. */
+            val token: String,
+        ) : Target()
     }
 
     /**
@@ -151,6 +164,15 @@ class FsRoots(private val context: Context) {
         // content URI. Dispatching on the first character rather than trying
         // both keeps the two gates separate, so neither can be reached by a
         // path shaped for the other.
+        // A file the user shared through the share sheet, pulled by token. Not
+        // a browse: it is not under any root and never will be, because the
+        // authorisation is the share itself rather than a folder grant.
+        if (path.startsWith(SHARE_PREFIX)) {
+            if (forWrite) return Result.Err(FsCode.ROFS)
+            val token = path.removePrefix(SHARE_PREFIX)
+            val g = ShareGrants.get(token) ?: return Result.Err(FsCode.NOENT)
+            return Result.Ok(Target.Shared(g.uri, g.name, g.size, token))
+        }
         if (path.startsWith("/")) return resolveLocal(path, forWrite)
 
         val uri = try {
@@ -289,5 +311,8 @@ class FsRoots(private val context: Context) {
 
     companion object {
         private const val TAG = "VortexFs"
+
+        /** Addresses a share-sheet file rather than a browsable path. */
+        const val SHARE_PREFIX = "share:"
     }
 }

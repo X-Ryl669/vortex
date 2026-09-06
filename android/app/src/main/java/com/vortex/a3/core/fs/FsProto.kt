@@ -13,7 +13,7 @@ import org.json.JSONObject
  * READ(handle, offset, len) -> bytes
  * ```
  *
- * Every transfer today buffers a whole file in memory ([ClipboardBlobStore]
+ * Every transfer today buffers a whole file in memory (the old blob store
  * holds bytes keyed by a content token), which is what made an 835 MB share an
  * `OutOfMemoryError` and why a 64 MB cap exists. Ranged reads remove the cap as
  * a side effect rather than as a separate change.

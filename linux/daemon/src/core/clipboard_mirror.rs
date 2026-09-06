@@ -17,11 +17,6 @@ pub const MAX_CLIPBOARD_TEXT_CHARS: usize = 65_536;
 /// frame stays under the BLE notify MTU (same reason images are chunked).
 pub const MAX_SINGLE_FRAME_TEXT_BYTES: usize = 400;
 
-/// Max bytes for a phone→laptop FILE pulled over LAN (reliable TCP). Files
-/// ride the same offer+pull path as images but can be much larger; this bounds
-/// memory and transfer time. ~64 MiB covers documents, photos, short clips.
-pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-
 /// "Blob available, pull it over LAN" signal (phone→laptop). The laptop fetches
 /// the bytes by `token` via the next bulk-sync (served as CLIPBOARD_IMAGE
 /// chunks). When `name`/`mime` are EMPTY it's a clipboard IMAGE (PNG); when set

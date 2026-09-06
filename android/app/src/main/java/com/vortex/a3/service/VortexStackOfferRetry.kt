@@ -24,7 +24,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * So every offer is tracked until the laptop has actually FETCHED it: retried
  * while it can't be delivered, watched for a pull once it has been, and
  * surfaced as a toast when it ends up nowhere. The stashed blob is untouched
- * either way — [com.vortex.a3.core.clipboard.ClipboardBlobStore] keeps it
+ * either way — [com.vortex.a3.core.fs.ShareGrants] keeps it
  * addressable, so a later re-share of the same file is free.
  */
 

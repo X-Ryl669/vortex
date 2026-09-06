@@ -14,7 +14,14 @@ import android.util.Log
  */
 class FsHandles {
 
-    private class Handle(val pfd: ParcelFileDescriptor, val size: Long, var lastUsed: Long)
+    private class Handle(
+        val pfd: ParcelFileDescriptor,
+        val size: Long,
+        var lastUsed: Long,
+        /** Set when this handle is reading a share-sheet file: its CLOSE is
+         *  what tells the sender the laptop actually has the bytes. */
+        val shareToken: String?,
+    )
 
     private val lock = Any()
     private var next: Long = 0
@@ -28,7 +35,7 @@ class FsHandles {
      * the process's descriptors, so the table is bounded and idle entries are
      * pruned first.
      */
-    fun insert(pfd: ParcelFileDescriptor, size: Long): Long? = synchronized(lock) {
+    fun insert(pfd: ParcelFileDescriptor, size: Long, shareToken: String? = null): Long? = synchronized(lock) {
         prune()
         if (open.size >= MAX_HANDLES) {
             Log.w(TAG, "fs: handle table full ($MAX_HANDLES); refusing OPEN")
@@ -39,7 +46,7 @@ class FsHandles {
         next += 1
         if (next <= 0) next = 1
         val id = next
-        open[id] = Handle(pfd, size, System.nanoTime())
+        open[id] = Handle(pfd, size, System.nanoTime(), shareToken)
         id
     }
 
@@ -51,10 +58,18 @@ class FsHandles {
         Pair(h.pfd, h.size)
     }
 
-    /** Close and forget a handle. Silent for an unknown id — see [FsServer]. */
-    fun remove(id: Long) = synchronized(lock) {
-        open.remove(id)?.let { close(it) }
-        Unit
+    /**
+     * Close and forget a handle, returning its share token if it had one.
+     *
+     * Only an EXPLICIT close reports a token — [prune] deliberately does not.
+     * An expired handle means the reader went away mid-file, which is the
+     * opposite of delivery, and counting it would tell the user a transfer
+     * succeeded when it was abandoned.
+     */
+    fun remove(id: Long): String? = synchronized(lock) {
+        val h = open.remove(id) ?: return null
+        close(h)
+        h.shareToken
     }
 
     /** Close everything. Called when the link drops: handles cannot outlive

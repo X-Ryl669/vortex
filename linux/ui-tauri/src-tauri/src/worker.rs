@@ -512,6 +512,8 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // Wi-Fi is preferred for the same frames; this hands it the
         // credentials a TCP+IK session needs (design doc §6).
         crate::fs_lan::init(identity.clone(), peer_store.clone());
+        // Drains accepted phone file offers by streaming each one to disk.
+        crate::fs_pull::spawn();
         let ble_raw_tx = crate::peer_handoff::spawn_dispatcher(
             app.clone(),
             peer_store.clone(),

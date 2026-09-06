@@ -80,11 +80,6 @@ class ShareQueue(
                         return
                     }
                 }
-                is ClipboardFileReader.Outcome.TooLarge -> {
-                    failed++
-                    Log.w(TAG, "skipping $uri: over the size cap (${outcome.bytes} bytes)")
-                    showProgress()
-                }
                 is ClipboardFileReader.Outcome.Unreadable -> {
                     failed++
                     Log.w(TAG, "skipping $uri: ${outcome.why}")
@@ -167,7 +162,7 @@ class ShareQueue(
         /**
          * Files in flight at once.
          *
-         * Must stay well under `ClipboardBlobStore.MAX_ENTRIES` so a queued
+         * Must stay well under `ShareGrants.MAX_ENTRIES` so a queued
          * file's bytes cannot be evicted before the laptop collects them, and
          * small enough that the OFFER burst does not overrun the BLE notify
          * path (the same reason the offer sender paces itself).

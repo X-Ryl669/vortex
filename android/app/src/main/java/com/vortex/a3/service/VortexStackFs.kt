@@ -24,6 +24,10 @@ internal fun VortexStack.startFsServer() {
     val handles = FsHandles()
     val server = FsServer(ctx, roots, handles)
     fsHandles = handles
+    // A share-sheet file the laptop just finished reading. Same completion
+    // signal the old bulk-sync path got from writing the whole blob onto the
+    // socket: advances the batch's progress and releases the next queued file.
+    server.onShareDelivered = { token -> noteFileServed(token) }
 
     // Wi-Fi path. The laptop prefers it and falls back to BLE, so BOTH
     // transports serve from this one server and one handle table: a handle is

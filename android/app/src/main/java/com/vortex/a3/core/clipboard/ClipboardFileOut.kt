@@ -5,84 +5,74 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
 
-/** A file the phone is sending to the laptop (bytes + display name + MIME). */
-data class ClipboardOutgoingFile(val bytes: ByteArray, val name: String, val mime: String)
+/** A file the phone is sending to the laptop. */
+data class ClipboardOutgoingFile(
+    /** What to read when the laptop pulls it. Held as a URI, never as bytes:
+     *  the file is streamed in ranges on demand, so its size no longer has to
+     *  fit in the heap. */
+    val uri: Uri,
+    val name: String,
+    val mime: String,
+    /** Best known size, or -1 when the provider will not say. Advisory only —
+     *  the open is what decides. */
+    val size: Long,
+)
 
 /**
- * Reads an arbitrary clipboard / shared `content://` URI into a
- * [ClipboardOutgoingFile] for phone→laptop FILE sync. Used by both the Quick
- * Settings quick-send and the share-sheet target. Returns null if it isn't
- * readable or exceeds the LAN size cap.
+ * Describes an arbitrary clipboard / shared `content://` URI for phone→laptop
+ * FILE sync. Used by both the Quick Settings quick-send and the share-sheet
+ * target.
+ *
+ * It no longer READS the file. The old version buffered the whole thing to
+ * compute a content hash for the token and to hand the bytes to the offer path,
+ * which is what made an 835 MB share allocate 876 MB against a 256 MB heap
+ * growth limit and throw `OutOfMemoryError` — an `Error`, so the surrounding
+ * `catch (Exception)` missed it and the process died, taking the BLE/LAN
+ * service with it. The 64 MB cap existed to keep that from happening.
+ *
+ * Now the laptop pulls the file through the ranged-read protocol
+ * ([com.vortex.a3.core.fs.FsServer]), one bounded chunk at a time, so nothing
+ * on either side holds more than a chunk and the cap is gone.
  */
 object ClipboardFileReader {
-    /** Mirrors the Rust `clipboard_mirror::MAX_FILE_BYTES`. */
-    const val MAX_FILE_BYTES = 64L * 1024 * 1024
 
     private const val TAG = "ClipboardFileOut"
 
-    /** Outcome of a read, so the caller can tell the user something true
+    /** Outcome of a describe, so the caller can tell the user something true
      *  instead of a generic "couldn't read the shared file". */
     sealed class Outcome {
         data class Ok(val file: ClipboardOutgoingFile) : Outcome()
-        /** Bigger than [MAX_FILE_BYTES]; [bytes] is the best size we know. */
-        data class TooLarge(val bytes: Long) : Outcome()
-        /** Unreadable, empty, or it would not fit in memory. */
+        /** Unreadable or empty. There is no longer a "too large". */
         data class Unreadable(val why: String) : Outcome()
     }
 
     /**
-     * Read [uri] into memory, or explain why not.
+     * Describe [uri] without reading it, or explain why it cannot be sent.
      *
-     * **The size is checked BEFORE the bytes are read.** It used to be checked
-     * after `readBytes()`, which made the guard unreachable for exactly the
-     * files it existed to stop: an 835 MB share allocated 876 MB against a
-     * 256 MB heap growth limit and threw `OutOfMemoryError` at the read. That
-     * is an `Error`, not an `Exception`, so the old `catch (e: Exception)` did
-     * not catch it — it escaped `ShareReceiverActivity.onCreate` and killed the
-     * whole process, taking the BLE/LAN service down with it. The user saw a
-     * crash and no explanation.
-     *
-     * `OutOfMemoryError` is still caught below, because a pre-check can only
-     * use the size the provider *reports*: `OpenableColumns.SIZE` is absent or
-     * -1 for plenty of providers, and a wrong one must not be able to kill the
-     * app either.
+     * The only I/O here is opening the stream briefly to prove it is readable.
+     * Discovering at pull time that a file was never readable would mean the
+     * user sees a share succeed and a transfer fail minutes later, so the cheap
+     * check is worth one open.
      */
     fun read(context: Context, uri: Uri): Outcome {
         val cr = context.contentResolver
         val mime = cr.getType(uri) ?: "application/octet-stream"
         val name = displayName(context, uri) ?: "file"
-
-        // Pre-flight: refuse before allocating anything. A negative or absent
-        // size means "provider doesn't know" — fall through and let the
-        // bounded read below decide.
-        val reported = reportedSize(context, uri)
-        if (reported > MAX_FILE_BYTES) {
-            Log.i(TAG, "file too large ($reported bytes > $MAX_FILE_BYTES) — not sent")
-            return Outcome.TooLarge(reported)
-        }
+        val size = reportedSize(context, uri)
 
         return try {
-            // Bounded even when the provider lied about (or omitted) the size:
-            // read at most the cap + 1 byte, so an oversized stream is detected
-            // without ever buffering it whole.
-            val bytes = cr.openInputStream(uri)?.use { it.readAtMost(MAX_FILE_BYTES + 1) }
-            when {
-                bytes == null -> Outcome.Unreadable("no input stream")
-                bytes.isEmpty() -> Outcome.Unreadable("empty file")
-                bytes.size > MAX_FILE_BYTES -> {
-                    Log.i(TAG, "file exceeds cap (provider reported $reported) — not sent")
-                    Outcome.TooLarge(maxOf(reported, bytes.size.toLong()))
-                }
-                else -> Outcome.Ok(ClipboardOutgoingFile(bytes, name, mime))
-            }
-        } catch (e: OutOfMemoryError) {
-            // Reachable only when the reported size was wrong/absent. Catching
-            // an Error is deliberate and narrow: the alternative is the process
-            // dying and every Vortex feature with it.
-            Log.w(TAG, "file read ran out of memory: ${e.message}")
-            Outcome.Unreadable("too large to buffer")
+            val readable = cr.openFileDescriptor(uri, "r")?.use { pfd ->
+                // A zero-length file is not worth a transfer, and an empty
+                // provider read is the usual symptom of a URI we cannot really
+                // open. `statSize` is -1 when the provider will not say, which
+                // is not itself a failure.
+                val st = try { pfd.statSize } catch (_: Exception) { -1L }
+                st != 0L
+            } ?: return Outcome.Unreadable("no file descriptor")
+            if (!readable) return Outcome.Unreadable("empty file")
+            Outcome.Ok(ClipboardOutgoingFile(uri, name, mime, size))
         } catch (e: Exception) {
-            Log.w(TAG, "file read failed: ${e.message}")
+            Log.w(TAG, "file not readable: ${e.message}")
             Outcome.Unreadable(e.message ?: "read failed")
         }
     }
@@ -96,22 +86,6 @@ object ClipboardFileReader {
             } ?: -1L
     } catch (_: Exception) {
         -1L
-    }
-
-    /** Read at most [limit] bytes. Unlike `readBytes()` this never allocates
-     *  more than the caller is prepared to accept. */
-    private fun java.io.InputStream.readAtMost(limit: Long): ByteArray {
-        val cap = limit.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-        val out = java.io.ByteArrayOutputStream(minOf(cap, 64 * 1024))
-        val buf = ByteArray(64 * 1024)
-        var total = 0
-        while (total < cap) {
-            val n = read(buf, 0, minOf(buf.size, cap - total))
-            if (n <= 0) break
-            out.write(buf, 0, n)
-            total += n
-        }
-        return out.toByteArray()
     }
 
     private fun displayName(context: Context, uri: Uri): String? = try {

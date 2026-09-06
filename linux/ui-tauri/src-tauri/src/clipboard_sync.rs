@@ -604,7 +604,7 @@ fn expand_home(raw: &str, home: &std::path::Path) -> Option<PathBuf> {
 
 /// A non-clobbering path in `dir` for `name`: if it exists, append " (1)",
 /// " (2)", … before the extension (same as a browser download).
-fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
+pub(crate) fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
     let first = dir.join(name);
     if !first.exists() {
         return first;
@@ -627,75 +627,6 @@ fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
     first // give up after 10k — overwrite
 }
 
-/// Apply a fully-received FILE shared from the phone (instant-share style, NOT the
-/// clipboard): save it under its original name in the folder [`receive_root`]
-/// picks. Bytes are never logged; only size + name.
-/// Returns the saved path on success (for the transfer panel), `None` on error.
-///
-/// `subdir` is the one folder level a capture adds below that root
-/// (`Screenshots` / `Photos`, from [`Offer::subdir`] — a fixed table, never
-/// the wire value), and it is also what marks the file as a capture: with it
-/// set the root is the picture folder, without it the download folder.
-pub(crate) async fn apply_synced_file(
-    _app: &AppHandle,
-    name: &str,
-    _mime: &str,
-    bytes: Vec<u8>,
-    subdir: Option<&str>,
-) -> Option<PathBuf> {
-    // Sanitise to a single path component (no traversal / separators).
-    let safe = std::path::Path::new(name)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "vortex-file".to_string());
-    let Some(dir) = receive_root(subdir).map(|d| receive_dir(&d, subdir)) else {
-        tracing::warn!("received file: no HOME — dropped");
-        return None;
-    };
-    let size = bytes.len();
-    let safe2 = safe.clone();
-    let saved = tokio::task::spawn_blocking(move || -> std::io::Result<PathBuf> {
-        std::fs::create_dir_all(&dir)?;
-        let path = unique_path(&dir, &safe2);
-        // Write to a temporary name, then rename into place.
-        //
-        // Writing straight to the final name means a failure part-way — the
-        // disk filling up is the realistic one — leaves a TRUNCATED file
-        // sitting under the name the user expects, looking complete. A rename
-        // within the same directory is atomic, so the file either appears whole
-        // or does not appear at all.
-        let tmp = path.with_extension(format!(
-            "{}.vortex-part",
-            path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default()
-        ));
-        if let Err(e) = std::fs::write(&tmp, &bytes) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        Ok(path)
-    })
-    .await;
-    let path = match saved {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            tracing::warn!("received file write failed: {e}");
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!("received file task join: {e}");
-            return None;
-        }
-    };
-    // No per-file toast: the ongoing transfer notification (see `transfers`)
-    // is the single in-place progress indicator.
-    tracing::info!(bytes = size, name = %safe, "file received from phone → {}", path.display());
-    Some(path)
-}
 
 /// Where a received file goes: the download folder itself, or one named
 /// level below it. Kept separate from the name sanitising above so it can be
@@ -757,6 +688,8 @@ async fn flush_file_batch(batch: Vec<Offer>) {
             // inside one debounce window.
             .filter(|o| {
                 !queued.contains(&o.token)
+                    // Being streamed right now: dequeued, not yet pulled.
+                    && !crate::fs_pull::is_in_flight(&o.token)
                     && !pulled_recently(&o.token)
                     && seen.insert(o.token.clone())
             })
@@ -797,10 +730,11 @@ async fn flush_file_batch(batch: Vec<Offer>) {
         }
     }
     crate::lan::note_queue_progress();
-    tracing::info!(count, "phone file offer(s) accepted → LAN pull nudged");
-    if let Some(nudge) = crate::SYNC_NUDGE.get() {
-        nudge.notify_one();
-    }
+    tracing::info!(count, "phone file offer(s) accepted → streaming pull");
+    // The ranged-read puller, not the heartbeat: it streams each file straight
+    // to disk instead of reassembling it in memory, and drains the batch on its
+    // own rather than one file per heartbeat round.
+    crate::fs_pull::nudge();
 }
 
 /// BLE image-offer consumer: clipboard images stash a pull token immediately;

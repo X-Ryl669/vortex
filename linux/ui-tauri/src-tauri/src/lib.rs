@@ -84,6 +84,7 @@ mod share;
 mod file_consent;
 mod fs_cli;
 mod fs_lan;
+mod fs_pull;
 mod contacts;
 mod desktop_apps;
 mod diagnostics;

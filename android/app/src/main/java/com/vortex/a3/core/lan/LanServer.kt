@@ -849,50 +849,6 @@ class LanServer(
                                     }
                                     continue
                                 }
-                                // Instant-share file pull: serve the stashed blob
-                                // reliably over TCP as CLIPBOARD_FILE chunks.
-                                if (key == "clipboard_file") {
-                                    val token = req.optString(key, "")
-                                    // A stashed blob, or — when the token is a
-                                    // document URI — a file the laptop picked
-                                    // out of a browsed folder. One pull path
-                                    // for both: the transfer, the chunking and
-                                    // the laptop's save are already proven, and
-                                    // a browsed file is not a different kind of
-                                    // file just because it was asked for.
-                                    val blob = com.vortex.a3.core.clipboard.ClipboardBlobStore
-                                        .getByToken(token)
-                                        ?: com.vortex.a3.core.files.PhoneFiles
-                                            .read(context, token)?.bytes
-                                    if (blob == null) {
-                                        Log.i(TAG, "bulk-sync: clipboard_file token=$token not found")
-                                        status.put(key, "nomatch")
-                                    } else {
-                                        // Extends the hot window: the laptop
-                                        // comes back for the NEXT queued file
-                                        // in a fresh round moments from now.
-                                        keepLanHot()
-                                        sendChunked(FrameType.CLIPBOARD_FILE, blob)
-                                        Log.i(TAG, "bulk-sync: clipboard_file sent (${blob.size} bytes)")
-                                        status.put(key, "sent")
-                                        try { onFileServed(token) } catch (e: Exception) {
-                                            Log.w(TAG, "onFileServed listener threw: ${e.message}")
-                                        }
-                                    }
-                                    continue
-                                }
-                                // Folder listing: the value is the document
-                                // URI to look inside, or "" for the roots the
-                                // user has granted.
-                                if (key == "browse") {
-                                    val at = req.optString(key, "")
-                                    val json = com.vortex.a3.core.files.PhoneFiles.list(context, at)
-                                    keepLanHot()
-                                    sendChunked(FrameType.PHONE_FILES, json)
-                                    Log.i(TAG, "bulk-sync: listing sent (${json.size} bytes)")
-                                    status.put(key, "sent")
-                                    continue
-                                }
                                 // Watermark datasets: the value is "everything
                                 // up to <ms>" rather than a content hash.
                                 val historyFrameType = when (key) {
