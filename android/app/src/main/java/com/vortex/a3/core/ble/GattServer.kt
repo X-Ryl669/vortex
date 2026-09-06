@@ -382,7 +382,16 @@ class GattServer(
      *  Called under `synchronized(cipher)` from [sealAndNotify], so a
      *  fragment burst can't interleave with another sealed frame. */
     fun sendAudioSignal(device: BluetoothDevice, frame: Frame): Boolean {
-        val budget = ((deviceMtu[device.address] ?: 23) - 3).coerceAtLeast(1)
+        // ATT_MTU-3 is the transport limit, but NOT the only one: the GATT
+        // attribute value itself caps at 512 bytes, and
+        // `notifyCharacteristicChanged` THROWS above that rather than
+        // truncating. On a 517 MTU the two disagree — budget 514 > 512 — so
+        // every fragment we built at full budget crashed the app from a worker
+        // thread. Observed live the first time a frame needed fragmenting on a
+        // 517-MTU link (an FS directory listing); any notification over the
+        // budget would have done it.
+        val budget = minOf((deviceMtu[device.address] ?: 23) - 3, ATT_MAX_VALUE_LEN)
+            .coerceAtLeast(1)
         val encoded = frame.encode()
         if (encoded.size <= budget) {
             return notifyTo(device, frame, audioSignalChar, audioSignalSubscribers)
@@ -732,6 +741,16 @@ class GattServer(
                 s.notifyCharacteristicChanged(device, c, /*confirm=*/false)
             } catch (e: SecurityException) {
                 Log.w(TAG, "notify threw for ${device.address}: ${e.message}")
+                false
+            } catch (e: RuntimeException) {
+                // Anything else the stack throws — an oversized value, a stale
+                // server handle — must become a failed send, not a dead app.
+                // This runs on a coroutine worker, where an escaping exception
+                // takes the whole process down, and every caller here already
+                // handles false. A 517-byte MTU once did exactly that: the
+                // fragment budget was MTU-3 while GATT caps an attribute value
+                // at 512, and the stack threw rather than truncating.
+                Log.w(TAG, "notify failed for ${device.address}: ${e.message}")
                 false
             }
             if (!queued) {
@@ -1249,6 +1268,10 @@ class GattServer(
 
     companion object {
         private const val TAG = "VortexGattSrv"
+
+        /** GATT caps an attribute value at 512 bytes regardless of the
+         *  negotiated MTU, and the notify call throws above it. */
+        private const val ATT_MAX_VALUE_LEN = 512
         /** How far to skip the recv nonce forward when an AUDIO_SIGNAL open
          *  fails, to resync past dropped BLE writes without a re-handshake
          *  (mirrors the laptop daemon's NONCE_RESYNC_WINDOW). */
