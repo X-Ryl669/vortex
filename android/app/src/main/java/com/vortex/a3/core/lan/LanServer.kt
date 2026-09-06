@@ -125,6 +125,39 @@ class LanServer(
      */
     var onFsReply: ((frameType: Byte, payload: ByteArray) -> Unit)? = null
 
+    /**
+     * Writer for the LAN session the laptop is using for filesystem traffic,
+     * or null when there is none open.
+     *
+     * Bound to the connection that has actually carried an FS frame, not to
+     * whichever connection is newest: the laptop also opens short-lived
+     * heartbeat sessions, and publishing one of those would send a request down
+     * a socket about to close.
+     */
+    @Volatile
+    private var fsWriter: ((op: Byte, payload: ByteArray) -> Unit)? = null
+
+    /**
+     * Send one FS_REQ over the live LAN session. False when there is none, so
+     * the caller can fall back to BLE.
+     *
+     * This works because the session is a plain bidirectional socket: the
+     * laptop dials it and serves whatever arrives on it, whichever side asked.
+     * The phone cannot open one itself — the laptop has no listener — so the
+     * first request of a browse still goes over BLE, and the laptop's own reply
+     * is what brings the LAN session up for everything after it.
+     */
+    fun fsSend(op: Byte, payload: ByteArray): Boolean {
+        val w = fsWriter ?: return false
+        return try {
+            w(op, payload)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "fs: LAN send failed (${e.message}); caller falls back")
+            false
+        }
+    }
+
     /** Fired after an instant-share FILE blob has been written to the peer,
      *  with the content token it pulled by. Closes the loop the outgoing-offer
      *  watchdog waits on: an offer is only really done once the laptop has the
@@ -718,6 +751,13 @@ class LanServer(
                     } finally { outLock.unlock() }
                 }
 
+                // Writes an FS_REQ on THIS connection. Published only once an
+                // FS frame has arrived here (below), so it can never be a
+                // heartbeat socket.
+                val fsOut: (Byte, ByteArray) -> Unit = { op, payloadBytes ->
+                    lockedSealAndWrite(FrameType.FS_REQ, op, payloadBytes)
+                }
+
                 val writer: suspend (com.vortex.a3.core.earbuds.AudioOpFrame) -> Result<Unit> =
                     { outFrame ->
                         try {
@@ -983,6 +1023,11 @@ class LanServer(
                                 Log.w(TAG, "fs: reply AEAD decrypt failed")
                                 continue
                             }
+                            // This socket is demonstrably the laptop's FS
+                            // session, so it is the one to send our own
+                            // requests on — Wi-Fi instead of BLE for everything
+                            // after the first.
+                            fsWriter = fsOut
                             try {
                                 onFsReply?.invoke(frame.type, plain)
                             } catch (e: Exception) {
@@ -1160,6 +1205,10 @@ class LanServer(
                     // its writer.
                     com.vortex.a3.core.earbuds.EarbudsSwitchHolder
                         .clearSessionWriter(peerPubFinal, writer)
+                    // Same CAS discipline: only clear the FS slot if this
+                    // connection still owns it, or we would strip a newer
+                    // session of its writer on our way out.
+                    if (fsWriter === fsOut) fsWriter = null
                 }
             }
         } catch (e: Exception) {

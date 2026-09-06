@@ -59,8 +59,19 @@ internal fun VortexStack.startFsServer() {
     // ops, same frames — the protocol is symmetric — so the client needs only a
     // way to send and a way to be handed replies.
     com.vortex.a3.core.fs.FsClient.sender = { op, payload ->
-        val peer = activePeerPub ?: peerStore.list().firstOrNull()?.peerStaticPub
-        peer != null && gattServer?.sendFsRequest(peer, op, payload) == true
+        // Wi-Fi first, exactly as the laptop does for the same frames: a 48 KiB
+        // read is one TCP frame against ~96 paced BLE fragments.
+        //
+        // The first request of a browse still goes over BLE, and cannot not:
+        // the phone has no way to dial the laptop, which runs no listener. What
+        // it can do is answer on the session the laptop opens to deliver its
+        // reply — that socket is bidirectional and the laptop serves whatever
+        // arrives on it — so BLE carries the opening request and Wi-Fi carries
+        // the rest, including every ranged read of a download.
+        lanServer?.fsSend(op, payload) == true || run {
+            val peer = activePeerPub ?: peerStore.list().firstOrNull()?.peerStaticPub
+            peer != null && gattServer?.sendFsRequest(peer, op, payload) == true
+        }
     }
     gattServer?.onFsReply = { _, type, payload ->
         com.vortex.a3.core.fs.FsClient.onReply(type, payload)

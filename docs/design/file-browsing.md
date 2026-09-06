@@ -277,7 +277,20 @@ the laptop's roots config decides what is visible.
 descended two levels, and downloaded both a 1 KB file (one read) and a 299 KB
 file (multiple ranged reads) — both byte-identical by md5.
 
-**It runs over BLE only.** The laptop prefers Wi-Fi for the same traffic in the
+**The opening request rides BLE; everything after it rides Wi-Fi.** The phone
+cannot dial the laptop — the laptop runs no listener — so it cannot open a LAN
+session itself. What it can do is answer on the session the LAPTOP opens to
+deliver its reply: that socket is bidirectional, and the laptop's dispatcher
+serves an `FS_REQ` arriving on it whichever side sent it. So the first request
+of a browse goes over BLE, the laptop's reply brings the session up, and the
+phone sends everything after it there — including every ranged read of a
+download. Measured: 18.4 MB in 46 s (~409 KiB/s) against ~40 KiB/s on BLE.
+
+The phone binds its sender to the connection that has actually carried an FS
+frame, not the newest one, because the laptop also opens short-lived heartbeat
+sessions and a request sent down one of those would die with it.
+
+**A note on what remains BLE-only.** The laptop prefers Wi-Fi for the same traffic in the
 other direction, and it can because the PHONE listens on TCP and the laptop
 dials it. There is no listener the other way, so a phone-initiated LAN session
 has nothing to connect to. Listings are small and fine over BLE; pulling a large
