@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Laptop
+import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Smartphone
 import androidx.compose.material.icons.outlined.StickyNote2
@@ -98,6 +99,7 @@ fun HomeScreen(
     onRequestBatteryWhitelist: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenNotes: () -> Unit,
+    onOpenLaptopFiles: () -> Unit,
     onOpenEarbudsPicker: () -> Unit,
     onPickEarbud: (BluetoothDeviceRow) -> Unit,
     onRescanEarbuds: () -> Unit,
@@ -201,6 +203,13 @@ fun HomeScreen(
                     Icon(
                         imageVector = Icons.Outlined.StickyNote2,
                         contentDescription = str("notes.title"),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = onOpenLaptopFiles) {
+                    Icon(
+                        imageVector = Icons.Outlined.FolderOpen,
+                        contentDescription = "Laptop files",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }

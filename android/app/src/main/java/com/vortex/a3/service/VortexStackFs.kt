@@ -55,6 +55,17 @@ internal fun VortexStack.startFsServer() {
     // handle table the LAN side was still pointing at.
     lanServer?.fsServe = serve
 
+    // The other direction: browsing the LAPTOP's files from this phone. Same
+    // ops, same frames — the protocol is symmetric — so the client needs only a
+    // way to send and a way to be handed replies.
+    com.vortex.a3.core.fs.FsClient.sender = { op, payload ->
+        val peer = activePeerPub ?: peerStore.list().firstOrNull()?.peerStaticPub
+        peer != null && gattServer?.sendFsRequest(peer, op, payload) == true
+    }
+    gattServer?.onFsReply = { _, type, payload ->
+        com.vortex.a3.core.fs.FsClient.onReply(type, payload)
+    }
+
     gattServer?.onFsRequest = { peerPub, op, payload ->
         // Off the GATT callback thread, always. A document provider can stall
         // for seconds — a cloud-backed one indefinitely — and blocking here
@@ -85,4 +96,7 @@ internal fun VortexStack.startFsServer() {
  *  notice. */
 internal fun VortexStack.stopFsServer() {
     fsHandles?.clear()
+    // Nothing in flight can be answered once the link is gone; fail the waiters
+    // now rather than leaving the UI parked until each one times out.
+    com.vortex.a3.core.fs.FsClient.reset()
 }

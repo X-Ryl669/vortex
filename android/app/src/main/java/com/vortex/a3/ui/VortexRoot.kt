@@ -145,6 +145,7 @@ fun VortexRoot(
             ) {
                 var showSettings by remember { mutableStateOf(false) }
                 var showNotes by remember { mutableStateOf(false) }
+                var showLaptopFiles by remember { mutableStateOf(false) }
                 remember { com.vortex.a3.core.notes.NoteStore.init(activity); 0 }
                 // Shared smart-switch setting (persisted + cross-device LWW).
                 remember { SmartSwitchSetting.init(activity); 0 }
@@ -197,7 +198,13 @@ fun VortexRoot(
                 val allFilesOn = remember(showSettings) {
                     com.vortex.a3.core.fs.FsRoots(activity).allFilesGranted()
                 }
-                if (showNotes) {
+                if (showLaptopFiles) {
+                    // Its own BackHandler walks up the folder stack first, so
+                    // Back only leaves the screen from the top level.
+                    com.vortex.a3.ui.screens.LaptopFilesScreen(
+                        onBack = { showLaptopFiles = false },
+                    )
+                } else if (showNotes) {
                     // System back pops to Home instead of leaving the app.
                     // NotesScreen's own handlers (close the editor) compose
                     // later, so they still win while the editor is open.
@@ -290,6 +297,7 @@ fun VortexRoot(
                         onRequestBatteryWhitelist = actions.onRequestBatteryWhitelist,
                         onOpenSettings = { showSettings = true },
                         onOpenNotes = { showNotes = true },
+                        onOpenLaptopFiles = { showLaptopFiles = true },
                         onOpenEarbudsPicker = actions.onOpenEarbudsPicker,
                         onPickEarbud = actions.onPickEarbud,
                         onRescanEarbuds = actions.onRescanEarbuds,

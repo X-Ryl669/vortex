@@ -194,6 +194,12 @@ class GattServer(
     @Volatile var onFsRequest: (peerStaticPub: ByteArray, op: Byte, payload: ByteArray) -> Unit =
         { _, _, _ -> }
 
+    /** Invoked for a reply to a request WE sent: FS_META / FS_DATA / FS_ERR.
+     *  Replies carry no `sub` — the frame type says which of the three it is
+     *  and the request id inside correlates it. */
+    @Volatile var onFsReply: (peerStaticPub: ByteArray, frameType: Byte, payload: ByteArray) -> Unit =
+        { _, _, _ -> }
+
     /** Invoked when a device (the laptop) ENABLES notifications on the
      *  AUDIO_SIGNAL characteristic — i.e. the BLE notify path just became
      *  deliverable. VortexStack uses this to flush any notifications that
@@ -502,6 +508,10 @@ class GattServer(
         logTag: String,
         logSuccess: Boolean = false,
         verbose: Boolean = false,
+        // Almost every frame type is self-describing and leaves this 0. FS_REQ
+        // is the exception: its op lives here, so the payload cannot be read
+        // without it.
+        sub: Byte = 0x00,
     ): Boolean {
         val peerHex = peerStaticPub.toHex()
         val device = peerToDevice[peerHex] ?: run {
@@ -530,7 +540,7 @@ class GattServer(
                 Log.e(TAG, "$logTag: AEAD seal failed", e)
                 return false
             }
-            sendAudioSignal(device, Frame(frameType, 0x00, ct.copyOf(n)))
+            sendAudioSignal(device, Frame(frameType, sub, ct.copyOf(n)))
         }
         if (notifyOk) {
             if (logSuccess) Log.i(TAG, "$logTag: notified ${device.address}")
@@ -557,6 +567,11 @@ class GattServer(
      *  full item set. Bidirectional LWW sync; see NoteSync. */
     fun sendNotesSyncEncrypted(peerStaticPub: ByteArray, chunkPayload: ByteArray): Boolean =
         sealAndNotify(peerStaticPub, FrameType.NOTES_SYNC, chunkPayload, "sendNotesSync")
+
+    /** One filesystem REQUEST to the laptop (FS_REQ 0x50), for browsing the
+     *  laptop's files from the phone. The op rides in the frame's `sub`. */
+    fun sendFsRequest(peerStaticPub: ByteArray, op: Byte, payload: ByteArray): Boolean =
+        sealAndNotify(peerStaticPub, FrameType.FS_REQ, payload, "sendFsRequest", sub = op)
 
     /** One filesystem reply — FS_META (0x51), FS_DATA (0x52) or FS_ERR (0x53).
      *  Replies carry no `sub`: the frame type says which of the three this is,
@@ -1054,7 +1069,10 @@ class GattServer(
                         frame.type != FrameType.CLIPBOARD_TEXT &&
                         frame.type != FrameType.NOTES_SYNC &&
                         frame.type != FrameType.PEER_HANDOFF &&
-                        frame.type != FrameType.FS_REQ
+                        frame.type != FrameType.FS_REQ &&
+                        frame.type != FrameType.FS_META &&
+                        frame.type != FrameType.FS_DATA &&
+                        frame.type != FrameType.FS_ERR
                     ) {
                         Log.w(TAG, "AudioSignal WRITE: unexpected frame type ${frame.type}")
                         return
@@ -1182,6 +1200,14 @@ class GattServer(
                                 onNotesSyncReceived(peerPub, jsonBytes)
                             } catch (e: Exception) {
                                 Log.w(TAG, "onNotesSyncReceived threw: ${e.message}")
+                            }
+                        }
+                        FrameType.FS_META, FrameType.FS_DATA, FrameType.FS_ERR -> {
+                            // A reply to something we asked the laptop for.
+                            try {
+                                onFsReply(peerPub, frame.type, jsonBytes)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "onFsReply threw: ${e.message}")
                             }
                         }
                         FrameType.FS_REQ -> {

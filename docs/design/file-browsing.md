@@ -266,6 +266,20 @@ This is where these features usually fail, and it is all daemon-side:
 Steps 1–2 are worth doing regardless of whether the mount ever ships, which is
 the main argument for this ordering.
 
+## 8b. Browsing the laptop from the phone
+
+The protocol is symmetric, so this needed no new frames: the phone sends the
+same ops it answers. `FsClient` is the consumer half (pipelined, id-correlated,
+20 s timeout), `LaptopFilesScreen` browses and downloads to `Downloads/`, and
+the laptop's roots config decides what is visible.
+
+**It runs over BLE only.** The laptop prefers Wi-Fi for the same traffic in the
+other direction, and it can because the PHONE listens on TCP and the laptop
+dials it. There is no listener the other way, so a phone-initiated LAN session
+has nothing to connect to. Listings are small and fine over BLE; pulling a large
+file this way runs at ~40 KiB/s. Closing that gap means giving the laptop a
+listener — worth doing, and the natural companion to step 3.
+
 ## 9. Open questions
 
 - **Windows `FileSizeLimitInBytes`:** ship a registry tweak in the installer,
