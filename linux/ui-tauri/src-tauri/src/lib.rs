@@ -282,8 +282,22 @@ impl std::io::Write for Tee {
 fn init_logging() {
     use std::io::Write;
 
+    // A launch WITH arguments is a forwarder: single-instance hands the argv to
+    // the already-running app and this process exits seconds later. It must not
+    // touch the log file, because rolling it aside pulls the running app's file
+    // out from under its open handle — after two such invocations the real
+    // app's output is going to an unlinked inode nobody can read. Found the
+    // hard way: two `--fs-ls` runs in a row destroyed the very log they were
+    // supposed to be inspected in.
+    //
+    // The cost is that a FIRST launch carrying arguments keeps no file log for
+    // that session. That is the rare case (autostart and the desktop entry both
+    // launch bare) and it is recoverable by restarting, whereas losing the
+    // running app's log is not.
+    let forwarding = std::env::args().len() > 1;
     let path = vortex_l3_daemon::core::platform::paths()
         .logs()
+        .filter(|_| !forwarding)
         .map(|dir| {
             let _ = std::fs::create_dir_all(&dir);
             dir.join("vortex.log")
