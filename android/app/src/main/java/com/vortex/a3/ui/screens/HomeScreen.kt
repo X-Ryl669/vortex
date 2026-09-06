@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -164,7 +165,15 @@ fun HomeScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+            .background(MaterialTheme.colorScheme.background)
+            // targetSdk 36 makes edge-to-edge mandatory and nothing here opted
+            // in, so this header drew UNDER the status bar: the Notes / Laptop
+            // files / Settings icons sat in the same band as the clock, where
+            // the system consumes the touch. They rendered fine and simply did
+            // not respond, which reads as a broken button rather than a
+            // mispositioned one. Background before padding, so the status bar
+            // still sits on our colour instead of a bare strip.
+            .systemBarsPadding(),
     ) {
         Row(
             modifier = Modifier
