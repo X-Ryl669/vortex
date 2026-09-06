@@ -266,6 +266,47 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Open Android's all-files-access screen.
+     *
+     * Only reachable from the "Allow access to any files" setting — never on
+     * the first-run path. It is a special access, granted on a system screen we
+     * cannot skip, and the honest default is the folder picker: pairing a
+     * laptop should not quietly come to mean handing over the whole phone
+     * (design doc §5).
+     *
+     * Toggling off is Android's job too, on the same screen, so there is one
+     * place that decides and nothing of ours to keep in step.
+     */
+    internal fun openAllFilesAccess() {
+        val intents = listOf(
+            // App-specific screen first: it lands on our entry with the toggle
+            // right there.
+            android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                android.net.Uri.parse("package:$packageName"),
+            ),
+            // Some OEM ROMs (MIUI among them) do not implement the per-app
+            // screen and throw; the global list is the documented fallback.
+            android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION,
+            ),
+        )
+        for (i in intents) {
+            try {
+                startActivity(i)
+                return
+            } catch (_: Exception) {
+                // Try the next one.
+            }
+        }
+        android.widget.Toast.makeText(
+            this,
+            "This phone has no all-files access screen",
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
+    }
+
     /** Open the folder picker. Adding is the only action here: revoking is
      *  Android's own "remove permission" in app settings, and duplicating it
      *  would give two places that must agree about what is shared. */
@@ -498,6 +539,7 @@ class MainActivity : ComponentActivity() {
         onOpenScreenControl = ::onOpenAccessibilitySettings,
         onRequestMediaPermission = ::requestMediaPermission,
         onPickSharedFolder = ::pickSharedFolder,
+        onOpenAllFilesAccess = ::openAllFilesAccess,
         onEnableBluetooth = ::onEnableBluetooth,
         isAggressiveOem = isAggressiveOemRom(),
         isIgnoringBatteryOptimizations = ::isIgnoringBatteryOptimizations,

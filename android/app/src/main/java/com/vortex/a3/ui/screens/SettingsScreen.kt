@@ -29,6 +29,7 @@ import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Movie
+import androidx.compose.material.icons.outlined.Storage
 import androidx.compose.material.icons.outlined.Headset
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.LightMode
@@ -102,6 +103,8 @@ fun SettingsScreen(
     onScreenControlClick: () -> Unit,
     sharedFolderCount: Int,
     onSharedFoldersClick: () -> Unit,
+    allFilesOn: Boolean,
+    onAllFilesClick: () -> Unit,
     onBack: () -> Unit,
 ) {
     Column(
@@ -315,6 +318,20 @@ fun SettingsScreen(
                     else "Off — tap to pick a folder the laptop may browse",
                     status = if (sharedFolderCount > 0) "$sharedFolderCount" else "Off",
                     onClick = onSharedFoldersClick,
+                )
+                ActionRow(
+                    icon = Icons.Outlined.Storage,
+                    title = "Allow access to any files",
+                    // Says what it costs before it is granted, and what it
+                    // replaces once it is: with all-files on, the picked
+                    // folders are superseded rather than added to, and showing
+                    // the same file under two paths would be worse than saying
+                    // so here.
+                    hint = if (allFilesOn)
+                        "On — the laptop can browse all of your storage, read-only"
+                    else "Off — instead of picking folders, share everything (asks Android)",
+                    status = if (allFilesOn) "On" else "Off",
+                    onClick = onAllFilesClick,
                 )
             }
         }

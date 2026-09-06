@@ -6,7 +6,9 @@ import android.provider.DocumentsContract
 import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
+import android.os.ParcelFileDescriptor
 import android.util.Log
+import java.io.File
 import org.json.JSONObject
 
 /**
@@ -103,7 +105,7 @@ class FsServer(
                                 name = it.name,
                                 isDir = true,
                                 readonly = !it.writable,
-                                path = treeRootPath(it.treeUri),
+                                path = rootPath(it),
                             )
                         },
                         cursor = null,
@@ -112,13 +114,40 @@ class FsServer(
             }
             // With exactly one folder, a synthetic level above it would be a
             // directory the user clicks through every time for no information.
-            val only = all[0]
-            return listChildren(r.id, treeRootUri(only.treeUri) ?: return err(r.id, FsCode.IO, "bad tree"), r.cursor)
+            return when (val only = all[0]) {
+                is FsRoots.Root.Local -> listLocal(r.id, only.dir, r.cursor)
+                is FsRoots.Root.Tree ->
+                    listChildren(
+                        r.id,
+                        treeRootUri(only.treeUri) ?: return err(r.id, FsCode.IO, "bad tree"),
+                        r.cursor,
+                    )
+            }
         }
         return when (val res = roots.resolve(r.path, forWrite = false)) {
             is FsRoots.Result.Err -> err(r.id, res.code, "refused")
-            is FsRoots.Result.Ok -> listChildren(r.id, res.uri, r.cursor)
+            is FsRoots.Result.Ok -> when (val t = res.target) {
+                is FsRoots.Target.Doc -> listChildren(r.id, t.uri, r.cursor)
+                is FsRoots.Target.Local -> listLocal(r.id, t.file, r.cursor)
+            }
         }
+    }
+
+    /** Directory listing over the all-files root. */
+    private fun listLocal(id: Int, dir: File, cursor: Int): Served {
+        if (!dir.isDirectory) return err(id, FsCode.INVAL, "not a directory")
+        // Sorted so paging is stable: listFiles has no defined order, and an
+        // unstable one would drop or repeat entries across pages.
+        val all = try {
+            dir.listFiles()?.sortedBy { it.name } ?: return err(id, FsCode.IO, "cannot list")
+        } catch (e: SecurityException) {
+            return err(id, FsCode.ACCES, "not granted")
+        } catch (e: Exception) {
+            return err(id, FsCode.IO, e.message ?: "list failed")
+        }
+        val page = all.drop(cursor).take(LIST_PAGE)
+        val next = if (cursor + page.size < all.size) cursor + page.size else null
+        return Served.Meta(FsReply.ListPage(id, page.map { localEntry(it) }, next))
     }
 
     private fun listChildren(id: Int, dirUri: Uri, cursor: Int): Served {
@@ -172,17 +201,23 @@ class FsServer(
         }
         return when (val res = roots.resolve(r.path, forWrite = false)) {
             is FsRoots.Result.Err -> err(r.id, res.code, "refused")
-            is FsRoots.Result.Ok -> {
-                val docUri = asDocumentUri(res.uri) ?: return err(r.id, FsCode.INVAL, "not a document")
-                try {
-                    context.contentResolver.query(docUri, PROJECTION, null, null, null)?.use { c ->
-                        if (!c.moveToFirst()) return err(r.id, FsCode.NOENT, "no such document")
-                        Served.Meta(FsReply.Stat(r.id, entryOf(c, res.uri)))
-                    } ?: err(r.id, FsCode.NOENT, "no such document")
-                } catch (e: SecurityException) {
-                    err(r.id, FsCode.ACCES, "not granted")
-                } catch (e: Exception) {
-                    err(r.id, FsCode.IO, e.message ?: "stat failed")
+            is FsRoots.Result.Ok -> when (val t = res.target) {
+                is FsRoots.Target.Local ->
+                    if (!t.file.exists()) err(r.id, FsCode.NOENT, "no such file")
+                    else Served.Meta(FsReply.Stat(r.id, localEntry(t.file)))
+                is FsRoots.Target.Doc -> {
+                    val docUri = asDocumentUri(t.uri)
+                        ?: return err(r.id, FsCode.INVAL, "not a document")
+                    try {
+                        context.contentResolver.query(docUri, PROJECTION, null, null, null)?.use { c ->
+                            if (!c.moveToFirst()) return err(r.id, FsCode.NOENT, "no such document")
+                            Served.Meta(FsReply.Stat(r.id, entryOf(c, t.uri)))
+                        } ?: err(r.id, FsCode.NOENT, "no such document")
+                    } catch (e: SecurityException) {
+                        err(r.id, FsCode.ACCES, "not granted")
+                    } catch (e: Exception) {
+                        err(r.id, FsCode.IO, e.message ?: "stat failed")
+                    }
                 }
             }
         }
@@ -190,40 +225,67 @@ class FsServer(
 
     private fun doOpen(r: OpenReq): Served {
         if (r.write) return err(r.id, FsCode.ROFS, "this device serves read-only")
-        return when (val res = roots.resolve(r.path, forWrite = false)) {
-            is FsRoots.Result.Err -> err(r.id, res.code, "refused")
-            is FsRoots.Result.Ok -> {
-                val docUri = asDocumentUri(res.uri) ?: return err(r.id, FsCode.INVAL, "not a document")
-                var size = 0L
-                try {
-                    context.contentResolver.query(docUri, PROJECTION, null, null, null)?.use { c ->
-                        if (c.moveToFirst()) {
-                            if (isDir(c)) return err(r.id, FsCode.ISDIR, "is a directory")
-                            size = c.getLong(IDX_SIZE)
-                        }
-                    }
-                } catch (_: Exception) {
-                    // Size is advisory — the open below is the real test.
-                }
-                val pfd = try {
-                    context.contentResolver.openFileDescriptor(docUri, "r")
-                } catch (e: SecurityException) {
-                    return err(r.id, FsCode.ACCES, "not granted")
-                } catch (e: java.io.FileNotFoundException) {
-                    return err(r.id, FsCode.NOENT, "no such document")
-                } catch (e: Exception) {
-                    return err(r.id, FsCode.IO, e.message ?: "open failed")
-                } ?: return err(r.id, FsCode.IO, "provider returned no descriptor")
-
-                if (size <= 0) size = try { pfd.statSize.coerceAtLeast(0) } catch (_: Exception) { 0 }
-                val handle = handles.insert(pfd, size)
-                if (handle == null) {
-                    try { pfd.close() } catch (_: Exception) {}
-                    return err(r.id, FsCode.IO, "too many open handles")
-                }
-                Served.Meta(FsReply.Open(r.id, handle, size, readonly = true))
-            }
+        val target = when (val res = roots.resolve(r.path, forWrite = false)) {
+            is FsRoots.Result.Err -> return err(r.id, res.code, "refused")
+            is FsRoots.Result.Ok -> res.target
         }
+        return when (target) {
+            is FsRoots.Target.Local -> openLocal(r.id, target.file)
+            is FsRoots.Target.Doc -> openDoc(r.id, target.uri)
+        }
+    }
+
+    private fun openLocal(id: Int, f: File): Served {
+        if (f.isDirectory) return err(id, FsCode.ISDIR, "is a directory")
+        if (!f.exists()) return err(id, FsCode.NOENT, "no such file")
+        val pfd = try {
+            ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+        } catch (e: SecurityException) {
+            return err(id, FsCode.ACCES, "not granted")
+        } catch (e: java.io.FileNotFoundException) {
+            return err(id, FsCode.NOENT, "no such file")
+        } catch (e: Exception) {
+            return err(id, FsCode.IO, e.message ?: "open failed")
+        }
+        return finishOpen(id, pfd, f.length())
+    }
+
+    private fun openDoc(id: Int, uri: Uri): Served {
+        val docUri = asDocumentUri(uri) ?: return err(id, FsCode.INVAL, "not a document")
+        var size = 0L
+        try {
+            context.contentResolver.query(docUri, PROJECTION, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    if (isDir(c)) return err(id, FsCode.ISDIR, "is a directory")
+                    size = c.getLong(IDX_SIZE)
+                }
+            }
+        } catch (_: Exception) {
+            // Size is advisory — the open below is the real test.
+        }
+        val pfd = try {
+            context.contentResolver.openFileDescriptor(docUri, "r")
+        } catch (e: SecurityException) {
+            return err(id, FsCode.ACCES, "not granted")
+        } catch (e: java.io.FileNotFoundException) {
+            return err(id, FsCode.NOENT, "no such document")
+        } catch (e: Exception) {
+            return err(id, FsCode.IO, e.message ?: "open failed")
+        } ?: return err(id, FsCode.IO, "provider returned no descriptor")
+
+        if (size <= 0) size = try { pfd.statSize.coerceAtLeast(0) } catch (_: Exception) { 0 }
+        return finishOpen(id, pfd, size)
+    }
+
+    private fun finishOpen(id: Int, pfd: ParcelFileDescriptor, size: Long): Served {
+        val handle = handles.insert(pfd, size)
+        if (handle == null) {
+            // Close what we just opened: refusing the request must not also
+            // leak the descriptor that made us refuse it.
+            try { pfd.close() } catch (_: Exception) {}
+            return err(id, FsCode.IO, "too many open handles")
+        }
+        return Served.Meta(FsReply.Open(id, handle, size, readonly = true))
     }
 
     private fun doRead(r: ReadReq): Served {
@@ -279,7 +341,22 @@ class FsServer(
         null
     }
 
-    private fun treeRootPath(treeUri: Uri): String = (treeRootUri(treeUri) ?: treeUri).toString()
+    /** The address a peer should send back to enter this root. A document URI
+     *  for a SAF tree; an ordinary absolute path for the all-files root. */
+    private fun rootPath(root: FsRoots.Root): String = when (root) {
+        is FsRoots.Root.Tree -> (treeRootUri(root.treeUri) ?: root.treeUri).toString()
+        is FsRoots.Root.Local -> root.dir.absolutePath
+    }
+
+    private fun localEntry(f: File): FsEntry = FsEntry(
+        name = f.name,
+        isDir = f.isDirectory,
+        size = if (f.isDirectory) 0 else f.length(),
+        // The protocol carries seconds; File reports milliseconds.
+        mtime = f.lastModified() / 1000,
+        readonly = true,
+        path = f.absolutePath,
+    )
 
     /** Peer-supplied URIs are already tree-document URIs (we only ever emit
      *  those), but a bare tree URI is accepted too so the laptop can address a

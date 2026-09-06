@@ -166,6 +166,22 @@ There is no storage permission today, so this is new surface either way:
 opt-in for users who want the full view. That keeps the scary permission out of
 the first-run path while not capping what power users can do.
 
+*Implemented as recommended.* "Shared folders" runs the SAF picker; "Allow
+access to any files" opens Android's special-access screen and is never touched
+on the first-run path. Neither grant is mirrored into a preference of ours — the
+OS grant IS the setting, read live, so a revocation in system settings cannot
+leave us offering a root we can no longer read.
+
+Two consequences worth knowing:
+
+* All-files **supersedes** the picked folders rather than adding to them.
+  Serving both would show one file under two unrelated paths, and nothing on
+  the wire says they are the same file.
+* Under all-files the served root is shared storage only, still canonicalised
+  and gated. Being granted all-files is not agreement to serve `/data`: the
+  user turned on "any files" meaning *their* files, and the app can read a
+  great deal more than that.
+
 ---
 
 ## 6. Transport reality
@@ -205,7 +221,11 @@ This is where these features usually fail, and it is all daemon-side:
 
 1. **`FS_STAT` + `FS_LIST` + `FS_READ`** on the phone (answer ranged reads,
    nothing else) and the daemon-side client. No mount yet — validate over the
-   existing session with a CLI.
+   existing session with a CLI. **Built, not yet run against a phone:** protocol
+   and laptop server/client (`fs_proto`, `fs_server`, `fs_link`), the phone's
+   server (`core/fs/`), and the CLI (`--fs-ls`, `--fs-stat`, `--fs-get`, which
+   log to `~/.cache/vortex/vortex.log`). What remains for this step is a live
+   run: share a folder, list it, fetch a file, compare checksums.
 2. **Rework large-file transfer onto ranged reads.** Removes `MAX_FILE_BYTES`
    and the buffer-the-whole-file crash. Ships value before any mount exists.
 3. **Daemon cache layer** — metadata, readahead, content budget.

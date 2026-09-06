@@ -3,8 +3,10 @@ package com.vortex.a3.core.fs
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Environment
 import android.provider.DocumentsContract
 import android.util.Log
+import java.io.File
 
 /**
  * What this phone serves to a paired laptop, and the gate every path-taking op
@@ -32,7 +34,53 @@ import android.util.Log
  */
 class FsRoots(private val context: Context) {
 
-    data class Root(val treeUri: Uri, val name: String, val writable: Boolean)
+    /**
+     * One shared location.
+     *
+     * Two kinds, because the two grant models are genuinely different: a SAF
+     * tree is addressed by document URI and enumerated through a provider,
+     * while all-files access hands back the ordinary filesystem. Modelling them
+     * as one and converting would mean inventing a fake URI for real paths, or
+     * vice versa — both lossy.
+     */
+    sealed class Root {
+        abstract val name: String
+        abstract val writable: Boolean
+
+        data class Tree(
+            val treeUri: Uri,
+            override val name: String,
+            override val writable: Boolean,
+        ) : Root()
+
+        /** The whole of shared storage, available only while the user has
+         *  granted all-files access. */
+        data class Local(
+            val dir: File,
+            override val name: String,
+            override val writable: Boolean,
+        ) : Root()
+    }
+
+    /** What a resolved path turned out to address. */
+    sealed class Target {
+        data class Doc(val uri: Uri) : Target()
+        data class Local(val file: File) : Target()
+    }
+
+    /**
+     * Whether the user has granted all-files access.
+     *
+     * Read from the OS, never cached and never mirrored into a preference of
+     * our own: the user can revoke it in system settings at any time, and a
+     * stale "on" would mean offering the laptop a root we can no longer read.
+     * The permission IS the setting — same rule as the SAF grants above.
+     */
+    fun allFilesGranted(): Boolean = try {
+        Environment.isExternalStorageManager()
+    } catch (_: Exception) {
+        false
+    }
 
     /**
      * The trees the user has granted us, newest first.
@@ -41,23 +89,43 @@ class FsRoots(private val context: Context) {
      * a grant in system settings at any moment, and a cache would keep serving
      * a folder that has actually been withdrawn.
      */
-    fun roots(): List<Root> =
+    fun roots(): List<Root> {
+        val out = ArrayList<Root>()
+        // All-files access supersedes the individual trees: offering both would
+        // show the same photo twice under two different paths, and the laptop
+        // has no way to know they are the same file.
+        if (allFilesGranted()) {
+            val shared = try {
+                @Suppress("DEPRECATION")
+                Environment.getExternalStorageDirectory()
+            } catch (_: Exception) {
+                null
+            }
+            if (shared != null && shared.isDirectory) {
+                out.add(Root.Local(shared, "Phone storage", writable = false))
+                return out
+            }
+        }
         context.contentResolver.persistedUriPermissions
             .filter { it.isReadPermission }
-            .mapNotNull { perm ->
+            .forEach { perm ->
                 val uri = perm.uri
                 // Only tree grants: a single-document grant cannot be browsed
                 // and has no children to enumerate.
-                if (!DocumentsContract.isTreeUri(uri)) return@mapNotNull null
-                Root(
-                    treeUri = uri,
-                    name = displayNameOf(uri),
-                    // v1 is read-only end to end; the flag is carried so the
-                    // laptop can show the folder as read-only rather than
-                    // discovering it by failing a write.
-                    writable = false,
+                if (!DocumentsContract.isTreeUri(uri)) return@forEach
+                out.add(
+                    Root.Tree(
+                        treeUri = uri,
+                        name = displayNameOf(uri),
+                        // v1 is read-only end to end; the flag is carried so the
+                        // laptop can show the folder as read-only rather than
+                        // discovering it by failing a write.
+                        writable = false,
+                    ),
                 )
             }
+        return out
+    }
 
     fun isEmpty(): Boolean = roots().isEmpty()
 
@@ -79,6 +147,12 @@ class FsRoots(private val context: Context) {
      */
     fun resolve(path: String, forWrite: Boolean): Result {
         if (path.isEmpty()) return Result.Err(FsCode.INVAL)
+        // An absolute path means the all-files root; anything else must be a
+        // content URI. Dispatching on the first character rather than trying
+        // both keeps the two gates separate, so neither can be reached by a
+        // path shaped for the other.
+        if (path.startsWith("/")) return resolveLocal(path, forWrite)
+
         val uri = try {
             Uri.parse(path)
         } catch (_: Exception) {
@@ -95,6 +169,7 @@ class FsRoots(private val context: Context) {
         } ?: return Result.Err(FsCode.ACCES)
 
         for (root in roots()) {
+            if (root !is Root.Tree) continue
             val grantedTree = try {
                 DocumentsContract.getTreeDocumentId(root.treeUri)
             } catch (_: Exception) {
@@ -103,11 +178,43 @@ class FsRoots(private val context: Context) {
             if (uri.authority != root.treeUri.authority) continue
             if (requestedTree != grantedTree) continue
             if (forWrite && !root.writable) return Result.Err(FsCode.ROFS)
-            return Result.Ok(uri)
+            return Result.Ok(Target.Doc(uri))
         }
         // ACCES, not NOENT, and deliberately so: answering "no such file" for a
         // path outside every root would let a paired peer probe for the
         // existence of documents it is not allowed to see.
+        return Result.Err(FsCode.ACCES)
+    }
+
+    /**
+     * Resolve a real filesystem path under the all-files root.
+     *
+     * Canonicalises before comparing, so `..` traversal and symlinks pointing
+     * out of shared storage are rejected rather than merely discouraged. Being
+     * granted all-files access is not the same as agreeing to serve `/data` —
+     * the user turned on "any files" meaning their files, and this app can read
+     * a great deal more than that.
+     */
+    private fun resolveLocal(path: String, forWrite: Boolean): Result {
+        if (!allFilesGranted()) return Result.Err(FsCode.ACCES)
+        val canonical = try {
+            File(path).canonicalFile
+        } catch (_: Exception) {
+            return Result.Err(FsCode.NOENT)
+        }
+        for (root in roots()) {
+            if (root !is Root.Local) continue
+            val croot = try {
+                root.dir.canonicalFile
+            } catch (_: Exception) {
+                continue
+            }
+            val inside = canonical == croot ||
+                canonical.path.startsWith(croot.path + File.separator)
+            if (!inside) continue
+            if (forWrite && !root.writable) return Result.Err(FsCode.ROFS)
+            return Result.Ok(Target.Local(canonical))
+        }
         return Result.Err(FsCode.ACCES)
     }
 
@@ -176,7 +283,7 @@ class FsRoots(private val context: Context) {
     }
 
     sealed class Result {
-        data class Ok(val uri: Uri) : Result()
+        data class Ok(val target: Target) : Result()
         data class Err(val code: Int) : Result()
     }
 

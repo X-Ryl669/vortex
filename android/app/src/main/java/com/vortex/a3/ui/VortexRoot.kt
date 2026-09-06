@@ -104,6 +104,7 @@ class VortexActions(
     /** Ask for the storage grant the media-share toggles need (no-op if held). */
     val onRequestMediaPermission: () -> Unit,
     val onPickSharedFolder: () -> Unit,
+    val onOpenAllFilesAccess: () -> Unit,
     /** Ask the system to turn Bluetooth on (one-tap dialog). */
     val onEnableBluetooth: () -> Unit,
     val isAggressiveOem: Boolean,
@@ -193,6 +194,9 @@ fun VortexRoot(
                 val sharedFolderCount = remember(showSettings) {
                     com.vortex.a3.core.fs.FsRoots(activity).roots().size
                 }
+                val allFilesOn = remember(showSettings) {
+                    com.vortex.a3.core.fs.FsRoots(activity).allFilesGranted()
+                }
                 if (showNotes) {
                     // System back pops to Home instead of leaving the app.
                     // NotesScreen's own handlers (close the editor) compose
@@ -257,6 +261,8 @@ fun VortexRoot(
                         onScreenControlClick = actions.onOpenScreenControl,
                         sharedFolderCount = sharedFolderCount,
                         onSharedFoldersClick = actions.onPickSharedFolder,
+                        allFilesOn = allFilesOn,
+                        onAllFilesClick = actions.onOpenAllFilesAccess,
                         onBack = { showSettings = false },
                     )
                 } else {
