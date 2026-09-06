@@ -207,7 +207,10 @@ This is where these features usually fail, and it is all daemon-side:
   repeatedly. Without a cache, every icon refresh is a round trip.
 - **Readahead.** Sequential reads (copying, media playback) should pull ahead of
   the requested range; a strict 63 KiB request/response ping-pong will never
-  saturate Wi-Fi.
+  saturate Wi-Fi. *Partly done:* both clients keep 4 ranged reads in flight,
+  which turns the round trip from a per-chunk cost into an overlapped one —
+  2.07 to 8.1 MB/s laptop-side, 0.4 to 2.3 MB/s phone-side. Reading *ahead* of
+  what was asked for is still to come, and is what a mount will need.
 - **Coalescing and a concurrency cap.** Thumbnailers fire dozens of parallel
   reads; unbounded, they will starve the link and the BLE session with it.
 - **Content cache with a byte budget**, not an entry count — one 2 GB video must
@@ -284,7 +287,7 @@ deliver its reply: that socket is bidirectional, and the laptop's dispatcher
 serves an `FS_REQ` arriving on it whichever side sent it. So the first request
 of a browse goes over BLE, the laptop's reply brings the session up, and the
 phone sends everything after it there — including every ranged read of a
-download. Measured: 18.4 MB in 46 s (~409 KiB/s) against ~40 KiB/s on BLE.
+download. Measured: 18.4 MB in 8 s (~2.3 MB/s) against ~40 KiB/s on BLE.
 
 The phone binds its sender to the connection that has actually carried an FS
 frame, not the newest one, because the laptop also opens short-lived heartbeat
