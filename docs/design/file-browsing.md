@@ -221,11 +221,25 @@ This is where these features usually fail, and it is all daemon-side:
 
 1. **`FS_STAT` + `FS_LIST` + `FS_READ`** on the phone (answer ranged reads,
    nothing else) and the daemon-side client. No mount yet — validate over the
-   existing session with a CLI. **Built, not yet run against a phone:** protocol
-   and laptop server/client (`fs_proto`, `fs_server`, `fs_link`), the phone's
-   server (`core/fs/`), and the CLI (`--fs-ls`, `--fs-stat`, `--fs-get`, which
-   log to `~/.cache/vortex/vortex.log`). What remains for this step is a live
-   run: share a folder, list it, fetch a file, compare checksums.
+   existing session with a CLI. **Done and validated on a device**
+   (2026-09-06, over BLE, all-files root): `--fs-ls` returned 34 entries of
+   shared storage; `--fs-stat` matched size and mtime; `--fs-get` fetched
+   28 KB and 482 KB files byte-identical by md5, the latter over 11 ranged
+   reads with the zip still passing `unzip -t`. Refusals behave: a missing path
+   inside a root answers NOENT, while `/data/...`, `/etc/hosts` and a SAF URI
+   under all-files all answer ACCES, so a peer cannot probe outside what is
+   served.
+
+   Two bugs it caught, both pre-existing and neither specific to this feature:
+   fragments were sized at `MTU-3` while GATT caps an attribute value at 512
+   and *throws* above it, so fragmenting crashed the app on a 517-MTU link; and
+   `init_logging` rolled the log on every forwarding CLI launch, destroying the
+   running app's file.
+
+   Measured throughput was 30-41 KiB/s, which is BLE. Content is supposed to
+   ride Wi-Fi (§6) and does not yet — `fs_link` sends over the sealed BLE
+   writer only. Fine for metadata and small files; it is what step 3/4 has to
+   fix before this is a mount anyone would enjoy using.
 2. **Rework large-file transfer onto ranged reads.** Removes `MAX_FILE_BYTES`
    and the buffer-the-whole-file crash. Ships value before any mount exists.
 3. **Daemon cache layer** — metadata, readahead, content budget.
