@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -92,17 +93,32 @@ fun LaptopFilesScreen(onBack: () -> Unit) {
         loading = false
     }
 
+    // Back — gesture or button — walks UP one folder and only leaves the screen
+    // from the top. Registered here rather than in the caller (as Notes and
+    // Settings do) precisely because it is not a plain dismiss: the caller does
+    // not know how deep the browse is.
     BackHandler {
         if (stack.isNotEmpty()) stack = stack.dropLast(1) else onBack()
     }
 
     Column(
-        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            // targetSdk 36 makes edge-to-edge mandatory, and nothing in this app
+            // compensates — so without this the header draws UNDER the status
+            // bar: the back arrow lands behind the clock, where it is hard to
+            // see and hard to hit (a synthetic tap on it is swallowed
+            // outright). The background is applied before the padding so the
+            // bar still sits on our colour rather than a bare gap.
+            .systemBarsPadding(),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // Same action as the back gesture, so the two never disagree about
+            // what "back" means at a given depth.
             IconButton(onClick = { if (stack.isNotEmpty()) stack = stack.dropLast(1) else onBack() }) {
                 Icon(
                     Icons.AutoMirrored.Outlined.ArrowBack,
