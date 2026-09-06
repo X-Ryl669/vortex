@@ -273,6 +273,10 @@ same ops it answers. `FsClient` is the consumer half (pipelined, id-correlated,
 20 s timeout), `LaptopFilesScreen` browses and downloads to `Downloads/`, and
 the laptop's roots config decides what is visible.
 
+**Verified on the device** (2026-09-06): listed the laptop's home directory,
+descended two levels, and downloaded both a 1 KB file (one read) and a 299 KB
+file (multiple ranged reads) — both byte-identical by md5.
+
 **It runs over BLE only.** The laptop prefers Wi-Fi for the same traffic in the
 other direction, and it can because the PHONE listens on TCP and the laptop
 dials it. There is no listener the other way, so a phone-initiated LAN session

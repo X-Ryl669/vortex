@@ -113,6 +113,18 @@ class LanServer(
      */
     var fsServe: ((op: Byte, payload: ByteArray) -> Pair<Byte, ByteArray>)? = null
 
+    /**
+     * A reply to a filesystem request WE sent, arriving over this socket.
+     *
+     * Needed because a reply does not necessarily come back on the transport
+     * that carried the request: the laptop's client prefers Wi-Fi for FS
+     * traffic, so a request sent over BLE is answered over TCP. Without this
+     * the phone dropped every such reply and its browser sat until the 20 s
+     * timeout, reporting "the laptop did not answer" while the laptop had in
+     * fact answered immediately.
+     */
+    var onFsReply: ((frameType: Byte, payload: ByteArray) -> Unit)? = null
+
     /** Fired after an instant-share FILE blob has been written to the peer,
      *  with the content token it pulled by. Closes the loop the outgoing-offer
      *  watchdog waits on: an offer is only really done once the laptop has the
@@ -960,6 +972,22 @@ class LanServer(
                                 FrameType.BULK_SYNC, 0x02,
                                 status.toString().toByteArray(Charsets.UTF_8),
                             )
+                        }
+                        frame.type == FrameType.FS_META ||
+                            frame.type == FrameType.FS_DATA ||
+                            frame.type == FrameType.FS_ERR -> {
+                            val plain = runCatching {
+                                aeadOpen(pair.receiver, frame.payload)
+                            }.getOrNull()
+                            if (plain == null) {
+                                Log.w(TAG, "fs: reply AEAD decrypt failed")
+                                continue
+                            }
+                            try {
+                                onFsReply?.invoke(frame.type, plain)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "onFsReply threw: ${e.message}")
+                            }
                         }
                         frame.type == FrameType.FS_REQ -> {
                             // Ranged filesystem op over Wi-Fi. The laptop

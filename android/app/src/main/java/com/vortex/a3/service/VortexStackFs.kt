@@ -65,6 +65,13 @@ internal fun VortexStack.startFsServer() {
     gattServer?.onFsReply = { _, type, payload ->
         com.vortex.a3.core.fs.FsClient.onReply(type, payload)
     }
+    // The same replies can arrive over Wi-Fi instead: the laptop's client picks
+    // its transport per send, so the one that carried our request is not
+    // necessarily the one that answers it.
+    lanServer?.onFsReply = { type, payload ->
+        com.vortex.a3.core.fs.FsClient.onReply(type, payload)
+    }
+    fsReplyFn = { type, payload -> com.vortex.a3.core.fs.FsClient.onReply(type, payload) }
 
     gattServer?.onFsRequest = { peerPub, op, payload ->
         // Off the GATT callback thread, always. A document provider can stall

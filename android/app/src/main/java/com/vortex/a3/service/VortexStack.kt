@@ -91,6 +91,10 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      *  and `restartBleComponents` replaces the server (and its handle table)
      *  without touching the LAN side. Whoever starts second installs it. */
     internal var fsServeFn: ((Byte, ByteArray) -> Pair<Byte, ByteArray>)? = null
+
+    /** Route for FS replies arriving over LAN. Same late-binding problem as
+     *  [fsServeFn]: the LAN server does not exist yet when BLE starts. */
+    internal var fsReplyFn: ((Byte, ByteArray) -> Unit)? = null
     /** Buffers phone→laptop notifications that fail to send while BLE is down;
      *  flushed when the peer re-subscribes to AUDIO_SIGNAL. */
     internal val notificationOutbox = com.vortex.a3.core.notif.NotificationOutbox()
@@ -1190,6 +1194,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // BLE started first, so the serve function already exists; install it
         // now that there is a LAN server to hang it on.
         lan.fsServe = fsServeFn
+        lan.onFsReply = fsReplyFn
     }
 
     /**

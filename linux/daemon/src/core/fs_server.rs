@@ -207,7 +207,19 @@ fn do_list(roots: &p::Roots, r: &p::ListReq) -> Served {
         // With exactly one root, a synthetic level above it would be a folder
         // the user has to click through every time for no information.
     }
-    let path = match resolve_or(roots, &r.path, false, r.id) {
+    // Which path to actually list. The single-root case above deliberately does
+    // NOT interpose a synthetic level, so the root's own path has to be
+    // substituted for the empty request here. Falling through with the empty
+    // path reached `resolve("")`, which is INVAL — so a peer asking for the
+    // root of a one-root device got "path refused" and could not browse at all.
+    // That is the DEFAULT configuration, and it is what the phone's browser hit
+    // on its first run.
+    let requested: String = if (r.path == "/" || r.path.is_empty()) && roots.list().len() == 1 {
+        roots.list()[0].path.to_string_lossy().to_string()
+    } else {
+        r.path.clone()
+    };
+    let path = match resolve_or(roots, &requested, false, r.id) {
         Ok(p) => p,
         Err(s) => return s,
     };
@@ -496,6 +508,36 @@ pub fn now_secs() -> i64 {
 mod tests {
     use super::*;
     use crate::core::fs_proto::Root;
+
+    /// The empty path against a ONE-root device must list that root.
+    ///
+    /// It used to answer INVAL: the single-root branch skips the synthetic
+    /// listing (rightly — a level with one entry is a click for nothing) but
+    /// then resolved the still-empty path. One root is the default config, so
+    /// the default device could not be browsed at all.
+    #[test]
+    fn empty_path_lists_the_only_root() {
+        let dir = scratch("one-root");
+        std::fs::write(dir.join("a.txt"), b"hi").expect("write");
+        let roots = p::Roots::new(vec![Root {
+            path: dir.clone(),
+            writable: false,
+        }]);
+        let handles = FsHandles::new();
+        let req = serde_json::to_vec(&serde_json::json!({"id": 1, "path": "", "cursor": 0}))
+            .expect("json");
+        match serve(&roots, &handles, p::op::LIST, &req) {
+            Served::Meta(FsReply::List { entries, .. }) => {
+                assert!(
+                    entries.iter().any(|e| e.name == "a.txt"),
+                    "expected the root's contents, got {entries:?}"
+                );
+            }
+            Served::Err(e) => panic!("expected a listing, got error {}: {}", e.code, e.msg),
+            _ => panic!("expected a listing"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("vortex-fsserver-{name}"));
