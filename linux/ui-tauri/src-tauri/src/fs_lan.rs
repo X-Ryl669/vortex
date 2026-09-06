@@ -81,17 +81,30 @@ pub(crate) async fn writer() -> Option<FsLanWriter> {
         return None;
     }
 
-    let ctx = CTX.get()?;
+    let Some(ctx) = CTX.get() else { return None };
     let peers = {
         let store = ctx.peer_store.clone();
-        tokio::task::spawn_blocking(move || store.list().unwrap_or_default())
-            .await
-            .ok()?
+        match tokio::task::spawn_blocking(move || store.list().unwrap_or_default()).await {
+            Ok(v) => v,
+            Err(_) => return None,
+        }
     };
     // The peer whose files we are browsing is the active one, for the same
     // reason the BLE loop dials it: it owns the session the UI is showing.
-    let peer = crate::arbiter::preferred_peer(peers)?;
-    let addr = crate::lan::resolve_peer_addr(false).await?;
+    let Some(peer) = crate::arbiter::preferred_peer(peers) else { return None };
+
+    // Every "cannot use LAN" path from here on records the failure, rather
+    // than only the ones that get as far as a failed handshake. Resolving the
+    // address is itself expensive — a probe plus an mDNS browse, measured at
+    // 12 s with the phone's Wi-Fi off — and returning early without arming the
+    // cooldown made every send in a burst pay it again. An eleven-read fetch
+    // would have spent over two minutes rediscovering a phone that was not
+    // there, before falling back each time.
+    let Some(addr) = crate::lan::resolve_peer_addr(false).await else {
+        tracing::info!("fs-lan: phone not reachable on the network; using BLE");
+        note_failure(&mut s);
+        return None;
+    };
     let local_counter = {
         let store = ctx.peer_store.clone();
         let peer_pub = peer.peer_static_pub;
@@ -139,13 +152,23 @@ pub(crate) async fn writer() -> Option<FsLanWriter> {
         }
         Err(e) => {
             tracing::warn!(%addr, "fs-lan: session failed ({e}); using BLE");
-            s.last_failed = Some(Instant::now());
-            if !s.warned {
-                s.warned = true;
-                warn_user_slow_link();
-            }
+            note_failure(&mut s);
             None
         }
+    }
+}
+
+/// Arm the retry cooldown and tell the user once.
+///
+/// One place, so a new "give up on LAN" branch cannot forget either half. The
+/// first version warned only on a failed handshake, which missed the common
+/// case entirely: with the phone off Wi-Fi there is no address to hand to a
+/// handshake, so the user got a silent 20x slowdown and no cooldown.
+fn note_failure(s: &mut Session) {
+    s.last_failed = Some(Instant::now());
+    if !s.warned {
+        s.warned = true;
+        warn_user_slow_link();
     }
 }
 
@@ -167,7 +190,7 @@ pub(crate) async fn close() {
 /// on, which is the test for whether a notification earns its place.
 fn warn_user_slow_link() {
     tokio::spawn(async {
-        let _ = crate::notify::show_banner(
+        match crate::notify::show_banner(
             "Phone files over Bluetooth",
             "Wi-Fi isn't reachable, so browsing and copying will be slow. \
              Put both devices on the same network to speed it up.",
@@ -179,6 +202,13 @@ fn warn_user_slow_link() {
             // dismissed would be worse than the problem it describes.
             false,
         )
-        .await;
+        .await
+        {
+            // Logged either way: the whole point is to tell the user why
+            // things got slow, so a notification daemon that refused it is
+            // worth knowing about rather than assuming it landed.
+            Ok(_) => tracing::info!("fs-lan: told the user we are on the slow link"),
+            Err(e) => tracing::warn!("fs-lan: could not show the slow-link notice: {e}"),
+        }
     });
 }
