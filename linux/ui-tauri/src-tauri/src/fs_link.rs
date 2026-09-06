@@ -34,6 +34,14 @@ use vortex_l3_daemon::core::fs_server::{self, FsHandles, Served};
 #[allow(dead_code)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Ranged reads kept in flight by [`read_all`].
+///
+/// Hides the round trip, not the disk: the peer serves reads under one lock so
+/// they do not overlap there. Modest on purpose — replies are 48 KiB each, and
+/// on a BLE fallback every one is ~96 paced notify fragments, so a large window
+/// would flood a link that cannot absorb it.
+const READ_WINDOW: usize = 4;
+
 /// A reply, as delivered to whoever is waiting on a request id.
 #[derive(Debug)]
 pub enum Reply {
@@ -384,31 +392,77 @@ pub(crate) async fn read_all(
     path: &str,
     mut sink: impl FnMut(u64, &[u8]) -> std::io::Result<()>,
 ) -> Result<u64, i32> {
+    use futures::stream::{FuturesOrdered, StreamExt};
+
     let (handle, size) = open(path, false).await?;
     let mut offset = 0u64;
-    let result = loop {
-        let (bytes, eof) = match read(handle, offset, p::MAX_READ_LEN).await {
-            Ok(v) => v,
-            Err(c) => break Err(c),
-        };
-        if !bytes.is_empty() {
-            if let Err(e) = sink(offset, &bytes) {
-                tracing::warn!("fs: sink failed at offset {offset}: {e}");
+
+    // Pipelined when the size is known: keep [`READ_WINDOW`] reads outstanding
+    // so the next request is on the wire while the current reply is still
+    // arriving. Sequentially, every chunk paid a full round trip before the
+    // next was even sent, which is most of the cost on a link this fast.
+    //
+    // `FuturesOrdered` yields in ISSUE order, which is also offset order, so
+    // the sink is still called front to back and a caller that simply appends
+    // stays correct. Each future carries the offset it asked for rather than
+    // trusting a running counter — a short read would otherwise silently shift
+    // every later chunk.
+    //
+    // Without a size there is nothing to size a window against, and
+    // speculative reads past the end would be pure waste, so that case stays
+    // sequential and follows EOF.
+    let result = if size > 0 {
+        let mut pending = FuturesOrdered::new();
+        let mut next = 0u64;
+        loop {
+            while pending.len() < READ_WINDOW && next < size {
+                let at = next;
+                pending.push_back(async move { (at, read(handle, at, p::MAX_READ_LEN).await) });
+                next = next.saturating_add(p::MAX_READ_LEN as u64);
+            }
+            let Some((at, res)) = pending.next().await else {
+                break Ok(offset);
+            };
+            let (bytes, eof) = match res {
+                Ok(v) => v,
+                Err(c) => break Err(c),
+            };
+            if !bytes.is_empty() {
+                if let Err(e) = sink(at, &bytes) {
+                    tracing::warn!("fs: sink failed at offset {at}: {e}");
+                    break Err(code::IO);
+                }
+                offset = at + bytes.len() as u64;
+            } else if !eof {
+                tracing::warn!(at, "fs: read stalled without EOF");
                 break Err(code::IO);
             }
-            offset += bytes.len() as u64;
+            if eof {
+                break Ok(offset);
+            }
         }
-        if eof {
-            break Ok(offset);
-        }
-        if bytes.is_empty() {
-            // No EOF flag and no bytes: the peer is not making progress and a
-            // retry loop here would spin forever.
-            tracing::warn!(offset, "fs: read stalled without EOF");
-            break Err(code::IO);
-        }
-        if size > 0 && offset >= size {
-            break Ok(offset);
+    } else {
+        loop {
+            let (bytes, eof) = match read(handle, offset, p::MAX_READ_LEN).await {
+                Ok(v) => v,
+                Err(c) => break Err(c),
+            };
+            if !bytes.is_empty() {
+                if let Err(e) = sink(offset, &bytes) {
+                    tracing::warn!("fs: sink failed at offset {offset}: {e}");
+                    break Err(code::IO);
+                }
+                offset += bytes.len() as u64;
+            }
+            if eof {
+                break Ok(offset);
+            }
+            if bytes.is_empty() {
+                // No EOF flag and no bytes: the peer is not making progress and
+                // a retry loop here would spin forever.
+                tracing::warn!(offset, "fs: read stalled without EOF");
+                break Err(code::IO);
+            }
         }
     };
     close(handle).await;

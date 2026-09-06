@@ -5,6 +5,8 @@ import com.vortex.a3.core.ble.FrameType
 import java.io.File
 import java.io.RandomAccessFile
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
@@ -42,6 +44,19 @@ object FsClient {
      * sleep is this feature's worst outcome.
      */
     private const val REQUEST_TIMEOUT_MS = 20_000L
+
+    /**
+     * Ranged reads kept in flight at once.
+     *
+     * The gain is hiding the round trip, not the disk: the laptop serves reads
+     * under one lock, so they do not overlap there, but each request otherwise
+     * waited a full RTT before the next was even sent. Four is deliberately
+     * modest — it covers the latency without committing much: the replies are
+     * 48 KiB each, and on a BLE fallback every one of those is ~96 paced
+     * notify fragments, so a large window would flood a link that cannot
+     * absorb it.
+     */
+    private const val READ_WINDOW = 4
 
     private const val TAG = "VortexFs"
 
@@ -109,18 +124,30 @@ object FsClient {
     private suspend fun roundTrip(op: Byte, id: Int, payload: ByteArray): Reply {
         val d = CompletableDeferred<Reply>()
         synchronized(lock) { inflight[id] = d }
-        val send = sender
-        if (send == null || !send(op, payload)) {
+        try {
+            val send = sender ?: throw FsException(FsCode.IO, "no link to the laptop")
+            if (!send(op, payload)) throw FsException(FsCode.IO, "no link to the laptop")
+            val reply = withTimeoutOrNull(REQUEST_TIMEOUT_MS) { d.await() }
+                ?: throw FsException(TIMEOUT, "the laptop did not answer")
+            if (reply is Reply.Err) throw FsException(reply.e.code, reply.e.msg)
+            return reply
+        } finally {
+            // Always, including on CANCELLATION. Pipelining made that matter:
+            // when one read of a batch fails the rest are cancelled, and each
+            // used to leave its id in the map for the life of the process.
             synchronized(lock) { inflight.remove(id) }
-            throw FsException(FsCode.IO, "no link to the laptop")
         }
-        val reply = withTimeoutOrNull(REQUEST_TIMEOUT_MS) { d.await() }
-        if (reply == null) {
-            synchronized(lock) { inflight.remove(id) }
-            throw FsException(TIMEOUT, "the laptop did not answer")
-        }
-        if (reply is Reply.Err) throw FsException(reply.e.code, reply.e.msg)
-        return reply
+    }
+
+    /** One ranged read, as a suspending call the download loop can overlap. */
+    private suspend fun readAt(handle: Long, offset: Long, len: Int): FsData {
+        val id = newId()
+        val r = roundTrip(
+            FsOp.READ,
+            id,
+            ReadReq(id, handle, offset, len).toJson().toString().toByteArray(),
+        )
+        return (r as? Reply.Data)?.d ?: throw FsException(FsCode.IO, "expected data")
     }
 
     private fun newId(): Int = synchronized(lock) {
@@ -186,29 +213,58 @@ object FsClient {
         try {
             RandomAccessFile(dest, "rw").use { out ->
                 out.setLength(0)
-                while (true) {
-                    val id = newId()
-                    val r = roundTrip(
-                        FsOp.READ,
-                        id,
-                        ReadReq(id, handle, offset, MAX_READ_LEN).toJson().toString().toByteArray(),
-                    )
-                    val d = (r as? Reply.Data)?.d
-                        ?: throw FsException(FsCode.IO, "expected data")
-                    if (d.bytes.isNotEmpty()) {
-                        // Seek to the offset we were given rather than
-                        // appending: the reply carries one so a reader that
-                        // pipelines later cannot write bytes out of order.
-                        out.seek(d.offset)
-                        out.write(d.bytes)
-                        offset = d.offset + d.bytes.size
-                        onProgress(offset, size)
+                if (size > 0) {
+                    // Pipelined: keep [READ_WINDOW] reads outstanding so the
+                    // next request is already on the wire while the current
+                    // reply is still coming back. Only when the size is known —
+                    // without it there is no way to tell how many reads to
+                    // issue, and speculative ones past the end would be waste
+                    // on a link this feature exists to stop wasting.
+                    coroutineScope {
+                        val inflight = ArrayDeque<kotlinx.coroutines.Deferred<FsData>>()
+                        var nextOffset = 0L
+                        while (offset < size) {
+                            while (inflight.size < READ_WINDOW && nextOffset < size) {
+                                val at = nextOffset
+                                nextOffset += MAX_READ_LEN
+                                inflight.addLast(async { readAt(handle, at, MAX_READ_LEN) })
+                            }
+                            // Consumed in ISSUE order, which is also offset
+                            // order, so the file is written front to back and
+                            // progress only ever moves forward. Replies may
+                            // still arrive in any order; this just declines to
+                            // care.
+                            val d = inflight.removeFirst().await()
+                            if (d.bytes.isNotEmpty()) {
+                                out.seek(d.offset)
+                                out.write(d.bytes)
+                                offset = d.offset + d.bytes.size
+                                onProgress(offset, size)
+                            } else if (!d.eof) {
+                                throw FsException(FsCode.IO, "transfer stalled")
+                            }
+                            if (d.eof && inflight.isEmpty()) break
+                        }
+                        // A short file, or one that shrank under us: drop the
+                        // rest rather than awaiting reads past its end.
+                        inflight.forEach { it.cancel() }
                     }
-                    if (d.eof) break
-                    if (d.bytes.isEmpty()) {
-                        // No EOF and no bytes: the far side is not advancing,
-                        // and retrying would spin forever.
-                        throw FsException(FsCode.IO, "transfer stalled")
+                } else {
+                    // Unknown size: sequential, following EOF.
+                    while (true) {
+                        val d = readAt(handle, offset, MAX_READ_LEN)
+                        if (d.bytes.isNotEmpty()) {
+                            out.seek(d.offset)
+                            out.write(d.bytes)
+                            offset = d.offset + d.bytes.size
+                            onProgress(offset, size)
+                        }
+                        if (d.eof) break
+                        if (d.bytes.isEmpty()) {
+                            // No EOF and no bytes: the far side is not
+                            // advancing, and retrying would spin forever.
+                            throw FsException(FsCode.IO, "transfer stalled")
+                        }
                     }
                 }
             }
