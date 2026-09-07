@@ -319,8 +319,8 @@ This is where these features usually fail, and it is all daemon-side:
    a write refused. That test needs `/dev/fuse`, so it is `#[ignore]`d and run
    with `cargo test --lib fs_mount -- --ignored`.
 
-   Reachable from the UI: a folder button beside "Connected" on the phone's
-   card mounts on demand and hands the path to `xdg-open`. Mounting is what can
+   Reachable from the UI: a folder button on the right of the phone card's
+   "Connected" row mounts on demand and hands the path to `xdg-open`. Mounting is what can
    fail — the phone may have gone since the card last said Connected — so the
    button holds the error for a few seconds with the reason in its tooltip,
    rather than opening a file manager onto nothing.

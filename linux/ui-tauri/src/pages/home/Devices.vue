@@ -208,17 +208,18 @@ const earbudsStatus = computed(() => {
           </span>
           <!-- Browse the phone's files. Only while it is reachable: the mount
                is served over the live session, so offline there is nothing to
-               open. -->
+               open. `ml-auto` puts it on the card's right edge, under the ring
+               and switch buttons it matches. -->
           <button
             v-if="phoneOnline"
-            class="vx-mini"
-            :class="{ 'vx-mini--bad': filesError }"
+            class="vx-ring ml-auto disabled:opacity-60"
+            :class="{ 'vx-ring--bad': filesError }"
             :disabled="filesOpening"
             :title="filesError || t('peers.browse_tip')"
             @click="openPhoneFiles"
           >
-            <Loader2 v-if="filesOpening" class="h-3.5 w-3.5 animate-spin" />
-            <FolderOpen v-else class="h-3.5 w-3.5" :stroke-width="1.9" />
+            <Loader2 v-if="filesOpening" class="h-[18px] w-[18px] animate-spin" />
+            <FolderOpen v-else class="h-[18px] w-[18px]" :stroke-width="1.9" />
           </button>
         </div>
         <div class="h-px bg-white/[0.06]" />
@@ -358,24 +359,6 @@ const earbudsStatus = computed(() => {
 .vx-chip--live {
   @apply border-primary/40 bg-primary/[0.14] text-primary;
 }
-/* Small round action sitting inline with a line of text — vx-ring at 36px would
-   tower over the 13px status row it belongs to. */
-.vx-mini {
-  @apply flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full transition-colors disabled:opacity-60;
-  color: hsl(var(--muted-foreground));
-  border: 1px solid hsl(var(--border));
-  background: hsl(var(--foreground) / 0.04);
-}
-.vx-mini:hover:not(:disabled) {
-  color: hsl(var(--foreground));
-  background: hsl(var(--foreground) / 0.08);
-}
-/* A failed mount, held for a few seconds with the reason in the tooltip. */
-.vx-mini--bad {
-  color: hsl(var(--destructive));
-  border-color: hsl(var(--destructive) / 0.45);
-  background: hsl(var(--destructive) / 0.12);
-}
 /* Find-My ring button — theme-safe tints (foreground/primary alpha) so it reads
    in light mode too; pulses while a ring was just requested. */
 .vx-ring {
@@ -387,6 +370,13 @@ const earbudsStatus = computed(() => {
 .vx-ring:hover {
   color: hsl(var(--foreground));
   background: hsl(var(--foreground) / 0.08);
+}
+/* An action that just failed — held for a few seconds, with the reason in the
+   button's tooltip. Still, no pulse: this one is reporting, not working. */
+.vx-ring--bad {
+  color: hsl(var(--destructive));
+  border-color: hsl(var(--destructive) / 0.45);
+  background: hsl(var(--destructive) / 0.12);
 }
 .vx-ring--on {
   color: hsl(var(--primary));
