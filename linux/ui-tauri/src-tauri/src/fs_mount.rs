@@ -54,7 +54,7 @@ use std::time::{Duration, Instant, SystemTime};
 use fuser::{
     Errno, FileAttr, FileType, FopenFlags, Generation, INodeNo, KernelConfig, MountOption,
     OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyStatfs, Request,
+    ReplyOpen, ReplyStatfs, ReplyXattr, Request,
 };
 use vortex_l3_daemon::core::fs_proto::{self as p, code};
 
@@ -690,6 +690,45 @@ impl<R: FsRemote> fuser::Filesystem for PhoneFs<R> {
         });
     }
 
+    // ── Ops answered without asking the phone ────────────────────────────
+    //
+    // Left unimplemented, each of these answers `ENOSYS`, which the kernel
+    // handles but fuser logs as "[Not Implemented]" — a warning per call in
+    // the app's log, several per file opened. Answering them here costs
+    // nothing and the answers are all knowable locally.
+
+    /// Nothing to flush: the mount is read-only, and a read has no state on the
+    /// peer beyond the handle `release` will close.
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    /// No extended attributes, and no way to have any: the protocol carries a
+    /// name, a kind, a size and an mtime, and nothing else. `ENODATA` is the
+    /// answer for "this attribute is not set", which is the truth for every
+    /// name that could be asked about.
+    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
+        reply.error(Errno::ENODATA);
+    }
+
+    /// An empty list, not an error — `cp -a` and Dolphin both ask, and a
+    /// failure here reads to them as a file they could not fully inspect.
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        // The two-call protocol: size 0 asks how much room to allocate.
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         // Zeroed on purpose. There is no protocol op for free space, and a made
         // up figure would be a lie a file manager acts on. Zero free on a
@@ -765,14 +804,20 @@ fn spawn_session<R: FsRemote>(
     dir: &PathBuf,
     remote: R,
 ) -> Result<fuser::BackgroundSession, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    // A previous run that died without unmounting leaves the path occupied, and
-    // the mount would fail with a confusing EBUSY. Only ever our own private
-    // path under XDG_RUNTIME_DIR, and a no-op when nothing is mounted there.
+    // FIRST, before touching the path at all: a previous run that died without
+    // unmounting (a crash, a SIGKILL, the installer restarting the app) leaves
+    // the mount in the table with no server behind it, and every syscall on it
+    // answers ENOTCONN. That includes the `stat` inside `create_dir_all`, which
+    // therefore fails with EEXIST — the directory is there, it just cannot be
+    // looked at. Clearing the corpse first is what makes a remount work.
+    //
+    // Only ever our own private path under XDG_RUNTIME_DIR, and a no-op when
+    // nothing is mounted there.
     let _ = std::process::Command::new("fusermount3")
         .args(["-quz", &dir.to_string_lossy()])
         .stderr(std::process::Stdio::null())
         .status();
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
     let fs = PhoneFs {
         inner: Arc::new(Inner::new(remote)),
@@ -789,6 +834,12 @@ fn spawn_session<R: FsRemote>(
         MountOption::NoSuid,
         MountOption::NoDev,
         MountOption::NoExec,
+        // Let the KERNEL do permission checks, from the mode bits we report.
+        // Without it the kernel asks us (`access`) on every path walk, which
+        // is a round trip through the session thread to answer "yes" — the
+        // mount is visible to its owner alone and read-only, so there is
+        // nothing for us to decide that the mode bits do not already say.
+        MountOption::DefaultPermissions,
     ];
     // One session thread is enough: it only parses a request and hands it to
     // the runtime, so it is never the thing that is busy.

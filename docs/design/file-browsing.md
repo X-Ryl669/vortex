@@ -319,6 +319,37 @@ This is where these features usually fail, and it is all daemon-side:
    a write refused. That test needs `/dev/fuse`, so it is `#[ignore]`d and run
    with `cargo test --lib fs_mount -- --ignored`.
 
+   **Verified on the device** (2026-09-07, over Wi-Fi, all-files root). The
+   phone's shared storage appeared at `/run/user/1000/vortex/phone` as
+   `fuse.vortex (ro,nosuid,nodev,noexec,default_permissions)` with real names
+   and mtimes; a cold listing took ~300 ms and a subdirectory 12 ms.
+
+   * A 52 MB 4K video: `md5sum` matched the phone's in 7.4 s (7.1 MB/s), and
+     `ffprobe` read its codec, resolution and duration — a real seeking
+     consumer, not just a sequential one.
+   * A 481 MB APK: `cat | md5sum` matched in 66 s (7.3 MB/s) while the phone's
+     Java heap went 30.7 MB → 17.6 MB (a GC ran) and its native heap sat at
+     12.1 MB. Nothing is buffered, at 7.5x the size of the cap this feature
+     started out working around.
+   * A 3.4 GB ROM zip listed with its true size, and the last 64 KiB read at
+     offset 3,396,354,250 matched the phone's md5 of the same range — past
+     2^31, so the 64-bit offsets survive the whole stack.
+   * `touch` in the mount: "Read-only file system", refused by the kernel
+     without a round trip.
+
+   Two things that only a live run surfaced. Every path walk was asking us
+   `access` and every `close` a `flush`, and `getxattr`/`listxattr` on top —
+   fuser logs each as "[Not Implemented]", so an ordinary `ls` wrote warnings
+   into the app's log and paid a session round trip to answer "yes". Answering
+   them locally (and handing permission checks to the kernel with
+   `default_permissions`, which is what stops `access` being sent at all) took
+   that to zero and the 52 MB read from 8.6 s to 7.4 s. And the stale-mount
+   recovery was in the wrong order: a mount whose server was SIGKILLed (a
+   crash, or the installer restarting the app) stays in the table answering
+   `ENOTCONN`, which includes the `stat` inside `create_dir_all` — so
+   *creating* the mount point failed with EEXIST before the code that clears
+   the corpse ever ran.
+
 Steps 1–2 are worth doing regardless of whether the mount ever ships, which is
 the main argument for this ordering.
 
