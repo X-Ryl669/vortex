@@ -1,10 +1,12 @@
 //! Command-line exercise of the filesystem protocol (design doc §8 step 1:
 //! "No mount yet — validate over the existing session with a CLI").
 //!
-//! There is no mount adapter yet and no UI for browsing, so without this the
-//! only way to reach [`crate::fs_link`] would be to build one of those first
-//! and debug two new things at once. These flags drive the client directly over
-//! whatever session is already up, which is the same reason `--mirror` exists.
+//! There is no UI for browsing yet, so without this the only way to reach
+//! [`crate::fs_link`] would be to build one first and debug two new things at
+//! once. These flags drive the client directly over whatever session is already
+//! up, which is the same reason `--mirror` exists. `--fs-mount` is here for a
+//! second reason as well: mounting the phone is a deliberate act, not something
+//! that should happen behind the user's back on every connect.
 //!
 //! Results go to the app log (`~/.cache/vortex/vortex.log`), not the invoking
 //! terminal: single-instance forwards the argv to the *running* process, which
@@ -132,9 +134,37 @@ pub(crate) async fn get(remote: String, local: String) {
     }
 }
 
+/// `--fs-mount` / `--fs-umount` — put the phone's storage on the filesystem.
+///
+/// The mount is not automatic: it costs a `fusermount3` and a kernel session,
+/// and a mount pointing at a phone that is not here is worse than no mount. So
+/// it is driven explicitly, and from here until there is a button for it.
+#[cfg(target_os = "linux")]
+pub(crate) async fn mount() {
+    match crate::fs_mount::mount().await {
+        Ok(dir) => tracing::info!("fs-cli: mounted at {}", dir.display()),
+        Err(e) => tracing::warn!("fs-cli: mount failed: {e}"),
+    }
+}
+
 /// Route an `--fs-*` flag. Returns false when `argv` holds none, so the caller
 /// can fall through to its other flags.
 pub(crate) fn dispatch(argv: &[String]) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if argv.iter().any(|a| a == "--fs-umount") {
+            if crate::fs_mount::is_mounted() {
+                crate::fs_mount::unmount();
+            } else {
+                tracing::info!("fs-cli: nothing mounted");
+            }
+            return true;
+        }
+        if argv.iter().any(|a| a == "--fs-mount") {
+            tauri::async_runtime::spawn(mount());
+            return true;
+        }
+    }
     if let Some(pos) = argv.iter().position(|a| a == "--fs-ls") {
         // Optional: no path means the synthetic root listing the peer's shares.
         let path = argv.get(pos + 1).cloned().unwrap_or_default();

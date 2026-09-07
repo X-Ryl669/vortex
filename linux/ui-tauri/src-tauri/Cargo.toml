@@ -139,3 +139,10 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # The tray, spoken as StatusNotifierItem. Linux-only by nature, which is why
 # it lives here and not above.
 ksni = "0.3"
+# The phone's storage as a real mount (`fs_mount`). Default features are empty
+# on purpose: with `libfuse` this would need libfuse3 headers and pkg-config at
+# BUILD time, which every packaging target would then have to carry. Without
+# it, fuser mounts through the kernel directly and falls back to the setuid
+# `fusermount3` binary — a runtime dependency already present anywhere FUSE
+# works at all.
+fuser = { version = "0.18", default-features = false }

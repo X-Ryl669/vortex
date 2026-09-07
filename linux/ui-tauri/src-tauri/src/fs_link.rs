@@ -7,9 +7,9 @@
 //!   through [`vortex_l3_daemon::core::fs_server`], gated by the roots config,
 //!   and answered with `FS_META` / `FS_DATA` / `FS_ERR`. This is what lets the
 //!   phone browse the laptop.
-//! * **Client.** [`request`] issues an op to the phone and awaits its reply,
-//!   correlated by request id. This is what the mount adapter (FUSE / ProjFS)
-//!   will sit on top of.
+//! * **Client.** [`round_trip`] issues an op to the phone and awaits its reply,
+//!   correlated by request id. `fs_mount` (FUSE, Linux) and [`crate::fs_pull`]
+//!   (file transfer) sit on top of it.
 //!
 //! Requests are **pipelined**: a file manager stats everything in view at once,
 //! so a request/response lock would feel broken. Each in-flight id owns a
@@ -33,6 +33,15 @@ use vortex_l3_daemon::core::fs_server::{self, FsHandles, Served};
 /// sending `FS_ERR`.
 #[allow(dead_code)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Locally-generated code for "there is no link to the peer".
+///
+/// `EHOSTDOWN`, so a mount adapter can hand the file manager an accurate
+/// message rather than a generic I/O error. NOT part of [`p::code`]: it is
+/// never sent and never received, because a peer that could answer would not
+/// be down. It only travels from [`send`] to whoever asked.
+#[allow(dead_code)]
+pub(crate) const NO_LINK: i32 = 112;
 
 /// Ranged reads kept in flight by [`read_all`].
 ///
@@ -175,17 +184,27 @@ async fn serve_request(state: Arc<State>, f: RawFrame) {
         Served::Data(bytes) => (ty::FS_DATA, bytes),
         Served::Err(e) => (ty::FS_ERR, serde_json::to_vec(&e).unwrap_or_default()),
     };
-    send(&state, ty_byte, 0, payload).await;
+    if send(&state, ty_byte, 0, payload).await.is_err() {
+        // The peer asked over a link that has since gone. Nothing to do but
+        // drop it: it will not be waiting on a reply it can receive.
+        tracing::debug!("fs: dropped a reply, no link");
+    }
 }
 
-async fn send(state: &State, ty_byte: u8, sub: u8, payload: Vec<u8>) {
+/// Put one frame on the best transport available.
+///
+/// `Err` means it reached neither, which a client must be told rather than
+/// left to discover through the 20 s timeout: a file manager blocked for 20 s
+/// per operation on a phone that is simply not here is this feature's worst
+/// outcome (design doc §6, "an honest, immediate error rather than hanging").
+async fn send(state: &State, ty_byte: u8, sub: u8, payload: Vec<u8>) -> Result<(), ()> {
     // Wi-Fi first, Bluetooth second (design doc §6). The two carry identical
     // frames, so this is only a routing choice — but a 48 KiB read is one TCP
     // frame and ~96 paced BLE fragments, which is the difference between a
     // copy taking a second and taking minutes.
     if let Some(w) = crate::fs_lan::writer().await {
         match w(ty_byte, sub, payload.clone()).await {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(e) => {
                 // The session looked alive and wasn't — a phone that changed
                 // network, or a socket the peer dropped. Fall through to BLE
@@ -198,22 +217,25 @@ async fn send(state: &State, ty_byte: u8, sub: u8, payload: Vec<u8>) {
     }
     let w = { state.writer.lock().await.clone() };
     let Some(w) = w else {
-        tracing::debug!("fs: no writer (link down); dropping a reply");
-        return;
+        tracing::debug!("fs: no writer (link down)");
+        return Err(());
     };
     if let Err(e) = w(ty_byte, sub, payload).await {
         tracing::warn!("fs: send 0x{ty_byte:02x} failed: {e}");
+        return Err(());
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
-// Nothing calls the client half yet: its consumers are the mount adapter
-// (FUSE / ProjFS) and the reworked file transfer, both of which land in later
-// commits. Each item below carries `#[allow(dead_code)]` rather than the module
-// carrying a blanket one, so genuine dead code here is still reported.
+// The `#[allow(dead_code)]` on each item below, rather than a blanket one on the
+// module, so genuine dead code here is still reported. They are needed because
+// not every op has a consumer on every platform: `write` waits on design doc
+// §8 step 5, and the FUSE consumer of the read path is Linux-only until ProjFS
+// lands.
 
 /// Issue one op to the phone and await its reply.
 ///
@@ -231,7 +253,12 @@ async fn round_trip(op: u8, id: u32, payload: Vec<u8>) -> Result<Reply, i32> {
         let mut g = state.inflight.lock().map_err(|_| code::IO)?;
         g.insert(id, tx);
     }
-    send(&state, ty::FS_REQ, op, payload).await;
+    if send(&state, ty::FS_REQ, op, payload).await.is_err() {
+        if let Ok(mut g) = state.inflight.lock() {
+            g.remove(&id);
+        }
+        return Err(NO_LINK);
+    }
     match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
         Ok(Ok(reply)) => Ok(reply),
         // Sender dropped: the session ended under us.

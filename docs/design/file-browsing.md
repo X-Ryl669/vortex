@@ -108,6 +108,11 @@ Design notes:
 
 ## 4. Desktop presentation: WebDAV first, native VFS as the exit
 
+*Linux went straight to the native VFS (v2) and skipped WebDAV.* The reasoning
+is under v2 below; in short, on Linux WebDAV buys strictly less than FUSE for
+comparable work, so the "cheapest path" argument for doing it first does not
+survive contact with it. Windows still has the choice open.
+
 ### v1 — WebDAV on loopback
 
 One implementation serving both OSes:
@@ -131,13 +136,24 @@ not go away and is the main reason v1 may not be the end state.
 
 ### v2 — native virtual filesystem
 
-- **Linux:** FUSE. Straightforward, gives a real mount.
+- **Linux:** FUSE. Straightforward, gives a real mount. **Done** —
+  [`fs_mount.rs`], mounted at `$XDG_RUNTIME_DIR/vortex/phone`.
 - **Windows:** **ProjFS** (Projected File System), shipped in Windows 10 1809+
   with **no third-party install** — it is what VFS for Git uses. This is the key
   fact that beats WebDAV: a real filesystem, no size limits, proper seeking.
 
 More code (two presentation implementations), but no artificial ceilings, and
 the phone side is untouched by the switch.
+
+**Why Linux skipped WebDAV.** GVFS and KIO mount `davs://` *inside the file
+manager's own process*, so only that program's file dialogs can see the files —
+`cp`, `mpv`, `ffprobe`, a text editor's Open box, anything not built on KIO,
+cannot. A FUSE mount is a path in the filesystem, so everything can. Against
+that, the platform-neutrality argument for WebDAV-first only pays off on
+Windows, where it also runs into the ~50 MB `FileSizeLimitInBytes` cap. Linux
+needs no gateway process, no port, and no auth story at all: the mount is a
+directory only the mounting user can see (FUSE's default `Owner` access mode),
+which is a smaller attack surface than a loopback HTTP server.
 
 ### Rejected: SFTP + sshfs
 
@@ -195,6 +211,10 @@ ride it, and it is how the daemon knows the phone is there at all. So:
 - Wi-Fi (LAN, or Wi-Fi Direct for bulk) is required for content.
 - With no usable network, the mount reports an honest, immediate error rather
   than hanging — a file manager blocked on a dead read is the worst outcome.
+  *Done:* a request that reaches neither transport fails at once with
+  `EHOSTDOWN` ("Host is down") instead of waiting out the 20 s reply timeout.
+  Twenty seconds per operation on a phone that is simply not here is
+  indistinguishable from a hung file manager.
 - Wi-Fi Direct is already used for large transfers and applies here unchanged.
 
 ---
@@ -204,15 +224,28 @@ ride it, and it is how the daemon knows the phone is there at all. So:
 This is where these features usually fail, and it is all daemon-side:
 
 - **Metadata cache with invalidation.** File managers stat everything in view,
-  repeatedly. Without a cache, every icon refresh is a round trip.
+  repeatedly. Without a cache, every icon refresh is a round trip. *Done for
+  the mount, mostly by the kernel:* attributes and directory entries carry a
+  5 s TTL, so a repeat `stat` inside that window never even reaches our
+  process. The other half is ours — a listing seeds the attribute cache for
+  every entry in it, which is what makes the `lookup` + `getattr` storm that
+  follows a `readdir` cost nothing. Invalidation is the TTL expiring; there is
+  no push notification of a change on the phone, and 5 s is the compromise.
 - **Readahead.** Sequential reads (copying, media playback) should pull ahead of
   the requested range; a strict 63 KiB request/response ping-pong will never
   saturate Wi-Fi. *Partly done:* both clients keep 4 ranged reads in flight,
   which turns the round trip from a per-chunk cost into an overlapped one —
   2.07 to 8.1 MB/s laptop-side, 0.4 to 2.3 MB/s phone-side. Reading *ahead* of
-  what was asked for is still to come, and is what a mount will need.
+  what was asked for arrives with the mount, and again from the kernel rather
+  than from us: a sequential reader makes the kernel issue several `read` calls
+  at once, and because the mount answers every one off-thread instead of
+  blocking, they overlap on the wire. A daemon-side readahead of its own is
+  still open, and is what would help the *first* read of a file.
 - **Coalescing and a concurrency cap.** Thumbnailers fire dozens of parallel
-  reads; unbounded, they will starve the link and the BLE session with it.
+  reads; unbounded, they will starve the link and the BLE session with it. *Cap
+  done:* the mount holds a semaphore of 8 over every request it sends, so a
+  folder of photos cannot queue megabytes of image data ahead of the next
+  listing. Coalescing overlapping ranges is not done.
 - **Content cache with a byte budget**, not an entry count — one 2 GB video must
   not evict a whole tree's metadata.
 - **Honest errors.** Every failure path returns a definite error quickly.
@@ -264,7 +297,27 @@ This is where these features usually fail, and it is all daemon-side:
 3. **Daemon cache layer** — metadata, readahead, content budget.
 4. **WebDAV loopback gateway**, both OSes.
 5. **`FS_WRITE` / `FS_SETMETA`** for real, once read-only is solid.
-6. **FUSE + ProjFS**, if the Windows WebDAV limits bite.
+6. **FUSE + ProjFS**, if the Windows WebDAV limits bite. **Linux done**
+   ([`fs_mount.rs`]), ahead of steps 3-5 and instead of WebDAV on this OS —
+   see §4. `--fs-mount` / `--fs-umount` put the phone's storage at
+   `$XDG_RUNTIME_DIR/vortex/phone`, read-only, and every program on the machine
+   can read it.
+
+   The load-bearing decision is that **nothing blocks the FUSE session
+   thread**: each operation is handed to the async runtime and its reply object
+   (which fuser makes `Send` for exactly this) is answered when the phone
+   answers. Serving inline instead would cost one full round trip per operation
+   in series, and a file manager opening a folder issues dozens at once.
+
+   What is not there yet: writes (step 5 — the mount is `ro`, so the kernel
+   refuses them without a round trip), a content cache, coalescing, and
+   `statfs` numbers (there is no protocol op for free space, and inventing one
+   for a read-only mount would be a lie a file manager acts on).
+
+   Verified against a real kernel mount over a fake peer — `read_dir`, a
+   100 KiB file read back byte-identical through the page cache, a `stat`, and
+   a write refused. That test needs `/dev/fuse`, so it is `#[ignore]`d and run
+   with `cargo test --lib fs_mount -- --ignored`.
 
 Steps 1–2 are worth doing regardless of whether the mount ever ships, which is
 the main argument for this ordering.
@@ -308,7 +361,10 @@ listener — worth doing, and the natural companion to step 3.
   reopen, or the file manager will see spurious I/O errors after a Doze kill.
 - **Multi-peer:** with several paired phones, is the mount per-phone (a mount
   point each) or does it follow the active peer? Per-phone is more predictable
-  but multiplies mounts.
+  but multiplies mounts. *Answered by construction for now:* the protocol
+  client takes no peer — it sends to whichever session is up — so the single
+  mount follows the active peer. A per-phone mount is not expressible until the
+  client is addressed by peer, which is the real prerequisite here.
 - **Thumbnails:** let the desktop generate them by reading bytes (simple, heavy
   on the link), or ask the phone for MediaStore thumbnails (fast, needs another
   op)?

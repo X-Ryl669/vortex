@@ -84,6 +84,10 @@ mod share;
 mod file_consent;
 mod fs_cli;
 mod fs_lan;
+// The phone's storage as a FUSE mount. Linux-only by nature: the Windows half
+// of design doc §8 step 6 is ProjFS, a different API for the same protocol.
+#[cfg(target_os = "linux")]
+mod fs_mount;
 mod fs_pull;
 mod contacts;
 mod desktop_apps;
