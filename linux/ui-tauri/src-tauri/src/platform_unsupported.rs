@@ -176,3 +176,12 @@ pub(crate) fn persist_peer_earbuds(_state: &vortex_l3_daemon::core::appstate::Ap
 /// is nothing to unlock here — Windows has no programmatic unlock at all, which
 /// `SessionControl::can_unlock` already reports — so the value is dropped.
 pub(crate) fn note_phone_unlocked(_unlocked: Option<bool>) {}
+
+// ── Browsing the phone's files (FUSE on Linux) ────────────────────────────
+
+/// The protocol is portable; the mount adapter is not. Windows needs ProjFS
+/// (design doc §8 step 6), so until that exists the button has nothing to open.
+#[tauri::command]
+pub async fn open_phone_files() -> Result<String, String> {
+    Err(UNSUPPORTED.to_string())
+}

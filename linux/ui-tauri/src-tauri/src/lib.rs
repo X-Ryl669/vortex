@@ -63,6 +63,10 @@ use platform_unsupported as proximity;
 use platform_unsupported as earbuds;
 #[cfg(not(target_os = "linux"))]
 use platform_unsupported as laptop_cast;
+// Browsing the phone's files needs a mount adapter, and the Windows one
+// (ProjFS) is not written yet — design doc §8 step 6.
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as fs_mount;
 mod clipboard;
 mod clipboard_hotkey;
 mod clipboard_window;
@@ -658,6 +662,7 @@ pub fn run() {
             universal_control::uc_running,
             universal_control::uc_set_placement,
             universal_control::uc_get_placement,
+            fs_mount::open_phone_files,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Vortex Tauri")

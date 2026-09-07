@@ -863,6 +863,31 @@ pub(crate) fn unmount() {
     }
 }
 
+/// Open the phone's storage in the desktop file manager.
+///
+/// Mounts on demand: the button IS the request, so asking the user to mount
+/// first would be a step that exists only because the code is in two pieces.
+/// Idempotent, because [`mount`] is — clicking twice reveals the same window
+/// rather than remounting under it.
+///
+/// Returns the path so the UI can name it in a tooltip; the interesting half of
+/// the result is the error, which is what a phone that is not reachable looks
+/// like from here.
+#[tauri::command]
+pub async fn open_phone_files() -> Result<String, String> {
+    let dir = mount().await?;
+    let path = dir.to_string_lossy().to_string();
+    // `tokio::process`, not `std::process`: a `std` `Child` dropped without
+    // `wait()` stays a zombie for the parent's whole life, and this app runs
+    // for days. Same reason `handoff::open_url` does it this way.
+    tokio::process::Command::new("xdg-open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("cannot open the file manager: {e}"))?;
+    tracing::info!(%path, "fs-mount: opened in the file manager");
+    Ok(path)
+}
+
 /// Detach the mount on the process's way out.
 ///
 /// A FUSE mount whose server process has died is not gone — it stays in the

@@ -70,6 +70,7 @@
     "forget_body": "{name} bilan aloqa uziladi. Qayta ulanish uchun yana pairing qilinadi.",
     "forget_confirm": "Unutish",
     "switch_tip": "Boshqa telefonga o'tish",
+    "browse_tip": "Telefon fayllarini ko'rish",
     "switch_scanning": "Boshqa telefonlaringiz qidirilmoqda…",
     "switch_pick": "Qaysi telefonga o'tamiz?",
     "switch_none": "Yaqinda boshqa ulangan telefon yo'q.",

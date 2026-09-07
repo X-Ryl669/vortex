@@ -17,6 +17,7 @@ import {
   BellRing,
   SwitchCamera,
   TabletSmartphone,
+  FolderOpen,
 } from "lucide-vue-next";
 import {
   activeEarbuds,
@@ -89,6 +90,28 @@ async function ringPhone() {
     ringTimer = setTimeout(() => (ringing.value = false), 2500);
   } catch {
     /* ignore — offline phone simply won't get the heartbeat */
+  }
+}
+
+// Browse the phone's storage: mounts it (FUSE) and opens the mount point in
+// the file manager. Mounting is what can actually fail — a phone that has gone
+// since the card last said "Connected" — so the failure is shown on the button
+// rather than swallowed, with the reason in its tooltip.
+const filesOpening = ref(false);
+const filesError = ref("");
+let filesErrorTimer: ReturnType<typeof setTimeout> | undefined;
+async function openPhoneFiles() {
+  if (filesOpening.value) return;
+  filesOpening.value = true;
+  filesError.value = "";
+  try {
+    await invoke("open_phone_files");
+  } catch (e) {
+    filesError.value = String(e);
+    clearTimeout(filesErrorTimer);
+    filesErrorTimer = setTimeout(() => (filesError.value = ""), 6000);
+  } finally {
+    filesOpening.value = false;
   }
 }
 
@@ -183,6 +206,20 @@ const earbudsStatus = computed(() => {
           <span class="text-[13px] text-[hsl(var(--card-foreground)/0.82)]">
             {{ phoneOnline ? t("peers.connected") : phoneConnecting ? t("peers.connecting") : t("peers.offline") }}
           </span>
+          <!-- Browse the phone's files. Only while it is reachable: the mount
+               is served over the live session, so offline there is nothing to
+               open. -->
+          <button
+            v-if="phoneOnline"
+            class="vx-mini"
+            :class="{ 'vx-mini--bad': filesError }"
+            :disabled="filesOpening"
+            :title="filesError || t('peers.browse_tip')"
+            @click="openPhoneFiles"
+          >
+            <Loader2 v-if="filesOpening" class="h-3.5 w-3.5 animate-spin" />
+            <FolderOpen v-else class="h-3.5 w-3.5" :stroke-width="1.9" />
+          </button>
         </div>
         <div class="h-px bg-white/[0.06]" />
         <div class="flex items-center justify-between">
@@ -320,6 +357,24 @@ const earbudsStatus = computed(() => {
 }
 .vx-chip--live {
   @apply border-primary/40 bg-primary/[0.14] text-primary;
+}
+/* Small round action sitting inline with a line of text — vx-ring at 36px would
+   tower over the 13px status row it belongs to. */
+.vx-mini {
+  @apply flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full transition-colors disabled:opacity-60;
+  color: hsl(var(--muted-foreground));
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--foreground) / 0.04);
+}
+.vx-mini:hover:not(:disabled) {
+  color: hsl(var(--foreground));
+  background: hsl(var(--foreground) / 0.08);
+}
+/* A failed mount, held for a few seconds with the reason in the tooltip. */
+.vx-mini--bad {
+  color: hsl(var(--destructive));
+  border-color: hsl(var(--destructive) / 0.45);
+  background: hsl(var(--destructive) / 0.12);
 }
 /* Find-My ring button — theme-safe tints (foreground/primary alpha) so it reads
    in light mode too; pulses while a ring was just requested. */
