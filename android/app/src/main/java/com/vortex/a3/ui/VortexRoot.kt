@@ -91,6 +91,8 @@ class VortexActions(
     val onOpenNotificationAccess: () -> Unit,
     /** Deep-link to system Accessibility settings to enable screen control. */
     val onOpenScreenControl: () -> Unit,
+    /** Ask for the storage grant the media-share toggles need (no-op if held). */
+    val onRequestMediaPermission: () -> Unit,
     /** Ask the system to turn Bluetooth on (one-tap dialog). */
     val onEnableBluetooth: () -> Unit,
     val isAggressiveOem: Boolean,
@@ -143,6 +145,17 @@ fun VortexRoot(
                 remember { com.vortex.a3.core.lan.FileAutoAcceptSetting.init(activity); 0 }
                 val fileAutoAcceptOn =
                     com.vortex.a3.core.lan.FileAutoAcceptSetting.enabled.collectAsState().value
+                remember { com.vortex.a3.core.media.MediaAutoShareSetting.init(activity); 0 }
+                val shareScreenshotsOn =
+                    com.vortex.a3.core.media.MediaAutoShareSetting.screenshots.collectAsState().value
+                val sharePhotosOn =
+                    com.vortex.a3.core.media.MediaAutoShareSetting.photos.collectAsState().value
+                // Re-checked each time Settings opens AND after either toggle
+                // moves: the flip that turns a row on is what asks for the
+                // grant, and the hint should follow the answer.
+                val mediaReadGranted = remember(showSettings, shareScreenshotsOn, sharePhotosOn) {
+                    activity.hasMediaReadPermission()
+                }
                 // Re-evaluated each time Settings opens (the user may have just
                 // run the ADB grant); a hint tells them to re-open if so.
                 val clipboardAutoGranted = remember(showSettings) {
@@ -185,6 +198,21 @@ fun VortexRoot(
                         onFileAutoAcceptChange = {
                             com.vortex.a3.core.lan.FileAutoAcceptSetting.setEnabled(it)
                         },
+                        // The setting is the user's intent and is recorded
+                        // either way; the grant is requested alongside, and
+                        // the watcher checks it at scan time. A refused grant
+                        // leaves the switch on and the hint explaining.
+                        shareScreenshotsOn = shareScreenshotsOn,
+                        onShareScreenshotsChange = {
+                            com.vortex.a3.core.media.MediaAutoShareSetting.setScreenshots(it)
+                            if (it) actions.onRequestMediaPermission()
+                        },
+                        sharePhotosOn = sharePhotosOn,
+                        onSharePhotosChange = {
+                            com.vortex.a3.core.media.MediaAutoShareSetting.setPhotos(it)
+                            if (it) actions.onRequestMediaPermission()
+                        },
+                        mediaReadGranted = mediaReadGranted,
                         screenControlOn = screenControlOn,
                         onScreenControlClick = actions.onOpenScreenControl,
                         onBack = { showSettings = false },

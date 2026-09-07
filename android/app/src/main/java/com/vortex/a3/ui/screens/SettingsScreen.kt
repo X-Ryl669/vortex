@@ -32,6 +32,8 @@ import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.NotificationsActive
+import androidx.compose.material.icons.outlined.PhotoCamera
+import androidx.compose.material.icons.outlined.Screenshot
 import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -78,6 +80,13 @@ fun SettingsScreen(
     clipboardAutoGranted: Boolean,
     fileAutoAcceptOn: Boolean,
     onFileAutoAcceptChange: (Boolean) -> Unit,
+    shareScreenshotsOn: Boolean,
+    onShareScreenshotsChange: (Boolean) -> Unit,
+    sharePhotosOn: Boolean,
+    onSharePhotosChange: (Boolean) -> Unit,
+    /** Whether the storage grant behind the two rows above is held; without
+     *  it their hint says what to do instead of what they do. */
+    mediaReadGranted: Boolean,
     screenControlOn: Boolean,
     onScreenControlClick: () -> Unit,
     onBack: () -> Unit,
@@ -190,6 +199,32 @@ fun SettingsScreen(
                     hint = str("settings.file_auto_accept_hint"),
                     checked = fileAutoAcceptOn,
                     onCheckedChange = onFileAutoAcceptChange,
+                )
+            }
+
+            // ── PHONE → LAPTOP ──────────────────────────────────────────
+            // Two rows, both off until switched on: a screenshot and a photo
+            // are different decisions (see MediaAutoShareSetting). The grant
+            // is asked for on the first flip; until it is held the hint says
+            // so in place of the description.
+            SectionLabel(str("settings.sec_auto_share"))
+            SectionCard {
+                ToggleRow(
+                    icon = Icons.Outlined.Screenshot,
+                    title = str("settings.share_screenshots"),
+                    hint = if (mediaReadGranted || !shareScreenshotsOn) str("settings.share_screenshots_hint")
+                    else str("settings.share_media_needs_permission"),
+                    checked = shareScreenshotsOn,
+                    onCheckedChange = onShareScreenshotsChange,
+                )
+                RowDivider()
+                ToggleRow(
+                    icon = Icons.Outlined.PhotoCamera,
+                    title = str("settings.share_photos"),
+                    hint = if (mediaReadGranted || !sharePhotosOn) str("settings.share_photos_hint")
+                    else str("settings.share_media_needs_permission"),
+                    checked = sharePhotosOn,
+                    onCheckedChange = onSharePhotosChange,
                 )
             }
             // When sync is on but background reads aren't granted, phone→laptop

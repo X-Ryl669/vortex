@@ -278,5 +278,25 @@
     "ble_tip_title": "Barqaror ulanish uchun bitta maslahat",
     "ble_tip_body": "KDE Connect kabi telefonga ulanadigan boshqa ilovalarni yopib qo'ying — ular Bluetooth LE radiosini band qilib, Vortexning ulanishiga xalaqit berishi mumkin.",
     "start": "Vortexdan foydalanishni boshlash"
+  },
+  "diagnostics": {
+    "title": "Diagnostika",
+    "subtitle": "Bu kompyuter nimalarni qila oladi va nimasi yetishmayapti.",
+    "loading": "Tekshirilyapti…",
+    "copy": "Hisobotni nusxalash",
+    "copied": "Nusxalandi",
+    "refresh": "Qayta tekshirish",
+    "logAt": "Log fayli:",
+    "check": {
+      "distro": "Tizim",
+      "desktop": "Ish stoli",
+      "bluetooth": "Bluetooth",
+      "paired": "Bog'langan telefon",
+      "adb": "adb (ekran funksiyalari)",
+      "injector": "Kursor uzatish",
+      "gnome_extension": "Jonli pill kengaytmasi",
+      "keyring": "Kalitlar ombori",
+      "gstreamer": "Ekran uzatish kodeki"
+    }
   }
 }

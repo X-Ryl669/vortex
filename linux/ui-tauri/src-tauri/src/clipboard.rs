@@ -546,6 +546,19 @@ pub(crate) struct ClipEntryDto {
     pinned: bool,
 }
 
+/// The most recent TEXT the user copied, for "send clipboard to phone".
+///
+/// Read from the history rather than the live clipboard on purpose: the tray
+/// menu is frozen until its callback returns, and an X11/Wayland clipboard read
+/// can block on the owning application. The history is already in memory and is
+/// the same thing the user just copied.
+pub(crate) fn latest_text() -> Option<String> {
+    clipboard_history()
+        .into_iter()
+        .find(|e| e.kind == "text")
+        .and_then(|e| e.text)
+}
+
 #[tauri::command]
 pub fn clipboard_history() -> Vec<ClipEntryDto> {
     let dir = clip_dir();

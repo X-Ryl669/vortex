@@ -1,61 +1,32 @@
-//! Spike: can this laptop act as a **BLE** HID device (HOGP) for the phone?
+//! Universal Control over **BLE HID** (HOGP) — no adb, no cable, no developer
+//! mode.
 //!
-//! Why this exists. The Classic-Bluetooth HID path (`bt_hid.rs`) is blocked on
-//! two changes we are not willing to make to a user's system:
+//! The Classic-Bluetooth HID path in `bt_hid.rs` is blocked on two changes we
+//! will not make to someone's system: the adapter's Class of Device is
+//! read-only on `Adapter1` (changing it means editing a root-owned config and
+//! restarting bluetoothd, dropping every Bluetooth connection including the
+//! user's earbuds), and BlueZ's `input` plugin would likely have to go, taking
+//! Bluetooth mouse support away from everyone who has one.
 //!
-//!   * the adapter's Class of Device must say "peripheral", and `Class` is
-//!     read-only on `org.bluez.Adapter1` — changing it means editing
-//!     `/etc/bluetooth/main.conf` as root and restarting `bluetoothd`, which
-//!     drops every Bluetooth connection including the user's earbuds;
-//!   * BlueZ's `input` plugin very likely has to be disabled, which takes away
-//!     Bluetooth mouse/keyboard support from every user who has one.
+//! BLE sidesteps both: a peripheral says what it is through the Appearance
+//! field of its own advertisement, set at runtime, and the Classic `input`
+//! plugin is untouched.
 //!
-//! HOGP avoids both: it rides BLE, so the Classic `input` plugin is untouched,
-//! and a BLE peripheral declares what it is through the Appearance field in its
-//! own advertisement — set at runtime, no root, no system file, nothing left
-//! behind when we exit.
-//!
-//! This binary proves (or disproves) the idea in isolation, with no vortex
-//! wiring: publish the three services HOGP requires, advertise as a mouse, and
-//! push pointer reports once the phone subscribes.
-//!
-//! RESULT: **PASS** (2026-09-06, Fedora 44 + Redmi 9 / Android 10 / MIUI).
-//!
-//! Paired from the phone's Bluetooth settings, a cursor appeared and moved.
-//! The whole idea is viable: Universal Control can work with no adb, no cable
-//! and no developer mode.
-//!
-//! What the run established, point by point:
-//!
-//!   * BlueZ accepts the HID + DIS + Battery application and advertises with
-//!     appearance 0x03c2 — the BLE stand-in for the Class of Device that is
-//!     read-only on the Classic path, which is what blocked `bt_hid.rs`.
-//!   * The adapter reports `SupportedInstances = 11`, so this advertisement
-//!     coexists with vortex's own trusted-presence one. That was a stated
-//!     doubt; it is not a problem on this controller.
-//!   * Android bonds with it as an HID host even though the same laptop is
-//!     also its GATT peer over a separate link. That was the other doubt.
-//!
-//! One trap for whoever wires this up properly, met during the test: BEFORE
-//! bonding, the phone appears under a resolvable private address and reads
-//! `Paired: no, Bonded: no`. AFTER bonding, BlueZ resolves it to the identity
-//! address and the RPA entry is the stale one. Checking the wrong address
-//! reads as a failure when it actually succeeded — which is exactly the wrong
-//! conclusion I drew from it the first time.
-//!
-//! Run:  cargo run --features dev-tools --bin vortex-hogp-test
-//! Then: pair from the phone's Bluetooth settings.
-//! Pass:  a cursor appears on the phone and moves on its own.
+//! Proven on hardware before this module was written — see
+//! `src/bin/hogp_test.rs`, which carries the result. The constants, the report
+//! descriptor and the service layout below are lifted from that spike VERBATIM
+//! rather than retyped: a HID report descriptor is exactly the kind of thing
+//! that becomes subtly broken when transcribed, and those bytes are the ones a
+//! real phone accepted.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bluer::adv::Advertisement;
 use bluer::gatt::local::{
     Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod,
-    CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod, Descriptor, DescriptorRead,
-    Service,
+    CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod, CharacteristicNotifier,
+    Descriptor, DescriptorRead, Service,
 };
 use bluer::Uuid;
 use futures::FutureExt;
@@ -128,10 +99,6 @@ const REPORT_MAP: &[u8] = &[
     0xc0, // End Collection
 ];
 
-/// A read-only characteristic whose value never changes.
-///
-/// Every HOGP read is `encrypt_read`: the profile requires an encrypted link,
-/// and Android will not treat an unencrypted HID service as usable.
 fn const_read(uuid: u16, value: Vec<u8>) -> Characteristic {
     Characteristic {
         uuid: uuid16(uuid),
@@ -148,22 +115,107 @@ fn const_read(uuid: u16, value: Vec<u8>) -> Characteristic {
     }
 }
 
-#[tokio::main]
-async fn main() -> bluer::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
 
-    let session = bluer::Session::new().await?;
-    let adapter = session.default_adapter().await?;
-    adapter.set_powered(true).await?;
-    println!("adapter {} [{}]", adapter.name(), adapter.address().await?);
+/// A live HOGP peripheral: advertises as a mouse and pushes input reports to
+/// whichever host has subscribed.
+#[derive(Clone)]
+pub struct HogpServer {
+    /// `Some` once the phone has subscribed to the Report characteristic. That
+    /// subscription — not the bond, and not the connection — is the thing that
+    /// means reports will actually be delivered.
+    notifier: Arc<Mutex<Option<CharacteristicNotifier>>>,
+    /// Held for as long as the server should exist: dropping either handle
+    /// withdraws the service and the advertisement, which is how `stop()`
+    /// leaves nothing behind.
+    _handles: Arc<Mutex<Option<(bluer::gatt::local::ApplicationHandle, bluer::adv::AdvertisementHandle)>>>,
+}
 
-    // The notifier the host subscribes to. Reports are pushed through it once
-    // the phone enables notifications on the Report characteristic.
-    let notifier = Arc::new(Mutex::new(None));
+impl HogpServer {
+    /// Publish the HID service and start advertising. The phone bonds once,
+    /// from its own Bluetooth settings; after that it reconnects on its own
+    /// whenever this advertisement is up.
+    pub async fn start(adapter: &bluer::Adapter) -> bluer::Result<Self> {
+        let notifier: Arc<Mutex<Option<CharacteristicNotifier>>> = Arc::new(Mutex::new(None));
+        let hid_service = build_hid_service(notifier.clone());
+        // HOGP expects Device Information and Battery alongside HID. Android
+        // reads the PnP ID to name and classify the device, and a HID service
+        // arriving without these is routinely ignored.
+        let app = Application {
+            services: vec![
+                Service {
+                    uuid: uuid16(SVC_DEVICE_INFO),
+                    primary: true,
+                    characteristics: vec![const_read(
+                        CHR_PNP_ID,
+                        vec![0x02, 0x6b, 0x1d, 0x46, 0x02, 0x00, 0x01],
+                    )],
+                    ..Default::default()
+                },
+                Service {
+                    uuid: uuid16(SVC_BATTERY),
+                    primary: true,
+                    characteristics: vec![const_read(CHR_BATTERY_LEVEL, vec![100])],
+                    ..Default::default()
+                },
+                hid_service,
+            ],
+            ..Default::default()
+        };
+        let app_handle = adapter.serve_gatt_application(app).await?;
+        let adv = Advertisement {
+            advertisement_type: bluer::adv::Type::Peripheral,
+            service_uuids: BTreeSet::from([uuid16(SVC_HID)]),
+            discoverable: Some(true),
+            local_name: Some(ADV_NAME.to_string()),
+            appearance: Some(APPEARANCE_MOUSE),
+            ..Default::default()
+        };
+        let adv_handle = adapter.advertise(adv).await?;
+        tracing::info!("hogp: advertising as '{ADV_NAME}' (appearance 0x{APPEARANCE_MOUSE:04x})");
+        Ok(Self {
+            notifier,
+            _handles: Arc::new(Mutex::new(Some((app_handle, adv_handle)))),
+        })
+    }
 
-    let hid_service = Service {
+    /// Has a host subscribed? Only then does sending a report mean anything —
+    /// which is why this, and not "is something connected", is what the
+    /// transport gate should ask.
+    pub async fn is_ready(&self) -> bool {
+        self.notifier.lock().await.is_some()
+    }
+
+    /// Withdraw the service and the advertisement. Nothing is left configured
+    /// on this machine; the phone keeps its bond and will simply find nothing
+    /// to reconnect to until the next `start`.
+    pub async fn stop(&self) {
+        *self._handles.lock().await = None;
+        *self.notifier.lock().await = None;
+        tracing::info!("hogp: stopped advertising");
+    }
+
+    /// Relative pointer movement and wheel, as the descriptor lays them out:
+    /// `[buttons, dx, dy, wheel]`. No `0xa1` transaction header — that belongs
+    /// to Classic HID over L2CAP, not to a GATT notification.
+    pub async fn send_report(&self, buttons: u8, dx: i8, dy: i8, wheel: i8) -> bool {
+        let mut guard = self.notifier.lock().await;
+        let Some(n) = guard.as_mut() else { return false };
+        match n.notify(vec![buttons, dx as u8, dy as u8, wheel as u8]).await {
+            Ok(()) => true,
+            Err(e) => {
+                // The host went away. Drop the notifier so `is_ready` reports
+                // the truth and the caller can fall back rather than spending
+                // a session writing into nothing.
+                tracing::info!("hogp: notify failed ({e}); waiting for a new subscription");
+                *guard = None;
+                false
+            }
+        }
+    }
+}
+
+fn build_hid_service(notifier: Arc<Mutex<Option<CharacteristicNotifier>>>) -> Service {
+    Service {
         uuid: uuid16(SVC_HID),
         primary: true,
         characteristics: vec![
@@ -186,7 +238,7 @@ async fn main() -> bluer::Result<()> {
                     write_without_response: true,
                     method: CharacteristicWriteMethod::Fun(Box::new(|v, _| {
                         async move {
-                            println!("host set protocol mode -> {v:?}");
+                            tracing::debug!("hogp: host set protocol mode -> {v:?}");
                             Ok(())
                         }
                         .boxed()
@@ -203,7 +255,7 @@ async fn main() -> bluer::Result<()> {
                     write_without_response: true,
                     method: CharacteristicWriteMethod::Fun(Box::new(|v, _| {
                         async move {
-                            println!("host wrote control point -> {v:?}");
+                            tracing::debug!("hogp: host wrote control point -> {v:?}");
                             Ok(())
                         }
                         .boxed()
@@ -231,7 +283,8 @@ async fn main() -> bluer::Result<()> {
                         Box::new(move |n| {
                             let notifier = notifier.clone();
                             async move {
-                                println!("*** host subscribed to input reports ***");
+                                // The moment that matters: reports are deliverable from here.
+                                tracing::info!("hogp: host subscribed — cursor can cross with no adb");
                                 *notifier.lock().await = Some(n);
                             }
                             .boxed()
@@ -254,68 +307,5 @@ async fn main() -> bluer::Result<()> {
             },
         ],
         ..Default::default()
-    };
-
-    // HOGP expects Device Information and Battery alongside the HID service.
-    // Android reads the PnP ID to name and classify the device; a HID service
-    // arriving without these is routinely ignored.
-    let app = Application {
-        services: vec![
-            Service {
-                uuid: uuid16(SVC_DEVICE_INFO),
-                primary: true,
-                characteristics: vec![const_read(
-                    CHR_PNP_ID,
-                    // Vendor ID source 0x02 (USB IF), VID 0x1d6b (Linux
-                    // Foundation), PID 0x0246, version 1.0.0.
-                    vec![0x02, 0x6b, 0x1d, 0x46, 0x02, 0x00, 0x01],
-                )],
-                ..Default::default()
-            },
-            Service {
-                uuid: uuid16(SVC_BATTERY),
-                primary: true,
-                characteristics: vec![const_read(CHR_BATTERY_LEVEL, vec![100])],
-                ..Default::default()
-            },
-            hid_service,
-        ],
-        ..Default::default()
-    };
-    let _app_handle = adapter.serve_gatt_application(app).await?;
-    println!("GATT application registered (HID + DIS + Battery)");
-
-    let adv = Advertisement {
-        advertisement_type: bluer::adv::Type::Peripheral,
-        service_uuids: BTreeSet::from([uuid16(SVC_HID)]),
-        discoverable: Some(true),
-        local_name: Some(ADV_NAME.to_string()),
-        appearance: Some(APPEARANCE_MOUSE),
-        ..Default::default()
-    };
-    let _adv_handle = adapter.advertise(adv).await?;
-    println!("advertising as a BLE mouse (appearance 0x{APPEARANCE_MOUSE:04x})");
-
-    println!();
-    println!("→ On the phone: Settings → Bluetooth → pair '{ADV_NAME}'.");
-    println!("→ PASS if a cursor appears on the phone and drifts on its own.");
-    println!("→ Ctrl-C to stop; nothing is left configured on this machine.");
-    println!();
-
-    // Once subscribed, walk the pointer in a slow square so movement is
-    // obviously ours and not a stray touch.
-    let steps: [(i8, i8); 4] = [(6, 0), (0, 6), (-6, 0), (0, -6)];
-    let mut i = 0usize;
-    loop {
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        let mut guard = notifier.lock().await;
-        let Some(n) = guard.as_mut() else { continue };
-        let (dx, dy) = steps[(i / 25) % steps.len()];
-        i += 1;
-        // [buttons, dx, dy, wheel]
-        if let Err(err) = n.notify(vec![0x00, dx as u8, dy as u8, 0x00]).await {
-            println!("notify failed ({err}) — host went away; waiting for a new subscription");
-            *guard = None;
-        }
     }
 }

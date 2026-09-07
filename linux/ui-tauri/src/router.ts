@@ -20,6 +20,11 @@ export const router = createRouter({
       component: () => import("@/pages/messages/MessagesPage.vue"),
     },
     { path: "/settings", name: "settings", component: () => import("@/pages/settings/SettingsPage.vue") },
+    {
+      path: "/diagnostics",
+      name: "diagnostics",
+      component: () => import("@/pages/diagnostics/DiagnosticsPage.vue"),
+    },
     // Standalone popup window (no AppShell rail) — see App.vue.
     { path: "/clipboard", name: "clipboard", component: () => import("@/pages/clipboard/ClipboardPage.vue") },
   ],

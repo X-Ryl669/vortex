@@ -8,6 +8,11 @@
 //! signals back to the waiting `request` by notification id. It runs alongside
 //! the call module's own action watcher (signals are broadcast; each filters by
 //! key prefix), so the two never collide.
+//!
+//! The same banner + router also carries the AFTER: a screenshot or photo the
+//! phone sent by itself lands with a "Copy / Open" notification
+//! ([`notify_received`]), whose `fc:copy` / `fc:open` clicks come back through
+//! the same [`watch`]. One notification path for phone files, before and after.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -79,6 +84,97 @@ fn registry() -> &'static Mutex<HashMap<u32, oneshot::Sender<bool>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// notification id → the saved capture its Copy / Open buttons act on.
+/// Bounded ([`RECEIVED_MAX`]): a notification the user never touches is never
+/// reported closed to us, so the oldest entries are dropped rather than kept
+/// for the life of the process.
+static RECEIVED: Mutex<Vec<(u32, PathBuf)>> = Mutex::new(Vec::new());
+const RECEIVED_MAX: usize = 64;
+
+/// A capture the phone sent by itself has landed — say so, with the two
+/// things the user is about to do with a screenshot: paste it somewhere, or
+/// look at it. Posted through the same banner helper the consent prompt uses
+/// (same icon, same action plumbing); the clicks come back via [`watch`].
+///
+/// Normal urgency: a screenshot arriving is worth a banner, not a persistent
+/// alert. The buttons keep it in the notification list until it is dismissed.
+pub(crate) async fn notify_received(path: PathBuf, kind: &str) {
+    let title = match kind {
+        "screenshot" => "Screenshot from your phone",
+        "photo" => "Photo from your phone",
+        _ => "File from your phone",
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let folder = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let body = format!("{name} · saved to {folder}");
+    let actions = vec![
+        ("fc:copy".to_string(), "Copy".to_string()),
+        ("fc:open".to_string(), "Open".to_string()),
+    ];
+    match notification_display::show_call_banner(title, &body, "vortex", &actions, 0, false).await {
+        Ok(id) => {
+            if let Ok(mut g) = RECEIVED.lock() {
+                g.push((id, path));
+                if g.len() > RECEIVED_MAX {
+                    let excess = g.len() - RECEIVED_MAX;
+                    g.drain(..excess);
+                }
+            }
+        }
+        // The file is saved either way; only the shortcut to it is lost.
+        Err(e) => tracing::warn!("received-file notification failed ({e}); file is in place"),
+    }
+}
+
+/// The saved path behind a Copy / Open click, taking it out of the table:
+/// the notification is closed once acted on, so a second click cannot come.
+fn take_received(id: u32) -> Option<PathBuf> {
+    let mut g = RECEIVED.lock().ok()?;
+    let pos = g.iter().position(|(i, _)| *i == id)?;
+    Some(g.remove(pos).1)
+}
+
+/// Act on a received capture's button. Both are best-effort with a log line:
+/// the file is already where the notification said.
+async fn act_on_received(id: u32, key: &str) {
+    let Some(path) = take_received(id) else {
+        tracing::info!(id, key, "received-file action for a notification no longer tracked");
+        return;
+    };
+    match key {
+        "fc:open" => {
+            // Detached, like the handoff module's opener — the desktop's own
+            // handler for the type (image viewer), not ours.
+            match std::process::Command::new("xdg-open").arg(&path).spawn() {
+                Ok(_) => tracing::info!("opened {}", path.display()),
+                Err(e) => tracing::warn!("xdg-open {} failed: {e}", path.display()),
+            }
+        }
+        "fc:copy" => {
+            let p = path.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                let bytes = std::fs::read(&p).map_err(|e| format!("read: {e}"))?;
+                crate::clipboard_sync::copy_image_file_to_clipboard(&bytes)
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => tracing::info!("copied {} to the clipboard", path.display()),
+                Ok(Err(e)) => tracing::warn!("copy {} failed: {e}", path.display()),
+                Err(e) => tracing::warn!("copy task join: {e}"),
+            }
+        }
+        _ => {}
+    }
+    let _ = notification_display::close(id).await;
+}
+
 fn fmt_bytes(n: u64) -> String {
     if n < 1024 {
         format!("{n} B")
@@ -94,17 +190,26 @@ fn fmt_bytes(n: u64) -> String {
 /// Pop the consent banner and await the user's decision (true = accept). Times
 /// out to a decline after 45 s. Fails CLOSED (decline) if the banner can't show
 /// — consent must never be silently bypassed.
-pub(crate) async fn request(label: &str, count: usize, total: u64) -> bool {
+///
+/// `kind` is the offer's (`"screenshot"` / `"photo"` / empty) and only changes
+/// the wording: a capture the phone sent by itself is still gated here exactly
+/// like a share, because "my phone may send its pictures" and "my laptop may
+/// receive files unasked" are two decisions on two devices. Auto-accept is the
+/// laptop's, and it is the same opt-in for both.
+pub(crate) async fn request(label: &str, count: usize, total: u64, kind: &str) -> bool {
     if auto_accept() {
         // No banner at all — the transfer pill (see `transfers`) still reports
         // what arrived and where it was saved, so the receive stays visible.
         tracing::info!(count, bytes = total, "auto-accept on → file batch accepted without asking");
         return true;
     }
-    let title = if count > 1 {
-        format!("Phone wants to send {count} files")
-    } else {
-        "Phone wants to send a file".to_string()
+    let title = match (kind, count > 1) {
+        ("screenshot", false) => "Phone took a screenshot".to_string(),
+        ("screenshot", true) => format!("Phone took {count} screenshots"),
+        ("photo", false) => "Phone took a photo".to_string(),
+        ("photo", true) => format!("Phone took {count} photos"),
+        (_, true) => format!("Phone wants to send {count} files"),
+        (_, false) => "Phone wants to send a file".to_string(),
     };
     let body = format!("{label} · {}", fmt_bytes(total));
     let actions = vec![
@@ -142,6 +247,10 @@ pub(crate) async fn watch() {
         let accept = match key.as_str() {
             "fc:accept" => true,
             "fc:decline" => false,
+            "fc:copy" | "fc:open" => {
+                act_on_received(id, &key).await;
+                continue;
+            }
             _ => continue, // not ours (call:/act: handled by their own watchers)
         };
         let waiter = registry().lock().ok().and_then(|mut g| g.remove(&id));

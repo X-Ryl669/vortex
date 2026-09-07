@@ -60,6 +60,18 @@ object IncomingNotificationDisplay {
             .setAutoCancel(true)
             .setContentIntent(tapPi)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            // Its OWN group, one notification per group.
+            //
+            // Android auto-bundles: once an app has four notifications in a
+            // channel that are not already in a group, the framework folds them
+            // into a single summary of its own making. Mirrored laptop
+            // notifications hit that constantly and collapsed into one line the
+            // user then had to expand to read anything. Giving each its own
+            // group key takes them out of auto-grouping, so they stand as
+            // separate rows the way they do on the laptop. The key is derived
+            // from the id, so an update to the same laptop notification
+            // replaces its row rather than adding another.
+            .setGroup("vortex_mirror_$id")
             .build()
         try {
             NotificationManagerCompat.from(ctx).notify(id, n)

@@ -1,9 +1,18 @@
 # Release pipeline: pushing a `v*` tag builds the SIGNED Android APK and
 # publishes a GitHub Release with it attached.
 #
-# Linux deliberately ships NO binary for now — users run install_linux.sh,
-# which builds against their own distro's webkit (a universal binary is
-# painful; AppImage/Flatpak is a later step).
+# Linux ships .rpm and .deb, built in the distro containers they target.
+#
+# One universal Linux binary is not possible here and a bundle format does not
+# rescue it: the app links webkit2gtk and gtk3, whose sonames move between
+# distro releases, and the mirror pipeline loads GStreamer plugins from the
+# system at runtime. So this is a matrix, one package per target distro, and
+# the version each was built against is what it declares a dependency on.
+#
+# Not AppImage or Flatpak, deliberately. The app talks to BlueZ's Profile1,
+# eavesdrops on the session bus for notifications, shells adb, pactl, nmcli and
+# gsettings, and pushes a helper binary to the phone — a sandbox is the wrong
+# shape for it, and an AppImage carrying webkit is both large and fragile.
 #
 # Required repo secrets (Settings → Secrets and variables → Actions):
 #   KEYSTORE_B64      — base64 of vortex-release.jks
@@ -21,9 +30,69 @@ permissions:
   contents: write
 
 jobs:
+  linux-packages:
+    name: Linux package (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fedora-44
+            image: fedora:44
+            bundle: rpm
+            ext: rpm
+          - name: debian-13
+            image: debian:13
+            bundle: deb
+            ext: deb
+    steps:
+      # `git` first: actions/checkout falls back to a REST download without it,
+      # which loses the working tree layout the build expects.
+      - name: Bootstrap the container
+        run: |
+          if command -v dnf >/dev/null; then dnf -y install git which; \
+          else apt-get update && apt-get -y install git ca-certificates; fi
+
+      - uses: actions/checkout@v4
+
+      # The same script install_linux.sh uses, so CI and a user's machine
+      # install the same set. It detects the package manager itself and skips
+      # sudo when already root, which is the case in a container.
+      - name: Build and runtime dependencies
+        run: ./linux/packaging/install-deps.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: linux/ui-tauri/src-tauri
+
+      - name: Frontend dependencies
+        working-directory: linux/ui-tauri
+        run: npm install --legacy-peer-deps
+
+      - name: Bundle
+        working-directory: linux/ui-tauri
+        run: npm run tauri build -- --bundles ${{ matrix.bundle }}
+
+      # Name the artifact after the distro it was built against: the whole
+      # point of the matrix is that these are NOT interchangeable.
+      - name: Name it after its target
+        run: |
+          src=$(find linux/ui-tauri/src-tauri/target/release/bundle \
+                     -name "*.${{ matrix.ext }}" | head -1)
+          test -n "$src" || { echo "no ${{ matrix.ext }} produced"; exit 1; }
+          cp "$src" "vortex-${GITHUB_REF_NAME}-${{ matrix.name }}.${{ matrix.ext }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.name }}
+          path: vortex-*.${{ matrix.ext }}
+
   android-apk:
     name: Signed APK + GitHub Release
     runs-on: ubuntu-latest
+    needs: linux-packages
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -72,34 +141,57 @@ jobs:
       # UPDATE THE `What's new` BLOCK when bumping the version — it is the only
       # place the Releases page describes the release. (The changelog is
       # private, so the workflow cannot read it from here.)
+      - name: Collect the Linux packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          merge-multiple: true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: vortex-*.apk
+          files: |
+            vortex-*.apk
+            vortex-*.rpm
+            vortex-*.deb
           generate_release_notes: false
           body: |
-            ## What's new in 1.0.0-beta.3
+            ## What's new in 1.0.0-beta.7
 
-            **Universal Control** *(Experimental)* — push the laptop's cursor off the screen
-            edge and it arrives on the phone, driving the phone's own cursor. The keyboard
-            follows it and two-finger trackpad scrolling scrolls the phone. You choose which
-            side the phone sits on — or just one corner of that edge, so a dock or hot corner
-            keeps the rest. Push back out the way you came in, or press Esc, and control
-            returns to the laptop.
+            **The desktop now ships as a package.** `.rpm` for Fedora 44 and `.deb` for
+            Debian 13 are attached below — no clone, no Rust toolchain, no twenty-minute
+            compile. They are built in the distro they name and are not interchangeable:
+            the app links webkit2gtk and gtk3, whose versions move between releases. On
+            anything else, `install_linux.sh` still builds from source as before.
 
-            It needs **adb** *and* **Wayland on a recent GNOME**: holding the cursor at the
-            edge goes through the input-capture portal, so it does not arm on X11 or KDE.
-            Hiding the laptop's own cursor needs the GNOME extension on **GNOME 49+**. When
-            it cannot arm, the switch turns itself off and says why, in your language.
+            **A release of fixes, not features.** The project went through a full audit and
+            83 findings were closed. The ones you are most likely to have felt:
 
-            **Second screen** — the phone becomes a *real* extra monitor: it shows up in
-            Displays and windows drag onto it. GNOME only, view-only for now.
+            - **Earbuds handoff was failing about half the time.** Both devices allowed a
+              Bluetooth profile disconnect one second to complete; real earbuds routinely
+              need two or three, so a disconnect that was still in progress was reported as
+              a failure and the other device then tried to connect earbuds the first had not
+              released. Switches now go through on the first attempt.
+            - **The call pill sat on "Calling…" for the whole call** instead of becoming a
+              live timer.
+            - **Universal Control** is close to rewritten: it arms on KDE, it survives the
+              adb connection being re-established (it used to die with it, and the cursor
+              silently stopped crossing), wireless adb configures itself and closes its port
+              again when the feature is switched off. New: with a text field focused on the
+              phone, **Esc** dismisses the field instead of returning the cursor — two quick
+              presses always return, so the escape hatch cannot be taken away.
+            - **Do Not Disturb is shared.** Silence one device and the other goes quiet too.
+            - Phone-as-second-monitor works outside GNOME; notification action buttons work
+              on non-GNOME shells; mirrored notifications no longer fold into one row;
+              received files land in your real XDG download folder.
 
-            **Login codes to the clipboard** — an arriving SMS verification code lands on the
-            laptop clipboard, no retyping.
+            **If something breaks, the desktop app now writes
+            `~/.local/state/vortex/vortex.log`.** It used to launch with stderr discarded,
+            so a normal run left nothing to look at. That file plus `adb logcat` is what
+            makes a report actionable.
 
-            **The binary we push to your phone is now verifiable.** Universal Control works
-            by pushing a 20 KB helper to `/data/local/tmp` and running it as the shell user.
+            **The binary we push to your phone is verifiable.** Universal Control works by
+            pushing a 20 KB helper to `/data/local/tmp` and running it as the shell user.
             It is committed in built form because the app embeds it at compile time, so
             `android/inject/build.sh` rebuilds it — with NDK r26b, byte-for-byte identical:
 

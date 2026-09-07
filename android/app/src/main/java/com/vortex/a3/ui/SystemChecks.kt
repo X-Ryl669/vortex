@@ -70,7 +70,20 @@ internal fun requiredPermissions(): List<String> = buildList {
     add(Manifest.permission.READ_SMS)
     // Send SMS the laptop composed (Contacts/Messages).
     add(Manifest.permission.SEND_SMS)
+    // Read new screenshots / camera photos so they can be sent to the laptop
+    // by themselves. Optional twice over: the feature is off until the user
+    // turns it on in Settings, and refused here it simply stays on the phone
+    // (the watcher logs once and does nothing).
+    add(com.vortex.a3.core.media.mediaReadPermission())
 }
+
+/** Whether the gallery watcher may read other apps' pictures — the grant the
+ *  two media-share toggles need to do anything. */
+internal fun Context.hasMediaReadPermission(): Boolean =
+    androidx.core.content.ContextCompat.checkSelfPermission(
+        this,
+        com.vortex.a3.core.media.mediaReadPermission(),
+    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
 /**
  * Connectivity + notification permissions the app needs to advertise, pair and

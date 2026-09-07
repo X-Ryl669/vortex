@@ -278,5 +278,25 @@
     "ble_tip_title": "One thing for a rock-solid link",
     "ble_tip_body": "Close other phone-link apps that use Bluetooth, like KDE Connect. They hold the same Bluetooth LE radio and can block Vortex from connecting.",
     "start": "Start using Vortex"
+  },
+  "diagnostics": {
+    "title": "Diagnostics",
+    "subtitle": "What this computer can do, and what is missing.",
+    "loading": "Checking…",
+    "copy": "Copy report",
+    "copied": "Copied",
+    "refresh": "Check again",
+    "logAt": "Log file:",
+    "check": {
+      "distro": "System",
+      "desktop": "Desktop",
+      "bluetooth": "Bluetooth",
+      "paired": "Paired phone",
+      "adb": "adb (screen features)",
+      "injector": "Cursor sharing",
+      "gnome_extension": "Live pill extension",
+      "keyring": "Keyring",
+      "gstreamer": "Screen mirroring codec"
+    }
   }
 }

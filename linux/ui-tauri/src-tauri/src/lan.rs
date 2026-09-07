@@ -563,6 +563,10 @@ pub(crate) async fn try_lan_reconnect(
     local_state.camera_facing = crate::camera::camera_facing();
     // Find-My: the "ring my phone" request (unix-millis of the last tap).
     local_state.ring_seq = crate::ring::ring_seq();
+    // "Open this on my phone" — same rising-edge contract as ring_seq.
+    let (otp, otp_seq) = crate::send_to_phone::pending();
+    local_state.open_on_phone = otp;
+    local_state.open_on_phone_seq = otp_seq;
     // Now-playing snapshot (title/artist/app + raw playing) for the phone's
     // laptop-media notification. Cheap MPRIS property reads per heartbeat.
     crate::media_remote::fill_now_playing(&mut local_state).await;
@@ -590,6 +594,10 @@ pub(crate) async fn try_lan_reconnect(
         // adopt our value if ours is newer (and vice versa).
         local_state.smart_switch_enabled = mw.enabled.load(Ordering::Relaxed);
         local_state.smart_switch_changed_at = mw.enabled_changed_at.load(Ordering::Relaxed);
+        // Shared Do Not Disturb, same LWW contract.
+        let (dnd_on, dnd_at) = crate::dnd::state();
+        local_state.dnd = dnd_on;
+        local_state.dnd_changed_at = dnd_at;
         if mw.claim_peer.swap(false, Ordering::Relaxed) {
             local_state.audio_claim_request = true;
         }
@@ -635,7 +643,7 @@ pub(crate) async fn try_lan_reconnect(
         // follow on subsequent nudged rounds).
         let requested_file_token: Option<String> = crate::PENDING_FILE_OFFERS
             .get()
-            .and_then(|m| m.lock().ok().and_then(|g| g.front().map(|(t, _, _, _)| t.clone())));
+            .and_then(|m| m.lock().ok().and_then(|g| g.front().map(|(t, ..)| t.clone())));
         if let Some(token) = &requested_file_token {
             bulk_obj["clipboard_file"] = serde_json::Value::String(token.clone());
         }
@@ -711,17 +719,34 @@ pub(crate) async fn try_lan_reconnect(
                             let meta = crate::PENDING_FILE_OFFERS
                                 .get()
                                 .and_then(|m| m.lock().ok().and_then(|mut g| g.pop_front()));
-                            if let Some((_, name, mime, id)) = meta {
+                            if let Some((_, name, mime, id, kind)) = meta {
                                 note_queue_progress();
+                                let offer = crate::clipboard_sync::Offer {
+                                    kind,
+                                    ..Default::default()
+                                };
                                 match crate::clipboard_sync::apply_synced_file(
                                     app,
                                     &name,
                                     &mime,
                                     json.clone(),
+                                    offer.subdir(),
                                 )
                                 .await
                                 {
-                                    Some(_) => crate::transfers::complete(id),
+                                    Some(path) => {
+                                        crate::transfers::complete(id);
+                                        // A capture arrives unannounced, so it
+                                        // gets a notification the user can act
+                                        // on; a share the user just made does
+                                        // not (the pill already says where it
+                                        // went, and ten files would be ten
+                                        // notifications).
+                                        if offer.is_capture() {
+                                            crate::file_consent::notify_received(path, &offer.kind)
+                                                .await;
+                                        }
+                                    }
                                     None => crate::transfers::fail(id),
                                 }
                             }
@@ -769,11 +794,11 @@ pub(crate) async fn try_lan_reconnect(
                         let dead = crate::PENDING_FILE_OFFERS.get().and_then(|m| {
                             m.lock().ok().and_then(|mut g| {
                                 let front_matches =
-                                    g.front().is_some_and(|(t, _, _, _)| t == req);
+                                    g.front().is_some_and(|(t, ..)| t == req);
                                 if front_matches { g.pop_front() } else { None }
                             })
                         });
-                        if let Some((_, name, _, id)) = dead {
+                        if let Some((_, name, _, id, _)) = dead {
                             note_queue_progress();
                             crate::transfers::fail(id);
                             tracing::warn!(
@@ -1137,6 +1162,8 @@ pub(crate) async fn try_lan_reconnect(
                     // Universal Control's Esc: dismiss a focused field on the
                     // phone before handing the pointer back.
                     crate::universal_control::note_phone_input_focused(state.input_focused);
+                    // Shared Do Not Disturb (LWW).
+                    crate::dnd::apply_peer(state.dnd, state.dnd_changed_at);
                     // A LAN sync proves we're in live contact (any-transport) —
                     // gates the disconnect-clear of mirror pills.
                     crate::ble::touch_peer_contact();

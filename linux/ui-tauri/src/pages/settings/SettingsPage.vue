@@ -15,6 +15,8 @@ import {
   ClipboardList,
   MousePointer2,
   FileDown,
+  Stethoscope,
+  ChevronRight,
 } from "lucide-vue-next";
 import { theme } from "@/lib/theme";
 import { smartSwitchEnabled, setSmartSwitch } from "@/lib/smartSwitch";
@@ -346,6 +348,28 @@ const pill = (active: boolean) =>
             :model-value="proximityAutoUnlock"
             @update:model-value="setProximityAutoUnlock"
           />
+        </div>
+
+        <!-- Diagnostics: a NAVIGATION row, not a toggle, so it is built here
+             rather than with SettingsRow (which is toggle-only). -->
+        <div class="mt-4 rounded-[14px] border border-border bg-card/40 overflow-hidden">
+          <div
+            class="flex items-center gap-3.5 px-[18px] py-[15px] cursor-pointer select-none transition-colors hover:bg-foreground/[0.02]"
+            @click="router.push('/diagnostics')"
+          >
+            <span
+              class="h-9 w-9 rounded-[10px] shrink-0 grid place-items-center bg-muted/50 border border-border text-muted-foreground"
+            >
+              <Stethoscope class="h-[18px] w-[18px]" :stroke-width="1.8" />
+            </span>
+            <div class="min-w-0 flex-1">
+              <div class="text-sm font-semibold">{{ t("diagnostics.title") }}</div>
+              <div class="text-[11.5px] text-muted-foreground mt-0.5">
+                {{ t("diagnostics.subtitle") }}
+              </div>
+            </div>
+            <ChevronRight class="h-4 w-4 text-muted-foreground shrink-0" />
+          </div>
         </div>
 
         <p class="text-center mt-7 text-[11.5px] text-muted-foreground/70">

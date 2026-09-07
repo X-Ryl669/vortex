@@ -440,6 +440,63 @@ pub(crate) fn ensure_bt_hid() {
     });
 }
 
+/// One HOGP peripheral for the app's lifetime.
+static HOGP_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Publish the BLE HID peripheral, so a phone that has bonded once can reach
+/// us with no adb at all.
+///
+/// Advertised only while Universal Control is ON. It is a discoverable BLE
+/// peripheral announcing itself as a mouse; leaving that up permanently would
+/// put the laptop on every nearby scanner's list for a feature the user is not
+/// using. `uc_stop` withdraws it.
+pub(crate) fn ensure_hogp() {
+    if HOGP_INIT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let adapter = match bluer::Session::new().await {
+            Ok(s) => match s.default_adapter().await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::info!("universal-control: no adapter for HOGP: {e}");
+                    HOGP_INIT.store(false, Ordering::SeqCst);
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::info!("universal-control: no bluer session for HOGP: {e}");
+                HOGP_INIT.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        match vortex_l3_daemon::core::hogp::HogpServer::start(&adapter).await {
+            Ok(server) => {
+                crate::mirror_inject::set_hogp(server);
+                tracing::info!(
+                    "universal-control: BLE HID published — pair 'Vortex Mouse' from the phone \
+                     once and the cursor works with no adb"
+                );
+            }
+            Err(e) => {
+                tracing::info!("universal-control: could not publish BLE HID: {e}");
+                HOGP_INIT.store(false, Ordering::SeqCst);
+            }
+        }
+    });
+}
+
+/// Withdraw the BLE HID peripheral.
+pub(crate) fn stop_hogp() {
+    if !HOGP_INIT.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let Some(server) = crate::mirror_inject::get_hogp() else { return };
+    tauri::async_runtime::spawn(async move {
+        server.stop().await;
+    });
+}
+
 fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
@@ -450,6 +507,7 @@ fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
     // acquire it). Started lazily here, lives for the app's lifetime.
     ensure_cursor_publisher();
     ensure_bt_hid();
+    ensure_hogp();
     ensure_injector_health();
 
     // Wireless adb, bootstrapped from a cable that is plugged in RIGHT NOW.
@@ -577,6 +635,9 @@ fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
 pub(crate) fn uc_stop() {
     remember_enabled(false);
     STOP.store(true, Ordering::SeqCst);
+    // Stop announcing ourselves as a mouse: the advertisement exists for this
+    // feature and should not outlive it.
+    stop_hogp();
     // Close the adb TCP port we opened for this feature. Off-thread: `adb usb`
     // is a subprocess with a timeout in front of it, and this is a UI command.
     std::thread::spawn(|| {

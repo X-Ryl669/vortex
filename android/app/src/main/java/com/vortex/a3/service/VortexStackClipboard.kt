@@ -105,6 +105,54 @@ internal fun VortexStack.startClipboardOutbound() {
     }
 }
 
+/**
+ * A screenshot or camera photo the gallery watcher just reported → offer it
+ * to the laptop the way a share-sheet file is offered, with three
+ * differences that all follow from nobody having tapped anything:
+ *
+ *  - not gated by the clipboard-sync toggle. The two media switches ARE the
+ *    consent here; tying them to a third switch would make "screenshots on,
+ *    clipboard off" silently do nothing;
+ *  - `quiet`: the offer-retry machinery keeps its retries and its log lines
+ *    but not its toasts. "Laptop unreachable — keeping the file(s) queued"
+ *    is the right answer to a share the user is watching, and noise for a
+ *    photo they took of their lunch;
+ *  - no Wi-Fi Direct. The fast path switches the phone's Wi-Fi for ~6 s and
+ *    that is a fair trade for a file the user is waiting on, not for a
+ *    background event; a 5 MB photo takes a few seconds on the router path.
+ *    Which also settles battery and metered links: the pull is LAN-local
+ *    (laptop → phone over the router, never over mobile data), so the only
+ *    radio cost worth avoiding is that Wi-Fi switch, and it is avoided.
+ *
+ * The bytes are read once here — to hash them for the token and to apply the
+ * size cap — then dropped; the blob store keeps the URI and re-reads on pull
+ * (see [com.vortex.a3.core.clipboard.ClipboardBlobStore]).
+ */
+internal fun VortexStack.offerCapturedMedia(media: com.vortex.a3.core.media.CapturedMedia) {
+    scope.launch {
+        val file = com.vortex.a3.core.clipboard.ClipboardFileReader.read(ctx, media.uri)
+        if (file == null) {
+            Log.w(VortexStack.TAG, "${media.kind.name.lowercase()} _id=${media.id} unreadable or over the cap; not sent")
+            return@launch
+        }
+        val name = media.name.ifBlank { file.name }
+        val token = com.vortex.a3.core.clipboard.ClipboardBlobStore.stashLazy(file.bytes) {
+            com.vortex.a3.core.clipboard.ClipboardFileReader.read(ctx, media.uri)?.bytes
+        }
+        val o = org.json.JSONObject()
+        o.put("token", token)
+        o.put("bytes", file.bytes.size)
+        o.put("name", name)
+        o.put("mime", file.mime)
+        // Tells the laptop which subfolder and which notification, and that
+        // this was not a share. The phone names a KIND, never a path.
+        o.put("kind", media.kind.wire)
+        val offer = o.toString().toByteArray(Charsets.UTF_8)
+        Log.i(VortexStack.TAG, "${media.kind.name.lowercase()} offered to laptop ('$name', ${file.bytes.size} bytes, token=$token)")
+        offerFileToLaptop(token, name, offer, quiet = true)
+    }
+}
+
 /** Serialise clipboard text to the `{text, ts}` wire JSON (matches the
  *  Rust `ClipboardMirror`). Capped to keep it inside one BLE frame. */
 internal fun VortexStack.clipboardJsonBytes(text: String): ByteArray {

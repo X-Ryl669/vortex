@@ -56,6 +56,9 @@ internal fun VortexStack.buildLocalAppState(): com.vortex.a3.core.appstate.AppSt
         earbuds = earbuds,
         revoked = revokeNow,
         inputFocused = VortexService.inputFocused.get(),
+        // Shared Do Not Disturb (LWW, same contract as the smart switch).
+        dnd = com.vortex.a3.core.notif.DndSync.state().first,
+        dndChangedAt = com.vortex.a3.core.notif.DndSync.state().second,
         audioClaimRequest = claimNow,
         callPhase = phaseNow,
         // Call mirror additively over AppState (BLE+LAN) so the laptop
@@ -189,6 +192,8 @@ internal fun VortexStack.handlePeerAppState(peerPub: ByteArray, state: com.vorte
     handleCameraRequest(state.cameraReq, state.cameraFacing)
     // Find-My: the laptop tapped "Ring my phone" — ring loudly on the edge.
     com.vortex.a3.core.ring.RingController.onRingSeq(ctx, state.ringSeq)
+    // "Open this on my phone" — rising-edge, posts a notification to tap.
+    com.vortex.a3.core.handoff.OpenOnPhone.onState(ctx, state.openOnPhone, state.openOnPhoneSeq)
     // Shared smart-switch setting, LWW: adopt the laptop's value when its
     // timestamp is newer. The coordinator's flag updates via the
     // SmartSwitchSetting.enabled collector wired in startMediaFollow.
@@ -197,6 +202,13 @@ internal fun VortexStack.handlePeerAppState(peerPub: ByteArray, state: com.vorte
     ) {
         Log.i(VortexStack.TAG, "smart-switch: adopted peer setting (LWW) = ${state.smartSwitchEnabled}")
     }
+    // Shared Do Not Disturb, same LWW rule. The listener service is the only
+    // thing that can set the interruption filter, so it does the applying.
+    com.vortex.a3.core.notif.DndSync.applyPeer(
+        com.vortex.a3.core.media.MediaNotificationListenerService.instanceOrNull(),
+        state.dnd,
+        state.dndChangedAt,
+    )
     // Bidirectional forget — peer asked us to drop their trust.
     if (state.revoked) {
         Log.i(VortexStack.TAG, "peer revoked us; forgetting ${peerPub.toHexPrefix()}")

@@ -28,7 +28,7 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// it's a FILE — the laptop writes it to disk with that name and makes it
 /// pasteable (universal-clipboard file parity). One struct, two uses, so
 /// the whole offer+pull pipeline is shared.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClipboardImageOffer {
     /// Opaque id for the pending blob (the phone serves it by this token).
     #[serde(default)]
@@ -42,12 +42,37 @@ pub struct ClipboardImageOffer {
     /// File MIME type. EMPTY ⇒ image.
     #[serde(default)]
     pub mime: String,
+    /// Why the phone is sending this without anyone tapping Share: a
+    /// `"screenshot"` or a `"photo"` the gallery watcher picked up. EMPTY ⇒ an
+    /// ordinary share. The phone names a KIND, never a folder — the laptop
+    /// maps it in [`Self::subdir`], so a peer cannot steer a write anywhere.
+    #[serde(default)]
+    pub kind: String,
 }
 
 impl ClipboardImageOffer {
     /// True if this offer is a FILE (has a name) rather than a clipboard image.
     pub fn is_file(&self) -> bool {
         !self.name.is_empty()
+    }
+
+    /// True if the phone sent this by itself (a capture), not from the share
+    /// sheet. Decides the subfolder and the received notification.
+    pub fn is_capture(&self) -> bool {
+        self.subdir().is_some()
+    }
+
+    /// The subfolder under the download folder a capture lands in, by kind.
+    /// A fixed table on purpose: the wire value is untrusted, and only these
+    /// two names ever become part of a path. Anything else — an ordinary
+    /// share, or a kind this build does not know — lands in the root as
+    /// shares always have.
+    pub fn subdir(&self) -> Option<&'static str> {
+        match self.kind.as_str() {
+            "screenshot" => Some("Screenshots"),
+            "photo" => Some("Photos"),
+            _ => None,
+        }
     }
 }
 
@@ -224,6 +249,48 @@ impl ImageAssembler {
         self.chunks = Vec::new();
         self.last_add = None;
         Some(bytes)
+    }
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::*;
+
+    fn offer(kind: &str) -> ClipboardImageOffer {
+        ClipboardImageOffer {
+            token: "t".into(),
+            bytes: 1,
+            name: "x.png".into(),
+            mime: "image/png".into(),
+            kind: kind.into(),
+        }
+    }
+
+    #[test]
+    fn known_kinds_map_to_fixed_folders() {
+        assert_eq!(offer("screenshot").subdir(), Some("Screenshots"));
+        assert_eq!(offer("photo").subdir(), Some("Photos"));
+        assert!(offer("photo").is_capture());
+    }
+
+    /// The kind is peer-supplied. A path-looking value must not become a
+    /// path, and a share (empty kind) stays in the root.
+    #[test]
+    fn unknown_or_hostile_kinds_land_in_the_root() {
+        for k in ["", "../../etc", "/abs", "Screenshots", "video", "photo/../x"] {
+            assert_eq!(offer(k).subdir(), None, "kind {k:?}");
+            assert!(!offer(k).is_capture());
+        }
+    }
+
+    /// An older phone build sends no `kind` at all.
+    #[test]
+    fn offer_without_kind_still_parses_as_a_share() {
+        let o: ClipboardImageOffer =
+            serde_json::from_str(r#"{"token":"t","bytes":3,"name":"a.txt","mime":"text/plain"}"#)
+                .unwrap();
+        assert!(o.is_file());
+        assert!(!o.is_capture());
     }
 }
 

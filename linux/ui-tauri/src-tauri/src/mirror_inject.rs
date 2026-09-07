@@ -998,6 +998,9 @@ pub fn spawn_health_check(armed: impl Fn() -> bool + Send + 'static) {
         if !armed() || STOPPING.load(Ordering::SeqCst) {
             continue;
         }
+        // Keep the cached HOGP subscription answer fresh — `has_transport`
+        // reads it and cannot await.
+        refresh_hogp_ready();
         if INJECT.lock().map(|g| g.is_some()).unwrap_or(false) {
             send("");
         } else if !active() {
@@ -1009,6 +1012,56 @@ pub fn spawn_health_check(armed: impl Fn() -> bool + Send + 'static) {
 }
 
 static BT_HID: Mutex<Option<vortex_l3_daemon::core::bt_hid::BtHidServer>> = Mutex::new(None);
+
+/// BLE HID (HOGP) — the adb-free transport, and the only one that survives a
+/// phone reboot without a cable.
+///
+/// Proven on hardware before being wired in; `core/hogp.rs` carries the
+/// result. Ranked BELOW the adb injector because adb can draw a real finger on
+/// the touchscreen while HID can only move a pointer — but unlike adb it needs
+/// no developer mode, no `adb tcpip`, and no re-bootstrap after the phone
+/// restarts, which is the single biggest thing standing between a new user and
+/// this feature working.
+static HOGP: Mutex<Option<vortex_l3_daemon::core::hogp::HogpServer>> = Mutex::new(None);
+
+pub fn set_hogp(server: vortex_l3_daemon::core::hogp::HogpServer) {
+    if let Ok(mut g) = HOGP.lock() {
+        *g = Some(server);
+    }
+}
+
+pub fn get_hogp() -> Option<vortex_l3_daemon::core::hogp::HogpServer> {
+    HOGP.lock().ok().and_then(|g| g.clone())
+}
+
+/// Cached "a host has subscribed to our input reports".
+///
+/// `HogpServer::is_ready` is async, and this is asked from the capture loop
+/// where nothing may block — the same rule that governs every other question
+/// asked at crossing time. So the answer is kept here and refreshed off-thread
+/// by the health check.
+static HOGP_READY: AtomicBool = AtomicBool::new(false);
+
+/// Mouse buttons currently held, for HOGP. A HID report carries the WHOLE
+/// button state every time, so a move sent mid-drag has to repeat the held bit
+/// or the phone reads it as a release.
+static HOGP_BUTTONS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn hogp_ready() -> bool {
+    HOGP_READY.load(Ordering::Relaxed)
+}
+
+/// Re-read whether a HOGP host is subscribed. Subscription — not the bond and
+/// not the connection — is what means a report will actually be delivered.
+pub fn refresh_hogp_ready() {
+    let Some(server) = get_hogp() else {
+        HOGP_READY.store(false, Ordering::Relaxed);
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        HOGP_READY.store(server.is_ready().await, Ordering::Relaxed);
+    });
+}
 
 /// Register the Bluetooth HID server for ADB-free Universal Control fallback.
 pub fn set_bt_hid(server: vortex_l3_daemon::core::bt_hid::BtHidServer) {
@@ -1054,10 +1107,12 @@ pub fn active() -> bool {
     }
     if let Ok(g) = BT_HID.lock() {
         if let Some(hid) = g.as_ref() {
-            return hid.is_connected();
+            if hid.is_connected() {
+                return true;
+            }
         }
     }
-    false
+    hogp_ready()
 }
 
 /// Proactively connect paired Bluetooth devices when approaching screen edge.
@@ -1119,10 +1174,12 @@ pub fn has_transport() -> bool {
     }
     if let Ok(g) = BT_HID.lock() {
         if let Some(hid) = g.as_ref() {
-            return hid.is_connected();
+            if hid.is_connected() {
+                return true;
+            }
         }
     }
-    false
+    hogp_ready()
 }
 
 /// Send one protocol line (`D slot nx ny`, `M slot nx ny`, `U slot`,
@@ -1136,7 +1193,58 @@ pub fn send(line: &str) {
             return;
         }
     }
-    // Fallback: Bluetooth HID report dispatch
+    // Fallback 1: BLE HID (HOGP). Tried before Classic HID because it is the
+    // one that actually works on a phone the user has not put into developer
+    // mode — Classic needs adapter changes we refuse to make to their system.
+    //
+    // Buttons are held here rather than in the report, because HOGP sends the
+    // whole state on every report: a move sent while the left button is down
+    // must repeat that bit or the phone sees the button release mid-drag.
+    if hogp_ready() {
+        if let Some(server) = get_hogp() {
+            let mut parts = line.trim().split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            let mut num = || parts.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+            match cmd {
+                "P" => {
+                    let (dx, dy) = (num(), num());
+                    let (dx, dy) = (dx.clamp(-127, 127) as i8, dy.clamp(-127, 127) as i8);
+                    let buttons = HOGP_BUTTONS.load(Ordering::Relaxed);
+                    tauri::async_runtime::spawn(async move {
+                        server.send_report(buttons, dx, dy, 0).await;
+                    });
+                    return;
+                }
+                "B" => {
+                    let (btn, val) = (num(), num());
+                    let bit = 1u8 << (btn.clamp(0, 4) as u8);
+                    let buttons = if val == 1 {
+                        HOGP_BUTTONS.fetch_or(bit, Ordering::Relaxed) | bit
+                    } else {
+                        HOGP_BUTTONS.fetch_and(!bit, Ordering::Relaxed) & !bit
+                    };
+                    tauri::async_runtime::spawn(async move {
+                        server.send_report(buttons, 0, 0, 0).await;
+                    });
+                    return;
+                }
+                "W" => {
+                    let dy = num().clamp(-127, 127) as i8;
+                    let buttons = HOGP_BUTTONS.load(Ordering::Relaxed);
+                    tauri::async_runtime::spawn(async move {
+                        server.send_report(buttons, 0, 0, dy).await;
+                    });
+                    return;
+                }
+                // `V` (cursor overlay) and `D/M/U` (real touch) have no HID
+                // equivalent: a HID mouse gets Android's own pointer, and it
+                // cannot draw a finger. Dropping them is correct, not a gap.
+                _ => return,
+            }
+        }
+    }
+
+    // Fallback 2: Classic Bluetooth HID report dispatch
     if let Ok(g) = BT_HID.lock() {
         if let Some(hid) = g.as_ref() {
             let line_str = line.trim();

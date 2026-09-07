@@ -127,6 +127,17 @@ data class AppState(
     /** Unix-seconds timestamp of the last explicit smart-switch toggle.
      *  LWW: on receive, the peer's strictly-greater value is adopted. */
     val smartSwitchChangedAt: Long = 0L,
+    /** Do Not Disturb, shared across the pair on the same last-writer-wins
+     *  contract as [smartSwitchEnabled]. Silencing one device and leaving the
+     *  other buzzing on the table is the failure this removes, and it costs no
+     *  new permission: the notification listener we already hold may read and
+     *  set the interruption filter.
+     *
+     *  Only an explicit toggle advances [dndChangedAt] — never a heartbeat
+     *  merely observing the current state, which would ping-pong the setting
+     *  back on after the user turned it off. */
+    val dnd: Boolean = false,
+    val dndChangedAt: Long = 0L,
     /** Whether this device is currently plugged in / charging. Carried so
      *  the peer can paint its battery indicator blue (with a charging
      *  glyph) instead of the usual green. Older clients ignore it. */
@@ -180,6 +191,10 @@ data class AppState(
      *  Ring tap. We ring loudly (overriding silent/DND) on the rising edge and
      *  dedup repeats by comparing against the last value we acted on. 0 = none. */
     val ringSeq: Long = 0L,
+    /** Laptop→phone "open this on my phone": a URL or snippet plus the
+     *  unix-millis it was sent at. Rising-edge, same contract as [ringSeq]. */
+    val openOnPhone: String? = null,
+    val openOnPhoneSeq: Long = 0L,
     /** This device's OWN current Wi-Fi IPv4 (dotted quad), read live at build
      *  time and carried on every push over BOTH transports. The laptop adopts
      *  it into its cached-peer-IP fast path so mirror/cast/camera never dial a
@@ -241,6 +256,8 @@ data class AppState(
         // compare; the timestamp is what the peer adopts on.
         obj.put("smart_switch_enabled", smartSwitchEnabled)
         obj.put("smart_switch_changed_at", smartSwitchChangedAt)
+        obj.put("dnd", dnd)
+        obj.put("dnd_changed_at", dndChangedAt)
         if (charging) obj.put("charging", true)
         locked?.let { obj.put("locked", it) }
         unlocked?.let { obj.put("unlocked", it) }
@@ -343,6 +360,8 @@ data class AppState(
                 mediaControl = obj.optString("media_control", "").takeIf { it.isNotBlank() },
                 mediaControlSeq = obj.optLong("media_control_seq", 0L),
                 smartSwitchEnabled = obj.optBoolean("smart_switch_enabled", true),
+                dnd = obj.optBoolean("dnd", false),
+                dndChangedAt = obj.optLong("dnd_changed_at", 0L),
                 smartSwitchChangedAt = obj.optLong("smart_switch_changed_at", 0L),
                 charging = obj.optBoolean("charging", false),
                 locked = if (obj.has("locked") && !obj.isNull("locked")) {
@@ -358,6 +377,8 @@ data class AppState(
                 lockCommand = obj.optString("lock_command", "").takeIf { it.isNotBlank() },
                 lockCommandSeq = obj.optLong("lock_command_seq", 0L),
                 laptopMirrorReq = obj.optBoolean("laptop_mirror_req", false),
+                openOnPhone = obj.optString("open_on_phone", "").takeIf { it.isNotBlank() },
+                openOnPhoneSeq = obj.optLong("open_on_phone_seq", 0L),
                 laptopMirrorExtend = obj.optBoolean("laptop_mirror_extend", false),
                 laptopCastError = obj.optString("laptop_cast_error", "")
                     .takeIf { it.isNotBlank() },

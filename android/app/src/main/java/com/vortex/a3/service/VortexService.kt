@@ -52,6 +52,17 @@ class VortexService : Service() {
                 liveLan?.nudge()
             }
         },
+        onMediaCaptured = { media ->
+            // Same guard as above, same reason: the stack's peer store is
+            // lateinit. A picture taken while the stack is down is dropped,
+            // not queued — see CapturedMediaWatcher on why this feature is
+            // live-only.
+            if (stack.isStarted()) {
+                stack.offerCapturedMedia(media)
+            } else {
+                Log.i(tag, "gallery capture while the stack is down; not sent")
+            }
+        },
     )
 
     override fun onCreate() {

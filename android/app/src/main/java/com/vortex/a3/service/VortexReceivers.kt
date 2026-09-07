@@ -22,6 +22,11 @@ import android.util.Log
  *    (via [onBatteryChanged]).
  *  - **BT Pairing Auto-Confirm** — auto-confirms pairing requests from the
  *    trusted laptop without prompting user for PIN/confirmation.
+ *  - **Gallery** — a new screenshot or camera photo, reported once so the
+ *    laptop can be offered it (via [onMediaCaptured]). The watcher itself
+ *    lives in [com.vortex.a3.core.media.CapturedMediaWatcher]; it is
+ *    registered here because it is a system watcher with the same lifecycle
+ *    as the receivers, and dies with the service exactly as they do.
  *
  * The service supplies the reactions as callbacks; this class owns the
  * receiver instances, the battery edge-detect state, and register/unregister
@@ -32,8 +37,10 @@ class VortexReceivers(
     private val context: Context,
     private val onBluetoothReenabled: () -> Unit,
     private val onBatteryChanged: () -> Unit,
+    private val onMediaCaptured: (com.vortex.a3.core.media.CapturedMedia) -> Unit,
 ) {
     private var btStateReceiver: BroadcastReceiver? = null
+    private var mediaWatcher: com.vortex.a3.core.media.CapturedMediaWatcher? = null
     private var batteryReceiver: BroadcastReceiver? = null
     private var pairingRequestReceiver: BroadcastReceiver? = null
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
@@ -46,9 +53,12 @@ class VortexReceivers(
         registerBattery()
         registerPairingRequest()
         registerNetwork()
+        registerMediaWatcher()
     }
 
     fun unregister() {
+        mediaWatcher?.stop()
+        mediaWatcher = null
         btStateReceiver?.let { safeUnregister(it) }
         batteryReceiver?.let { safeUnregister(it) }
         pairingRequestReceiver?.let { safeUnregister(it) }
@@ -117,6 +127,16 @@ class VortexReceivers(
         } catch (e: Exception) {
             Log.w(TAG, "network callback: ${e.message}")
         }
+    }
+
+    /** The gallery watcher is registered whether or not either media toggle
+     *  is on: it queries nothing while both are off, and being always armed
+     *  means a toggle flipped in Settings takes effect on the next capture
+     *  with no service restart. */
+    private fun registerMediaWatcher() {
+        if (mediaWatcher != null) return
+        mediaWatcher = com.vortex.a3.core.media.CapturedMediaWatcher(context, onMediaCaptured)
+            .also { it.start() }
     }
 
     private fun registerBtState() {

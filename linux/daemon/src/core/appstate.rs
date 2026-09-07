@@ -251,6 +251,26 @@ pub struct AppState {
     /// LWW: on receive, the peer's strictly-greater value is adopted.
     #[serde(default)]
     pub smart_switch_changed_at: u64,
+    /// Do Not Disturb, shared across the pair the same way the smart-switch
+    /// setting is: turning it on either device turns it on for both, synced
+    /// last-writer-wins via `dnd_changed_at`.
+    ///
+    /// It is the one setting where the two devices disagreeing is actively
+    /// annoying — a meeting silences the laptop and the phone buzzes on the
+    /// table anyway — and it costs no new permission on either side: the phone
+    /// already holds notification-listener access, which may read and set the
+    /// interruption filter, and the desktop already shells `gsettings`.
+    ///
+    /// Only an explicit user change is ever propagated: `dnd_changed_at`
+    /// advances when someone toggles DND, never when a heartbeat merely
+    /// observes the current state. Sending observed state would ping-pong —
+    /// a stale beat would switch DND back on after the meeting ended.
+    #[serde(default)]
+    pub dnd: bool,
+    /// Unix-seconds timestamp of the last explicit DND toggle. `0` = "no
+    /// opinion"; LWW on receive, strictly-greater wins.
+    #[serde(default)]
+    pub dnd_changed_at: u64,
     /// Whether this device is currently plugged in / charging. Carried so
     /// the peer can paint its battery indicator blue (with a charging
     /// glyph) instead of the usual green. Older clients ignore it.
@@ -332,6 +352,22 @@ pub struct AppState {
     /// and make a fresh tap look like a replay. `0` = never rung. See [`ring`].
     #[serde(default)]
     pub ring_seq: u64,
+    /// Laptop→phone "open this on the phone": the URL or text the user sent,
+    /// and the unix-millis they sent it at.
+    ///
+    /// The mirror of browsing handoff, which only ever ran phone→laptop. Same
+    /// shape as [`ring_seq`] — millis rather than a counter, so a laptop
+    /// restart cannot regress the value and make a fresh send look like a
+    /// replay — and the phone acts on the rising edge only.
+    ///
+    /// It arrives as a NOTIFICATION the user taps rather than opening by
+    /// itself: Android 10 blocks background activity starts, and a device that
+    /// opened pages on its own because the other device said so would be a
+    /// worse idea than the platform restriction preventing it.
+    #[serde(default)]
+    pub open_on_phone: Option<String>,
+    #[serde(default)]
+    pub open_on_phone_seq: u64,
     /// The sender's OWN current Wi-Fi IPv4 (dotted quad), carried on every
     /// push over BOTH transports. The laptop adopts it into its cached-peer-IP
     /// fast path, so a DHCP renew can't strand mirror/cast/camera on a dead
@@ -440,11 +476,15 @@ impl AppState {
             // smart-switch store + LWW-synced with the peer.
             smart_switch_enabled: true,
             smart_switch_changed_at: 0,
+            dnd: false,
+            dnd_changed_at: 0,
             charging,
             locked: None,
             unlocked: None, // laptop doesn't report a keyguard state
             lock_command: None,
             lock_command_seq: 0,
+            open_on_phone: None,
+            open_on_phone_seq: 0,
             laptop_mirror_req: false, // laptop is the caster, never the requester
             laptop_mirror_extend: None, // ditto — the phone picks the kind
             laptop_cast: None,        // filled while actively casting
@@ -614,6 +654,8 @@ mod tests {
             media_control_seq: 3,
             smart_switch_enabled: true,
             smart_switch_changed_at: 0,
+            dnd: false,
+            dnd_changed_at: 0,
             charging: false,
             locked: Some(false),
             unlocked: Some(true),
@@ -630,6 +672,9 @@ mod tests {
             wifi_ip: Some("192.168.1.42".into()),
             display_hz: Some(120),
             ts: 1_700_000_000,
+            input_focused: false,
+            open_on_phone: None,
+            open_on_phone_seq: 0,
         };
         let json = serde_json::to_vec(&a).unwrap();
         let b: AppState = serde_json::from_slice(&json).unwrap();

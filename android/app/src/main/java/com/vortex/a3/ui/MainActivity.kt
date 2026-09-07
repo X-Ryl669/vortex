@@ -235,6 +235,19 @@ class MainActivity : ComponentActivity() {
         VortexService.startOrRefreshCallFlow(applicationContext)
     }
 
+    /** The storage grant behind the screenshot/photo auto-share toggles,
+     *  asked for when one of them is switched on. Nothing to do on the
+     *  result: the watcher re-checks the grant on every scan, and the
+     *  Settings hint re-reads it when the toggle moves. */
+    internal val mediaPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { _ -> }
+
+    internal fun requestMediaPermission() {
+        if (hasMediaReadPermission()) return
+        mediaPermissionLauncher.launch(com.vortex.a3.core.media.mediaReadPermission())
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Dev-only: keep the screen on so the lab tester can read the
@@ -397,6 +410,7 @@ class MainActivity : ComponentActivity() {
         onReject = ::onRejectClicked,
         onOpenNotificationAccess = ::onOpenNotificationAccess,
         onOpenScreenControl = ::onOpenAccessibilitySettings,
+        onRequestMediaPermission = ::requestMediaPermission,
         onEnableBluetooth = ::onEnableBluetooth,
         isAggressiveOem = isAggressiveOemRom(),
         isIgnoringBatteryOptimizations = ::isIgnoringBatteryOptimizations,

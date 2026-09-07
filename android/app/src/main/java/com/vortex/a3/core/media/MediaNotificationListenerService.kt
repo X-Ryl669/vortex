@@ -160,8 +160,25 @@ class MediaNotificationListenerService : NotificationListenerService() {
         )
     }
 
+    override fun onInterruptionFilterChanged(interruptionFilter: Int) {
+        super.onInterruptionFilterChanged(interruptionFilter)
+        // The user changed Do Not Disturb on the phone — carry it to the
+        // laptop. See DndSync for why only this path stamps the clock.
+        try {
+            com.vortex.a3.core.notif.DndSync.noteLocalChange(interruptionFilter)
+        } catch (_: Throwable) {
+        }
+    }
+
     override fun onListenerConnected() {
         instance = this
+        // Seed the shared DND view from whatever the phone is set to right
+        // now, WITHOUT claiming authorship — see DndSync.seed.
+        try {
+            com.vortex.a3.core.notif.DndSync.init(applicationContext)
+            com.vortex.a3.core.notif.DndSync.seed(currentInterruptionFilter)
+        } catch (_: Throwable) {
+        }
         // Restore the mirrored-keys set persisted before the listener/process
         // was killed (MIUI does this freely). Without it, a notification mirrored
         // before the gap wouldn't be recognized on its later removal → its
@@ -556,6 +573,10 @@ class MediaNotificationListenerService : NotificationListenerService() {
         /** Active listener instance, for cancelNotification from elsewhere. */
         @Volatile
         private var instance: MediaNotificationListenerService? = null
+
+        /** The bound listener, for the few things only it can do — setting the
+         *  interruption filter (DND sync). Null while unbound. */
+        fun instanceOrNull(): MediaNotificationListenerService? = instance
 
         /** Is the system actually BOUND to us right now?
          *

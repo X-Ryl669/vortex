@@ -124,6 +124,41 @@ struct CastHandle {
 }
 
 /// True while a laptop→phone cast is live.
+/// Which H.264 encoder this machine actually has, as a GStreamer element with
+/// its settings.
+///
+/// `x264enc` was hard-coded, and it is NOT part of a stock Fedora: it lives in
+/// `gstreamer1-plugins-ugly`, which comes from RPM Fusion, a third-party repo
+/// most people have never enabled. On a clean Fedora 44 — this very machine —
+/// casting to the phone therefore failed to build its pipeline, with nothing
+/// on screen to say why. The diagnostics page surfaced it.
+///
+/// `openh264enc` ships in Fedora's own repos (Cisco's licensing arrangement)
+/// and is present here, so it is the fallback. Preference order still puts
+/// x264 first where it exists: it is the better encoder at these settings and
+/// the one the latency comments below were tuned against.
+///
+/// Still CPU, never a GPU encoder — see the note at the call site about the
+/// cross-GPU DMA-BUF import that crashed the compositor.
+fn h264_encoder() -> &'static str {
+    fn have(element: &str) -> bool {
+        gst::ElementFactory::find(element).is_some()
+    }
+    if have("x264enc") {
+        "x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 key-int-max=30"
+    } else if have("openh264enc") {
+        // openh264enc names things differently: bitrate is bits/s, and the
+        // low-latency knob is `complexity=low` plus a short GOP rather than a
+        // tune preset.
+        "openh264enc bitrate=4000000 complexity=low gop-size=30"
+    } else {
+        // Neither present: return x264enc anyway so the pipeline build fails
+        // with GStreamer's own "no element" message, which names the missing
+        // plugin — more useful than a message we invent.
+        "x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 key-int-max=30"
+    }
+}
+
 pub fn active() -> bool {
     CAST.lock().map(|g| g.is_some()).unwrap_or(false)
 }
@@ -310,11 +345,12 @@ async fn start_portal(
     // pins the frames to SYSTEM MEMORY (no DMA-BUF reaches the encoder), so the
     // encode never touches a GPU context the compositor owns. `videorate` caps
     // a high-refresh panel to 30 fps — plenty for a screen view, light on CPU.
+    let encoder = h264_encoder();
     let desc = format!(
         "pipewiresrc fd={raw_fd} path={node_id} do-timestamp=true keepalive-time=1000 ! \
          videorate ! videoconvert ! videoscale ! \
          video/x-raw,format=I420,width=1280,height=720,framerate=30/1 ! \
-         x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 key-int-max=30 ! \
+         {encoder} ! \
          h264parse config-interval=-1 ! \
          video/x-h264,stream-format=byte-stream,alignment=au ! \
          appsink name=vsink emit-signals=false max-buffers=3 drop=true sync=false"
@@ -507,13 +543,14 @@ async fn start_extend(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), S
             String::new()
         }
     };
+    let encoder = h264_encoder();
     let desc = format!(
         "pipewiresrc path={node_id} do-timestamp=true keepalive-time=1000 ! \
          video/x-raw,width={EXTEND_W},height={EXTEND_H} ! \
          videorate ! videoconvert ! \
          video/x-raw,format=I420,framerate=30/1 ! \
          {cursor_stage}\
-         x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 key-int-max=30 ! \
+         {encoder} ! \
          h264parse config-interval=-1 ! \
          video/x-h264,stream-format=byte-stream,alignment=au ! \
          appsink name=vsink emit-signals=false max-buffers=3 drop=true sync=false"

@@ -209,6 +209,8 @@ pub(crate) fn spawn_state_consumer(
                         // Universal Control's Esc: dismiss a focused field on the
                         // phone before handing the pointer back.
                         crate::universal_control::note_phone_input_focused(state.input_focused);
+                        // Shared Do Not Disturb (LWW).
+                        crate::dnd::apply_peer(state.dnd, state.dnd_changed_at);
                         let dto = app_state_to_dto(hex::encode(peer_pub), state.clone());
                         let _ = app_state.emit("vortex:peer_state", dto);
                         // Auto-pin the peer's earbuds locally so the card shows

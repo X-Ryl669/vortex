@@ -571,13 +571,20 @@ fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
 
 /// Apply a fully-received FILE shared from the phone (instant-share style, NOT the
 /// clipboard): save it to the user's download folder ([`downloads_dir`]) under its
-/// original name and pop a desktop notification. Bytes are never logged; only size + name.
+/// original name. Bytes are never logged; only size + name.
 /// Returns the saved path on success (for the transfer panel), `None` on error.
+///
+/// `subdir` is the one folder level a capture adds below the download folder
+/// (`Screenshots` / `Photos`, from [`Offer::subdir`] — a fixed table, never
+/// the wire value). Same folder scheme as every other received file, one
+/// level down: a screenshot the phone sent by itself should be where the
+/// user already looks for phone files, not in a second tree of its own.
 pub(crate) async fn apply_synced_file(
     _app: &AppHandle,
     name: &str,
     _mime: &str,
     bytes: Vec<u8>,
+    subdir: Option<&str>,
 ) -> Option<PathBuf> {
     // Sanitise to a single path component (no traversal / separators).
     let safe = std::path::Path::new(name)
@@ -585,7 +592,7 @@ pub(crate) async fn apply_synced_file(
         .map(|s| s.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "vortex-file".to_string());
-    let Some(dir) = downloads_dir() else {
+    let Some(dir) = downloads_dir().map(|d| receive_dir(&d, subdir)) else {
         tracing::warn!("received file: no HOME — dropped");
         return None;
     };
@@ -633,7 +640,26 @@ pub(crate) async fn apply_synced_file(
     Some(path)
 }
 
-type Offer = vortex_l3_daemon::core::clipboard_mirror::ClipboardImageOffer;
+/// Where a received file goes: the download folder itself, or one named
+/// level below it. Kept separate from the name sanitising above so it can be
+/// tested on its own.
+pub(crate) fn receive_dir(downloads: &std::path::Path, subdir: Option<&str>) -> PathBuf {
+    match subdir {
+        Some(s) => downloads.join(s),
+        None => downloads.to_path_buf(),
+    }
+}
+
+/// "Downloads/Screenshots" (localised root) for UI copy — the folder a capture
+/// went to, named the way [`downloads_label`] names the root.
+pub(crate) fn receive_label(subdir: Option<&str>) -> String {
+    match subdir {
+        Some(s) => format!("{}/{s}", downloads_label()),
+        None => downloads_label(),
+    }
+}
+
+pub(crate) type Offer = vortex_l3_daemon::core::clipboard_mirror::ClipboardImageOffer;
 
 /// Instant-share-style consent + pull for a debounced batch of phone file offers: ask
 /// the user once, and only on accept queue them for the LAN pull. Clipboard
@@ -674,17 +700,26 @@ async fn flush_file_batch(batch: Vec<Offer>) {
     } else {
         format!("{count} files")
     };
-    let accepted = crate::file_consent::request(&label, count, total).await;
+    // The banner names what the phone did ("took a screenshot") when it is a
+    // capture; a batch is titled after its first offer, which is all of them
+    // in practice (a burst is one kind).
+    let accepted = crate::file_consent::request(&label, count, total, &batch[0].kind).await;
     if !accepted {
         tracing::info!(count, "phone file offer(s) declined on laptop");
         return;
     }
     for offer in &batch {
         // Per-file receive pill entry + pull queue entry.
-        let id = crate::transfers::start(&offer.name, offer.bytes);
+        let id = crate::transfers::start(&offer.name, offer.bytes, offer.subdir());
         if let Some(q) = crate::PENDING_FILE_OFFERS.get() {
             if let Ok(mut g) = q.lock() {
-                g.push_back((offer.token.clone(), offer.name.clone(), offer.mime.clone(), id));
+                g.push_back((
+                    offer.token.clone(),
+                    offer.name.clone(),
+                    offer.mime.clone(),
+                    id,
+                    offer.kind.clone(),
+                ));
             }
         }
     }
@@ -723,7 +758,12 @@ pub(crate) fn spawn_image_offer_consumer() -> tokio::sync::mpsc::UnboundedSender
                     break;
                 }
             };
-            if !CLIPBOARD_SYNC.load(Ordering::Relaxed) {
+            // A capture is not clipboard traffic: the phone's own switch
+            // sent it and the consent below gates it. It passes this toggle,
+            // which is about the clipboard, so that "screenshots on, clipboard
+            // sync off" is a combination that works rather than one that
+            // drops files without a word.
+            if !CLIPBOARD_SYNC.load(Ordering::Relaxed) && !offer.is_capture() {
                 continue;
             }
             if offer.is_file() {
@@ -744,6 +784,28 @@ pub(crate) fn spawn_image_offer_consumer() -> tokio::sync::mpsc::UnboundedSender
         }
     });
     tx
+}
+
+/// Put an image FILE on the system clipboard, for the "Copy" action on a
+/// received capture. Unlike [`set_system_image`] this decodes whatever the
+/// file is (a phone photo is a JPEG), and it arms the sync loop guard with the
+/// decoded pixels' signature so the watcher does not ship the phone's own
+/// picture straight back to it.
+pub(crate) fn copy_image_file_to_clipboard(bytes: &[u8]) -> Result<(), String> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| format!("decode image: {e}"))?
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    let rgba = img.into_raw();
+    if let Ok(mut g) = LAST_SYNC_IMG.lock() {
+        *g = img_sig(w as usize, h as usize, &rgba);
+    }
+    let data = arboard::ImageData {
+        width: w as usize,
+        height: h as usize,
+        bytes: std::borrow::Cow::Owned(rgba),
+    };
+    with_clip_setter(|cb| cb.set_image(data).map_err(|e| format!("set_image: {e}")))
 }
 
 /// Settings toggle: enable/disable laptop↔phone clipboard sync.
@@ -813,6 +875,29 @@ XDG_DOCUMENTS_DIR="$HOME/Documents"
         assert_eq!(expand_home("/data/dl", home), Some(PathBuf::from("/data/dl")));
         assert_eq!(expand_home("Downloads", home), None);
         assert_eq!(expand_home("", home), None);
+    }
+
+    /// A capture goes one named level below the download folder; a share
+    /// stays in the root. The subfolder is whatever the offer's fixed table
+    /// says, never joined from the wire.
+    #[test]
+    fn captures_land_one_level_below_downloads() {
+        let dl = std::path::Path::new("/home/cyril/Téléchargements");
+        assert_eq!(receive_dir(dl, None), dl.to_path_buf());
+        assert_eq!(
+            receive_dir(dl, Some("Screenshots")),
+            PathBuf::from("/home/cyril/Téléchargements/Screenshots")
+        );
+        let o = Offer {
+            kind: "photo".into(),
+            ..Default::default()
+        };
+        assert_eq!(receive_dir(dl, o.subdir()), PathBuf::from("/home/cyril/Téléchargements/Photos"));
+        let hostile = Offer {
+            kind: "../x".into(),
+            ..Default::default()
+        };
+        assert_eq!(receive_dir(dl, hostile.subdir()), dl.to_path_buf());
     }
 
     /// Unquoted and single-quoted values are valid shell too.

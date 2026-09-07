@@ -21,6 +21,9 @@ struct Item {
     received: u64,
     done: bool,
     failed: bool,
+    /// The subfolder a capture lands in (see `Offer::subdir`); `None` for a
+    /// share, which goes to the download folder's root.
+    subdir: Option<&'static str>,
 }
 
 static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
@@ -35,7 +38,7 @@ pub(crate) fn init(live_tx: UnboundedSender<LiveActivity>) {
     let _ = LIVE_TX.set(live_tx);
 }
 
-pub(crate) fn start(name: &str, size: u64) -> u64 {
+pub(crate) fn start(name: &str, size: u64, subdir: Option<&'static str>) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut g) = ITEMS.lock() {
         g.push(Item {
@@ -45,6 +48,7 @@ pub(crate) fn start(name: &str, size: u64) -> u64 {
             received: 0,
             done: false,
             failed: false,
+            subdir,
         });
     }
     emit();
@@ -156,12 +160,16 @@ fn emit() {
             format!("{count} files")
         };
         if all_done {
+            // Name the subfolder only when the whole batch went to one; a
+            // mixed batch (a share debounced in beside a screenshot) is
+            // described by the root they all sit under.
+            let subdir = g[0].subdir.filter(|_| g.iter().all(|i| i.subdir == g[0].subdir));
             (
                 format!("Received {label}"),
                 // Name the folder they actually landed in — it's localised
                 // ("Téléchargements", …), and a wrong name here sends the user
                 // hunting in a folder that hasn't got the files.
-                format!("Saved to {}", crate::clipboard_sync::downloads_label()),
+                format!("Saved to {}", crate::clipboard_sync::receive_label(subdir)),
                 100,
                 true,
             )

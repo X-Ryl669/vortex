@@ -37,6 +37,10 @@ internal class PendingOffer(
      *  comparing sequences tells us something its own reports can't — see
      *  [offersPresumedDropped]. */
     val seq: Long = 0L,
+    /** No toasts for this one. Set for a picture the gallery watcher sent by
+     *  itself: the user did not share it, so "sent" / "unreachable" / "lost"
+     *  on the phone's screen would be noise. Retries and log lines stay. */
+    val quiet: Boolean = false,
 ) {
     /** BLE send attempts made so far. Only bounds the never-delivered case. */
     var attempts: Int = 0
@@ -62,8 +66,13 @@ internal class PendingOffer(
  * send is retried while it can't go out, RE-announced while it has gone out but
  * nothing came to collect it, and reported as lost if neither ever happens.
  */
-internal suspend fun VortexStack.offerFileToLaptop(token: String, name: String, offer: ByteArray) {
-    val pending = PendingOffer(token, name, offer, seq = ++offerSeq)
+internal suspend fun VortexStack.offerFileToLaptop(
+    token: String,
+    name: String,
+    offer: ByteArray,
+    quiet: Boolean = false,
+) {
+    val pending = PendingOffer(token, name, offer, seq = ++offerSeq, quiet = quiet)
     pendingOffers[token] = pending
     // First attempt inline: the common case is a live link, where queueing and
     // waiting out a tick would add seconds to an otherwise instant share.
@@ -77,7 +86,7 @@ internal suspend fun VortexStack.offerFileToLaptop(token: String, name: String, 
         // (observed: 29 s for the BLE link to come back, then another 30 s for
         // a dropped offer to be re-announced) with nothing on screen since the
         // share sheet's "Sending…".
-        if (!offerUnreachableToasted) {
+        if (!offerUnreachableToasted && !quiet) {
             offerUnreachableToasted = true
             toastOffer("Laptop unreachable — keeping the file(s) queued")
         }
@@ -159,7 +168,7 @@ internal fun VortexStack.noteFileServed(token: String) {
     // The one unambiguous "it worked" moment on this device: the laptop has the
     // bytes. Per file rather than per batch, so a slow batch shows progress as
     // it goes instead of one summary at the end.
-    toastOffer("File sent: ${done.name}")
+    if (!done.quiet) toastOffer("File sent: ${done.name}")
     // SLIDING deadline, like the daemon's bulk-sync idle budget: the laptop
     // pulls one file per heartbeat round, so a big batch's last offer can
     // legitimately wait many minutes for its turn. A fetch anywhere in the
@@ -242,7 +251,7 @@ private suspend fun VortexStack.offerWatchdog() {
             }
             if (offerVerdict(pending, now) != OfferVerdict.GIVE_UP) continue
             pendingOffers.remove(pending.token)
-            lost += pending.name
+            if (!pending.quiet) lost += pending.name
             Log.w(VortexStack.TAG, "giving up on '${pending.name}': ${giveUpReason(pending)}")
         }
         if (lost.isNotEmpty()) toastOffersLost(lost)

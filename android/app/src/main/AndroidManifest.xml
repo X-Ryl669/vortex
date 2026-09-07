@@ -92,6 +92,15 @@
          default SMS app can actually write the provider on KitKat+). -->
     <uses-permission android:name="android.permission.WRITE_SMS" />
 
+    <!-- Screenshots / camera photos sent to the laptop by themselves: reading
+         another app's picture through MediaStore needs the legacy storage
+         grant up to Android 12 and the granular images one from 13 (where the
+         legacy one is a no-op). Runtime and optional; the feature is OFF until
+         the user switches it on in Settings. -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application

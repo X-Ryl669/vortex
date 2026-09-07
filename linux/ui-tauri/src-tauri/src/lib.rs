@@ -34,10 +34,14 @@ mod worker_transfers;
 mod worker_ctx;
 mod cmd_pairing;
 mod cmd_earbuds;
+mod send_to_phone;
 mod share;
 mod file_consent;
 mod contacts;
 mod desktop_apps;
+mod diagnostics;
+mod dnd;
+mod first_run;
 mod earbuds;
 mod handoff;
 mod ipc;
@@ -123,10 +127,12 @@ pub(crate) static PENDING_IMAGE_TOKEN: std::sync::OnceLock<Mutex<Option<String>>
 /// pulls the FRONT one per round (and nudges again if more remain), then pops it
 /// on delivery. Distinct from [`PENDING_IMAGE_TOKEN`] (clipboard images) so file
 /// transfer and clipboard-image sync don't clobber each other.
-/// `(token, name, mime, transfer_id)` — the id ties each queued file to its
-/// row in the transfer panel for live progress + completion.
+/// `(token, name, mime, transfer_id, kind)` — the id ties each queued file to
+/// its row in the transfer panel for live progress + completion; `kind` is the
+/// offer's (`"screenshot"` / `"photo"` / empty), carried through to the save so
+/// a capture lands in its subfolder and gets its notification.
 pub(crate) static PENDING_FILE_OFFERS: std::sync::OnceLock<
-    Mutex<std::collections::VecDeque<(String, String, String, u64)>>,
+    Mutex<std::collections::VecDeque<(String, String, String, u64, String)>>,
 > = std::sync::OnceLock::new();
 
 /// Holds the oneshot sender that `do_pair` is currently awaiting on,
@@ -301,7 +307,14 @@ pub fn run() {
             // lives entirely in this process, so a reboot or a quit left the edge
             // unarmed with the switch showing off. Put it back the way it was.
             universal_control::ensure_bt_hid();
+            // Per-user setup a package cannot do for us (autostart entry,
+            // enabling the GNOME extension). Idempotent, so it also repairs an
+            // install whose files were removed by hand.
+            first_run::ensure();
             universal_control::restore(app.handle().clone());
+            // Watch this desktop's own Do Not Disturb switch, so flipping it in
+            // GNOME's menu silences the phone too.
+            dnd::spawn_watcher();
 
             // The popup when THIS launch came from the GNOME shortcut (the
             // app wasn't running yet). The history WATCHER spawns inside
@@ -335,6 +348,9 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            diagnostics::diagnostics,
+            send_to_phone::send_to_phone,
+            diagnostics::diagnostics_report,
             worker::start_scan,
             worker::refresh_state,
             ipc::get_peer_states,

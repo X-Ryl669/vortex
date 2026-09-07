@@ -6,6 +6,7 @@ pub mod audio_route;
 pub mod audio_sink_cache;
 pub mod audio_switch;
 pub mod audio_switch_persistence;
+pub mod hogp;
 pub mod media_runtime;
 pub mod media_watch;
 pub mod ble;
