@@ -5445,6 +5445,7 @@ dependencies = [
  "tracing-subscriber",
  "vortex-l3-daemon",
  "walkdir",
+ "windows 0.62.2",
  "wl-clipboard-rs",
  "x11rb",
  "zbus 5.15.0",

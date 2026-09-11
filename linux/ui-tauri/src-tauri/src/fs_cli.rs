@@ -136,10 +136,10 @@ pub(crate) async fn get(remote: String, local: String) {
 
 /// `--fs-mount` / `--fs-umount` — put the phone's storage on the filesystem.
 ///
-/// The mount is not automatic: it costs a `fusermount3` and a kernel session,
-/// and a mount pointing at a phone that is not here is worse than no mount. So
-/// it is driven explicitly, and from here until there is a button for it.
-#[cfg(target_os = "linux")]
+/// The mount is not automatic: it costs a kernel session (FUSE) or a
+/// virtualization instance (ProjFS), and one pointing at a phone that is not
+/// here is worse than none. The home screen's folder button is the everyday
+/// way in; this stays because a flag can be scripted and a button cannot.
 pub(crate) async fn mount() {
     match crate::fs_mount::mount().await {
         Ok(dir) => tracing::info!("fs-cli: mounted at {}", dir.display()),
@@ -150,20 +150,17 @@ pub(crate) async fn mount() {
 /// Route an `--fs-*` flag. Returns false when `argv` holds none, so the caller
 /// can fall through to its other flags.
 pub(crate) fn dispatch(argv: &[String]) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        if argv.iter().any(|a| a == "--fs-umount") {
-            if crate::fs_mount::is_mounted() {
-                crate::fs_mount::unmount();
-            } else {
-                tracing::info!("fs-cli: nothing mounted");
-            }
-            return true;
+    if argv.iter().any(|a| a == "--fs-umount") {
+        if crate::fs_mount::is_mounted() {
+            crate::fs_mount::unmount();
+        } else {
+            tracing::info!("fs-cli: nothing mounted");
         }
-        if argv.iter().any(|a| a == "--fs-mount") {
-            tauri::async_runtime::spawn(mount());
-            return true;
-        }
+        return true;
+    }
+    if argv.iter().any(|a| a == "--fs-mount") {
+        tauri::async_runtime::spawn(mount());
+        return true;
     }
     if let Some(pos) = argv.iter().position(|a| a == "--fs-ls") {
         // Optional: no path means the synthetic root listing the peer's shares.

@@ -63,10 +63,6 @@ use platform_unsupported as proximity;
 use platform_unsupported as earbuds;
 #[cfg(not(target_os = "linux"))]
 use platform_unsupported as laptop_cast;
-// Browsing the phone's files needs a mount adapter, and the Windows one
-// (ProjFS) is not written yet — design doc §8 step 6.
-#[cfg(not(target_os = "linux"))]
-use platform_unsupported as fs_mount;
 mod clipboard;
 mod clipboard_hotkey;
 mod clipboard_window;
@@ -88,10 +84,15 @@ mod share;
 mod file_consent;
 mod fs_cli;
 mod fs_lan;
-// The phone's storage as a FUSE mount. Linux-only by nature: the Windows half
-// of design doc §8 step 6 is ProjFS, a different API for the same protocol.
-#[cfg(target_os = "linux")]
+// The phone's storage as a real filesystem. `fs_mount` is the facade and
+// `fs_vfs` the OS-independent half; the adapter under them is per-OS — FUSE on
+// Linux, ProjFS on Windows (design doc §8 step 6).
 mod fs_mount;
+mod fs_vfs;
+#[cfg(target_os = "linux")]
+mod fs_fuse;
+#[cfg(target_os = "windows")]
+mod fs_projfs;
 mod fs_pull;
 mod contacts;
 mod desktop_apps;

@@ -146,3 +146,20 @@ ksni = "0.3"
 # `fusermount3` binary — a runtime dependency already present anywhere FUSE
 # works at all.
 fuser = { version = "0.18", default-features = false }
+
+
+# ── Windows-bound dependencies ────────────────────────────────────────────
+# The mount adapter there is ProjFS (design doc §8 step 6) — a Win32 API with
+# no Linux counterpart, the way FUSE has no Windows one. Feature-gated per
+# namespace so we pull metadata for what we actually call: the ProjFS entry
+# points themselves, the FILE_ATTRIBUTE_* bits a placeholder carries, and the
+# ERROR_* codes the callbacks answer with.
+#
+# Same major version the daemon crate already pins, so the two do not resolve
+# two copies of the metadata into one build.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_ProjectedFileSystem",
+] }

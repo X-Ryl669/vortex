@@ -1,7 +1,10 @@
 # Browsing the phone's files from the desktop
 
-**Status:** design, not implemented. **Targets:** Linux *and* Windows from day
-one — the Windows port branch means every new feature needs both.
+**Status:** built through §8 step 2, plus step 6 (the mounts) on both OSes.
+Steps 3-5 — the daemon cache layer, a WebDAV gateway, writes — are open; the
+gateway is now unlikely, see §4. **Targets:** Linux *and* Windows from day one.
+Linux is verified on a device; the Windows adapter compiles and has never run
+(§8 step 6).
 
 Goal: open the phone's storage in Dolphin / Nautilus / Explorer, like KDE
 Connect does. Read-only first, writes stubbed.
@@ -106,14 +109,32 @@ Design notes:
 
 ---
 
-## 4. Desktop presentation: WebDAV first, native VFS as the exit
+## 4. Desktop presentation: native VFS on both, WebDAV never built
 
-*Linux went straight to the native VFS (v2) and skipped WebDAV.* The reasoning
-is under v2 below; in short, on Linux WebDAV buys strictly less than FUSE for
-comparable work, so the "cheapest path" argument for doing it first does not
-survive contact with it. Windows still has the choice open.
+***Both* operating systems went straight to the native VFS (v2); WebDAV was
+skipped entirely.** Its whole argument was being the cheapest path to something
+usable, and on neither OS did that survive contact:
 
-### v1 — WebDAV on loopback
+* **Linux** — GVFS and KIO mount `davs://` *inside the file manager's own
+  process*, so only that program's file dialogs would see the files. `cp`,
+  `mpv`, `ffprobe`, a text editor's Open box: none of them. FUSE is a real path
+  in the filesystem, so everything sees it.
+* **Windows** — the WebClient redirector caps a file at ~50 MB by default, and
+  escaping a 64 MB cap into a 50 MB one would have been absurd. ProjFS has no
+  such ceiling and needs no third-party install.
+
+What v1 was really buying was *one* implementation instead of two. That turned
+out to be the wrong unit of accounting: the two native adapters share
+everything above the OS call (`fs_vfs.rs` — caching, the path walk, pipelined
+reads, the concurrency cap) and differ only in the translation layer, which a
+WebDAV gateway would have needed anyway in the form of an HTTP server. Two
+adapters over one shared core came to about the same code as one gateway, with
+no size limits, no port, no auth story and no second process.
+
+The v1 sketch is kept below because its Windows caveat table is the reason
+ProjFS won there, and because it is the road not taken.
+
+### v1 — WebDAV on loopback (not built)
 
 One implementation serving both OSes:
 
@@ -134,26 +155,53 @@ Cheapest path to something usable, and platform-neutral Rust in the daemon.
 Loopback-only binding removes the auth problem outright. The 50 MB limit does
 not go away and is the main reason v1 may not be the end state.
 
-### v2 — native virtual filesystem
+### v2 — native virtual filesystem — **both done**
 
-- **Linux:** FUSE. Straightforward, gives a real mount. **Done** —
-  [`fs_mount.rs`], mounted at `$XDG_RUNTIME_DIR/vortex/phone`.
-- **Windows:** **ProjFS** (Projected File System), shipped in Windows 10 1809+
-  with **no third-party install** — it is what VFS for Git uses. This is the key
-  fact that beats WebDAV: a real filesystem, no size limits, proper seeking.
+- **Linux:** FUSE ([`fs_fuse.rs`]), mounted at `$XDG_RUNTIME_DIR/vortex/phone`.
+- **Windows:** **ProjFS** ([`fs_projfs.rs`]), projected at
+  `%LOCALAPPDATA%\Vortex\phone`. Ships in Windows 10 1809+ with no
+  third-party install — it is what VFS for Git uses — though it is an optional
+  feature that is off by default on client SKUs, so the mount error says how to
+  turn it on.
 
-More code (two presentation implementations), but no artificial ceilings, and
-the phone side is untouched by the switch.
+Three files, not two: [`fs_vfs.rs`] is everything between an adapter and the
+wire — the caches, the path walk, the pipelined ranged reads, the concurrency
+cap — and the adapters are only translation. That is what keeps "the mount
+adapter is swappable; the protocol is the investment" true in the code and not
+just in this document: adding Windows touched nothing the phone can observe.
 
-**Why Linux skipped WebDAV.** GVFS and KIO mount `davs://` *inside the file
-manager's own process*, so only that program's file dialogs can see the files —
-`cp`, `mpv`, `ffprobe`, a text editor's Open box, anything not built on KIO,
-cannot. A FUSE mount is a path in the filesystem, so everything can. Against
-that, the platform-neutrality argument for WebDAV-first only pays off on
-Windows, where it also runs into the ~50 MB `FileSizeLimitInBytes` cap. Linux
-needs no gateway process, no port, and no auth story at all: the mount is a
-directory only the mounting user can see (FUSE's default `Owner` access mode),
-which is a smaller attack surface than a loopback HTTP server.
+**The threading models are opposites, and that is the whole difference.**
+
+| | FUSE | ProjFS |
+|---|---|---|
+| Request delivery | one at a time, one session thread | its own thread pool, concurrent |
+| So the adapter must | **never block** — hand every op to the async runtime and answer from there | **block freely** — that is what the pool is for |
+| Concurrency limited by | our semaphore | our semaphore (the pool is sized above it on purpose) |
+
+Blocking a FUSE session thread serialises the entire mount behind one round
+trip at a time. Blocking a ProjFS pool thread is what ProjFS is built for — so
+the Windows callbacks are plainly synchronous, and the pool is sized at twice
+`MAX_INFLIGHT` so the shared semaphore runs out first and a thundering
+thumbnailer cannot exhaust the pool and wedge Explorer. If that ever stops
+holding, ProjFS has its own escape hatch (`ERROR_IO_PENDING` plus
+`PrjCompleteCommand`); it costs an owned copy of every callback parameter,
+which is why it is not the starting point.
+
+**Read-only is enforced differently too.** FUSE takes an `ro` mount option and
+the kernel refuses writes before they reach us. ProjFS has no such flag, so the
+projection marks every placeholder `FILE_ATTRIBUTE_READONLY` (advisory — it
+greys the commands out in Explorer) *and* vetoes `PRE_DELETE`, `PRE_RENAME`,
+`PRE_SET_HARDLINK` and `FILE_PRE_CONVERT_TO_FULL` from the notification
+callback, which is the half that actually enforces it.
+
+**One thing ProjFS gives free and one it costs.** It hydrates fetched content
+into the real directory and serves later reads from disk without asking us —
+design doc §7's content cache, for nothing. The cost is staleness: a file that
+changes on the phone is not re-fetched. The projection is therefore cleared at
+each mount, so a session starts from the phone's current truth; *within* a
+session a changed file still shows its old content. Fixing that properly means
+deriving a placeholder ContentID from size and mtime and driving
+`PrjUpdateFileIfNeeded` — the natural companion to step 3.
 
 ### Rejected: SFTP + sshfs
 
@@ -212,9 +260,11 @@ ride it, and it is how the daemon knows the phone is there at all. So:
 - With no usable network, the mount reports an honest, immediate error rather
   than hanging — a file manager blocked on a dead read is the worst outcome.
   *Done:* a request that reaches neither transport fails at once with
-  `EHOSTDOWN` ("Host is down") instead of waiting out the 20 s reply timeout.
-  Twenty seconds per operation on a phone that is simply not here is
-  indistinguishable from a hung file manager.
+  `EHOSTDOWN` — or `ERROR_HOST_DOWN`, which Explorer renders as "The host is
+  down" — instead of waiting out the 20 s reply timeout. Twenty seconds per
+  operation on a phone that is simply not here is indistinguishable from a hung
+  file manager. Both adapters map the protocol's codes straight across, which
+  is what the errno shape in §3 was for.
 - Wi-Fi Direct is already used for large transfers and applies here unchanged.
 
 ---
@@ -297,17 +347,19 @@ This is where these features usually fail, and it is all daemon-side:
 3. **Daemon cache layer** — metadata, readahead, content budget.
 4. **WebDAV loopback gateway**, both OSes.
 5. **`FS_WRITE` / `FS_SETMETA`** for real, once read-only is solid.
-6. **FUSE + ProjFS**, if the Windows WebDAV limits bite. **Linux done**
-   ([`fs_mount.rs`]), ahead of steps 3-5 and instead of WebDAV on this OS —
-   see §4. `--fs-mount` / `--fs-umount` put the phone's storage at
-   `$XDG_RUNTIME_DIR/vortex/phone`, read-only, and every program on the machine
-   can read it.
+6. **FUSE + ProjFS**, if the Windows WebDAV limits bite. **Both done**, ahead
+   of steps 3-5 and instead of WebDAV on either OS — see §4. `--fs-mount` /
+   `--fs-umount`, or the folder button on the phone's card, put the phone's
+   storage at `$XDG_RUNTIME_DIR/vortex/phone` (Linux) or
+   `%LOCALAPPDATA%\Vortex\phone` (Windows), read-only, and every program on
+   the machine can read it.
 
-   The load-bearing decision is that **nothing blocks the FUSE session
+   The load-bearing decision on Linux is that **nothing blocks the FUSE session
    thread**: each operation is handed to the async runtime and its reply object
    (which fuser makes `Send` for exactly this) is answered when the phone
    answers. Serving inline instead would cost one full round trip per operation
-   in series, and a file manager opening a folder issues dozens at once.
+   in series, and a file manager opening a folder issues dozens at once. On
+   Windows the same requirement is met by doing the opposite — see §4's table.
 
    What is not there yet: writes (step 5 — the mount is `ro`, so the kernel
    refuses them without a round trip), a content cache, coalescing, and
@@ -320,7 +372,8 @@ This is where these features usually fail, and it is all daemon-side:
    with `cargo test --lib fs_mount -- --ignored`.
 
    Reachable from the UI: a folder button on the right of the phone card's
-   "Connected" row mounts on demand and hands the path to `xdg-open`. Mounting is what can
+   "Connected" row mounts on demand and hands the path to the platform's file
+   manager (`xdg-open`, or `explorer.exe`). Mounting is what can
    fail — the phone may have gone since the card last said Connected — so the
    button holds the error for a few seconds with the reason in its tooltip,
    rather than opening a file manager onto nothing.
@@ -342,6 +395,20 @@ This is where these features usually fail, and it is all daemon-side:
      2^31, so the 64-bit offsets survive the whole stack.
    * `touch` in the mount: "Read-only file system", refused by the kernel
      without a round trip.
+
+   **The Windows half has never run.** There is no Windows machine in this
+   project's loop, so ProjFS is verified only as far as a cross-compile reaches:
+   `cargo check --all-targets --target x86_64-pc-windows-gnu` is clean, which
+   type-checks every callback signature, struct layout and constant against the
+   real Win32 metadata — and nothing about behaviour. What that cannot catch is
+   the ProjFS *protocol*: enumeration restart and buffer-full handling, the
+   write-alignment rule, whether the notification veto covers every path to a
+   write. Those are written from the documented contract with the reasoning in
+   comments, and they are what a first run on Windows should be expected to
+   shake out. The shared layer under it (`fs_vfs.rs`) is tested on every
+   platform, which is deliberately where the path walk lives — it is the
+   hardest part of the Windows adapter and the part least able to be tested
+   there.
 
    Two things that only a live run surfaced. Every path walk was asking us
    `access` and every `close` a `flush`, and `getxattr`/`listxattr` on top —
@@ -392,8 +459,11 @@ listener — worth doing, and the natural companion to step 3.
 
 ## 9. Open questions
 
-- **Windows `FileSizeLimitInBytes`:** ship a registry tweak in the installer,
-  document it, or skip straight to ProjFS?
+- ~~**Windows `FileSizeLimitInBytes`:** ship a registry tweak in the installer,
+  document it, or skip straight to ProjFS?~~ **Answered: straight to ProjFS**,
+  so the limit never applies. What replaces it as a Windows deployment question
+  is that ProjFS is an optional feature, off by default on client SKUs — the
+  mount error says how to enable it, and an installer step could do it instead.
 - **Handle lifetime** across phone process death — the daemon must transparently
   reopen, or the file manager will see spurious I/O errors after a Doze kill.
 - **Multi-peer:** with several paired phones, is the mount per-phone (a mount
