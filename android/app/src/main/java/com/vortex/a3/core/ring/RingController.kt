@@ -19,6 +19,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
+import com.vortex.a3.core.registerInternalReceiver
 
 /**
  * Find-My-style "ring my phone". The laptop bumps `AppState.ringSeq` (unix-millis
@@ -78,7 +79,13 @@ object RingController {
         // Force the ALARM stream to full so silent/vibrate can't mute us. Alarm
         // volume needs no DND-policy access (unlike ringer mode), and USAGE_ALARM
         // is exempt from most DND filters — the right "find my phone" behaviour.
-        if (am != null) {
+        // Only ever save the volume we found BEFORE raising it. The early
+        // return above covers the ordinary "already ringing" case, but it keys
+        // off `player`, and `player` stays null if MediaPlayer setup threw
+        // (unreadable ringtone URI). A second ring in that window would then
+        // re-read the volume we had already pushed to maximum, save THAT as the
+        // user's, and restore it — leaving the alarm volume stuck at full.
+        if (am != null && savedAlarmVol < 0) {
             try {
                 savedAlarmVol = am.getStreamVolume(AudioManager.STREAM_ALARM)
                 val max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
@@ -195,13 +202,7 @@ object RingController {
                 override fun onReceive(c: Context?, i: Intent?) = stop(c ?: ctx)
             }
             stopReceiver = r
-            val filter = IntentFilter(ACTION_STOP)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                ctx.registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                @Suppress("UnspecifiedRegisterReceiverFlag")
-                ctx.registerReceiver(r, filter)
-            }
+            ctx.registerInternalReceiver(r, IntentFilter(ACTION_STOP))
         }
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         val stopPi = PendingIntent.getBroadcast(

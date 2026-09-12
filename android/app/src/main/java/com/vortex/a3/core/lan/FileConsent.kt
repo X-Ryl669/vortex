@@ -14,6 +14,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import com.vortex.a3.core.registerInternalReceiver
 
 /**
  * Instant-share receive consent: when the laptop offers a file batch
@@ -84,13 +85,7 @@ object FileConsent {
                     pending[id]?.offer(accept)
                 }
             }
-            val filter = IntentFilter(ACTION)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                app.registerReceiver(rcv, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                @Suppress("UnspecifiedRegisterReceiverFlag")
-                app.registerReceiver(rcv, filter)
-            }
+            app.registerInternalReceiver(rcv, IntentFilter(ACTION))
             registered = true
         }
     }

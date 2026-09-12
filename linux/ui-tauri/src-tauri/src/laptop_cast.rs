@@ -261,7 +261,16 @@ pub async fn start(
     // Everything downstream — encode, seal, transport, the phone's viewer — is
     // identical, which is the whole reason this fits here rather than in a
     // module of its own.
-    if extend.unwrap_or_else(extend_enabled) {
+    // `None` means the asking phone did not state a kind. There used to be a
+    // laptop-side preference behind an on-disk flag for exactly this case, with
+    // `set_extend_mode` / `get_extend_mode` to change it — and no UI anywhere
+    // ever called either, so the flag was never written and the fallback was
+    // always this same `false`. The phone has offered the choice on every
+    // request since it gained the button, so `None` now only means a build old
+    // enough to predate that. Mirror is the right answer for it: a copy of a
+    // screen that already exists cannot leave a phantom monitor behind in the
+    // compositor's layout the way a virtual one can.
+    if extend.unwrap_or(false) {
         // Mutter first: it is the tuned path (and it rides its own cursor
         // overlay, because Mutter will not composite a pointer into a virtual
         // monitor). But `org.gnome.Mutter.ScreenCast` is GNOME's private API, so
@@ -477,38 +486,6 @@ async fn start_portal(
 /// and not a scale applied afterwards.
 const EXTEND_W: u32 = 1560;
 const EXTEND_H: u32 = 720;
-
-fn extend_flag_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".local/share/vortex/laptop_cast/extend"))
-}
-
-/// Whether the phone should be given a NEW screen rather than a copy of this one.
-pub(crate) fn extend_enabled() -> bool {
-    extend_flag_path().is_some_and(|p| p.exists())
-}
-
-/// Choose between mirroring this screen and extending onto a new one. Takes
-/// effect on the next cast — switching mid-cast would mean tearing the viewer
-/// down and re-keying it.
-#[tauri::command]
-pub(crate) fn set_extend_mode(on: bool) -> Result<(), String> {
-    let p = extend_flag_path().ok_or("no HOME")?;
-    if on {
-        if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&p, b"1").map_err(|e| e.to_string())?;
-    } else {
-        let _ = std::fs::remove_file(&p);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub(crate) fn get_extend_mode() -> bool {
-    extend_enabled()
-}
 
 /// Cast a NEW monitor to the phone (see [`crate::virtual_display`]).
 ///

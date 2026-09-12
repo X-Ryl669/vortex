@@ -202,7 +202,13 @@ export async function stopMirror() {
 
 export async function startMirror() {
   if (!primaryPeer.value || !phoneOnline.value || mirrorStarting.value) return;
-  void ensureMirrorListener();
+  // AWAITED, not fired and forgotten. Registering the listener is two awaits
+  // (a dynamic import, then the subscribe), and the "opening" message is the
+  // only one that turns the button green. Starting the mirror first left a
+  // window where that message could land before anything was listening, and
+  // the Share button would stay un-flipped for a mirror that was in fact live —
+  // with no way to stop it from the button that is there for exactly that.
+  await ensureMirrorListener();
   mirrorStarting.value = true;
   const cfg = { width: 720, height: 1560, fps: 60, bitrate: 10_000_000, transport: "wifi" };
   try {
@@ -439,14 +445,22 @@ export async function runScanLoop() {
     scanHits.value = [];
     scanning.value = true;
     await startScan();
+    // Whichever of the two fires, BOTH timers are cleared. The poll used to be
+    // cleared only on its own path, so a scan that ran the full 11s resolved on
+    // the deadline and left its 200ms interval installed — self-limiting (it
+    // clears itself the next time `scanning` is false) but a fresh one was
+    // started every cycle, and there is no reason to leave that to chance.
     await new Promise<void>(resolve => {
-      const deadline = setTimeout(resolve, 11000);
-      const tick = setInterval(() => {
-        if (!scanning.value) {
-          clearTimeout(deadline);
-          clearInterval(tick);
-          resolve();
-        }
+      let deadline: ReturnType<typeof setTimeout>;
+      let tick: ReturnType<typeof setInterval>;
+      const finish = () => {
+        clearTimeout(deadline);
+        clearInterval(tick);
+        resolve();
+      };
+      deadline = setTimeout(finish, 11000);
+      tick = setInterval(() => {
+        if (!scanning.value) finish();
       }, 200);
     });
     if (!scanLoopActive) break;

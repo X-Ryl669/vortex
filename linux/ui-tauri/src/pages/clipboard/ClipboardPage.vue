@@ -185,7 +185,7 @@ function hide() {
   filter.value = "";
   selected.value = 0;
   resetScroll();
-  void invoke("clipboard_hide");
+  void invoke("clipboard_hide").catch((e) => console.warn("clipboard_hide failed", e));
 }
 
 // Cumulative pixel offset of a row (rows vary in height by kind, so we sum

@@ -56,6 +56,57 @@ fn cache_path() -> Option<PathBuf> {
     Some(p)
 }
 
+/// How long a tombstone is kept before it is dropped.
+///
+/// A deleted item has to stay in the set, or the delete stops propagating and
+/// the peer hands the note back. But "stays" was literally for ever: every note
+/// ever deleted was persisted, re-serialized and re-sent in full on every sync
+/// and every reconnect, so the cost of this feature grew monotonically with how
+/// much the user had ever thrown away.
+///
+/// Thirty days is the trade. A device that has been offline LONGER than this
+/// still holds the live item, and will resurrect it on the next merge — the
+/// standard trade-off for a LWW-element-set, and an easy one to accept here
+/// where both devices belong to one person and sync on every connection. Move
+/// the number if that judgement is wrong; nothing else depends on it.
+const TOMBSTONE_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Drop tombstones older than [`TOMBSTONE_TTL_MS`]. Live items are untouched.
+fn prune_tombstones(items: &mut Vec<Item>) {
+    let cutoff = now_ms().saturating_sub(TOMBSTONE_TTL_MS);
+    let before = items.len();
+    items.retain(|i| !i.deleted || i.updated_at >= cutoff);
+    let dropped = before - items.len();
+    if dropped > 0 {
+        tracing::info!(dropped, "notes: expired tombstones dropped");
+    }
+}
+
+/// Do WE hold anything the peer's set does not — a note they lack, or a newer
+/// version of one they have?
+///
+/// This is the reply condition, and it used to be `sig(merged) != sig(remote)`,
+/// which was an equivalent proxy only while neither side ever dropped anything.
+/// With pruning it is not: a peer still holding a tombstone we have expired
+/// makes the signatures differ for ever, and answering that difference is an
+/// endless exchange — they send the tombstone, we merge and re-prune, reply,
+/// they reply, for as long as the two builds disagree. Which is exactly the
+/// window where one device has updated and the other has not.
+///
+/// Asking the question the comment always claimed to ask — do they need
+/// anything FROM US — makes a set that is merely smaller than theirs silent,
+/// and still replies whenever we genuinely have something to contribute.
+fn we_hold_more(ours: &[Item], remote: &[Item]) -> bool {
+    let theirs: std::collections::HashMap<&str, i64> = remote
+        .iter()
+        .map(|i| (i.id.as_str(), i.updated_at))
+        .collect();
+    ours.iter().any(|o| match theirs.get(o.id.as_str()) {
+        None => true,
+        Some(&t) => o.updated_at > t,
+    })
+}
+
 fn load_store() -> Vec<Item> {
     cache_path()
         .and_then(|p| std::fs::read(&p).ok())
@@ -77,6 +128,9 @@ fn with_notes<R>(f: impl FnOnce(&mut Vec<Item>) -> R) -> R {
     let mut g = NOTES.lock().unwrap_or_else(|e| e.into_inner());
     let items = g.get_or_insert_with(load_store);
     let r = f(items);
+    // One funnel for every read and every mutation, so a store loaded from disk
+    // and a store just edited are both pruned before anyone else sees them.
+    prune_tombstones(items);
     save_store(items);
     r
 }
@@ -272,6 +326,63 @@ impl Assembler {
 }
 
 #[cfg(test)]
+mod tombstone_tests {
+    use super::{prune_tombstones, we_hold_more, Item, TOMBSTONE_TTL_MS};
+
+    fn item(id: &str, updated_at: i64, deleted: bool) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: "note".to_string(),
+            title: String::new(),
+            body: String::new(),
+            done: false,
+            due_at: 0,
+            updated_at,
+            deleted,
+        }
+    }
+
+    #[test]
+    fn only_expired_tombstones_are_dropped() {
+        let now = super::now_ms();
+        let mut v = vec![
+            item("live-old", now - TOMBSTONE_TTL_MS * 2, false),
+            item("tomb-fresh", now - 1_000, true),
+            item("tomb-expired", now - TOMBSTONE_TTL_MS - 1_000, true),
+        ];
+        prune_tombstones(&mut v);
+        let ids: Vec<&str> = v.iter().map(|i| i.id.as_str()).collect();
+        // A live item is never dropped for age, however old it is.
+        assert!(ids.contains(&"live-old"));
+        assert!(ids.contains(&"tomb-fresh"));
+        assert!(!ids.contains(&"tomb-expired"));
+    }
+
+    /// The loop this condition exists to prevent: a peer that still holds a
+    /// tombstone we have expired must not draw a reply, or the two sides trade
+    /// it for as long as their builds disagree.
+    #[test]
+    fn a_peer_holding_more_than_us_draws_no_reply() {
+        let now = super::now_ms();
+        let ours = vec![item("a", now, false)];
+        let remote = vec![item("a", now, false), item("old-tomb", now - 1, true)];
+        assert!(!we_hold_more(&ours, &remote));
+    }
+
+    #[test]
+    fn a_note_they_lack_or_an_older_copy_does_draw_one() {
+        let now = super::now_ms();
+        let remote = vec![item("a", now - 5_000, false)];
+        // We have one they have never seen.
+        assert!(we_hold_more(&[item("b", now, false)], &remote));
+        // We have a newer version of one they do have.
+        assert!(we_hold_more(&[item("a", now, false)], &remote));
+        // Identical sets need no reply either way.
+        assert!(!we_hold_more(&[item("a", now - 5_000, false)], &remote));
+    }
+}
+
+#[cfg(test)]
 mod assembler_tests {
     use super::Assembler;
 
@@ -344,7 +455,11 @@ pub(crate) fn spawn_sync(
             };
             // Atomic LWW merge into the store.
             let (merged, changed) = with_notes(|v| {
-                let merged = merge(v, &remote);
+                let mut merged = merge(v, &remote);
+                // Prune here too, not only on save: `merged` is what we reply
+                // with, and re-sending a tombstone we have just expired would
+                // hand it straight back to us on the next round.
+                prune_tombstones(&mut merged);
                 let changed = sig(&merged) != sig(v);
                 if changed {
                     *v = merged.clone();
@@ -359,7 +474,7 @@ pub(crate) fn spawn_sync(
                 );
             }
             // Reply only if WE hold items the peer's set lacked → converges.
-            if sig(&merged) != sig(&remote) {
+            if we_hold_more(&merged, &remote) {
                 send_full(&writer, &merged).await;
             }
         }

@@ -101,6 +101,20 @@
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
+    <!-- Guards the app's OWN broadcasts (a file-consent decision, a Find-My
+         ring stop, a laptop-media transport tap). Those receivers are
+         registered at runtime with RECEIVER_NOT_EXPORTED from Android 13, but
+         that flag does not exist below it, and minSdk is 29 — so on Android
+         10-12 the receivers were implicitly EXPORTED and any app on the phone
+         could broadcast to them. The consent one is the reason this matters:
+         its ids count up from a fixed number, so a decision the user never
+         saw could be answered for them. A signature permission closes the
+         gap: only a build signed with this key may send. -->
+    <permission
+        android:name="com.vortex.a3.permission.INTERNAL_BROADCAST"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.vortex.a3.permission.INTERNAL_BROADCAST" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application

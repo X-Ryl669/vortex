@@ -409,8 +409,6 @@ pub fn run() {
             universal_control::uc_start,
             universal_control::uc_stop,
             universal_control::uc_running,
-            laptop_cast::set_extend_mode,
-            laptop_cast::get_extend_mode,
             universal_control::uc_set_placement,
             universal_control::uc_get_placement,
         ])
@@ -429,6 +427,12 @@ pub fn run() {
                 tracing::info!("shutting down — releasing the injector and adb forward");
                 crate::mirror_inject::stop();
                 crate::laptop_cast::dispatch_request(false, None);
+                // And hand the BLE link back. BlueZ owns the connection
+                // independently of us, so without this it survives the process
+                // — leaving the phone believing a peer is still attached, and
+                // the next run scanning for an advertisement it will therefore
+                // never send.
+                crate::ble::shutdown_link_blocking();
             }
         });
 }

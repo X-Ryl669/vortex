@@ -12,6 +12,8 @@ target/
 # ===== Android / Kotlin =====
 # Gradle
 .gradle/
+# Kotlin 2.x build-session scratch (android/.kotlin/) — build output, not source.
+.kotlin/
 build/
 /build
 gradle-app.setting

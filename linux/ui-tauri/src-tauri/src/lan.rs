@@ -1134,17 +1134,49 @@ pub(crate) async fn try_lan_reconnect(
                         local_state.earbuds.as_ref(),
                         Some(&state),
                     );
+                    // Everything from here to the end of this block is a LEVEL
+                    // — "what is true right now" — and the snapshot carrying it
+                    // was read at the START of this round, before bulk-sync.
+                    // Bulk-sync can sit for its whole idle timeout when the
+                    // phone is busy, and then these would apply a picture of the
+                    // world that is long gone.
+                    //
+                    // Live-caught during a real call: a round read `ringing`,
+                    // bulk-sync stalled 15s, the phone was answered in the
+                    // meantime, and the stale `ringing` then replaced the
+                    // in-call pill — the timer froze seven seconds short and the
+                    // call was reported as MISSED once it ended. A healthy round
+                    // dispatches ~120ms after the read, so two seconds is far
+                    // outside normal and well inside damaging.
+                    //
+                    // The seq-stamped commands below (lock, media, ring,
+                    // open-on-phone) need no such guard: they are edge-triggered
+                    // on a monotonic counter, so a late copy is simply ignored.
+                    // Nor do DND and the smart switch, which are last-writer-wins
+                    // on a timestamp a stale snapshot cannot beat.
+                    let fresh = outcome.peer_state_age < std::time::Duration::from_secs(2);
+                    if !fresh {
+                        tracing::info!(
+                            age_ms = outcome.peer_state_age.as_millis() as u64,
+                            "app-state is stale by the time this round finished —                              not applying its call/handoff/cast levels"
+                        );
+                    }
                     // Additive call-mirror path: feed the call carried in this
                     // AppState (over LAN) into the call consumer so the banner/
                     // pill survive a BLE drop mid-call. Deduped by (id, phase).
-                    dispatch_appstate_call(&state.call);
-                    // Additive browsing-handoff path (LAN backstop): the page the
-                    // phone is on → the "continue" pill survives a BLE drop and
-                    // stays fresh. Consumer dedups by URL.
-                    crate::handoff::dispatch_appstate_handoff(&state.handoff);
-                    // Laptop→phone screen mirror: start/stop casting our screen
-                    // off the phone's view-request level (edge-tracked).
-                    crate::laptop_cast::dispatch_request(state.laptop_mirror_req, state.laptop_mirror_extend);
+                    if fresh {
+                        dispatch_appstate_call(&state.call);
+                        // Additive browsing-handoff path (LAN backstop): the page
+                        // the phone is on → the "continue" pill survives a BLE
+                        // drop and stays fresh. Consumer dedups by URL.
+                        crate::handoff::dispatch_appstate_handoff(&state.handoff);
+                        // Laptop→phone screen mirror: start/stop casting our
+                        // screen off the phone's view-request level (edge-tracked).
+                        crate::laptop_cast::dispatch_request(
+                            state.laptop_mirror_req,
+                            state.laptop_mirror_extend,
+                        );
+                    }
                     // Continuity Camera: dial the phone's camera into the v4l2
                     // webcam when it offers (we requested it); stop when it ends.
                     crate::camera::dispatch_offer(

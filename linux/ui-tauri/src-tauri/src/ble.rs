@@ -62,6 +62,62 @@ pub(crate) fn touch_peer_contact() {
     LAST_PEER_CONTACT_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The RPA of the BLE session that is live right now, so the app can hand the
+/// link back on its way out. `None` between sessions.
+///
+/// Everything else about teardown was already handled — the loop disconnects
+/// and forgets the device whenever the listener returns. What was missing is
+/// that a PROCESS EXIT never reaches that code: the loop dies with the process
+/// and BlueZ, which owns the connection independently of us, keeps it open.
+/// The phone's GATT server therefore still sees a connected peer, holds its
+/// RPA and stops advertising in a way a scan can find — so the freshly started
+/// app scans, backs off 15s → 60s, and never reconnects. Measured on this
+/// machine: BLE dead for six minutes after a restart, with LAN quietly
+/// covering for it. Clearing the entry by hand and letting it reconnect took
+/// eleven seconds.
+static SESSION_ADDR: std::sync::Mutex<Option<bluer::Address>> =
+    std::sync::Mutex::new(None);
+
+fn note_session_addr(addr: Option<bluer::Address>) {
+    if let Ok(mut g) = SESSION_ADDR.lock() {
+        *g = addr;
+    }
+}
+
+/// Hand the BLE link back before the process goes away.
+///
+/// Synchronous and hard-bounded, because it runs from Tauri's `RunEvent::Exit`
+/// on the main thread: an exit that hangs on D-Bus is worse than one that
+/// leaves a stale entry. Its own runtime rather than the worker's, which may
+/// already be shutting down by the time this runs.
+pub(crate) fn shutdown_link_blocking() {
+    let Some(addr) = SESSION_ADDR.lock().ok().and_then(|g| *g) else {
+        return; // no live session — nothing to hand back
+    };
+    tracing::info!(%addr, "shutting down — dropping the BLE link so the phone re-advertises");
+    let worker = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok(session) = bluer::Session::new().await else { return };
+            let Ok(adapter) = session.default_adapter().await else { return };
+            // Disconnect is the half the PHONE sees: it ends the GATT link, so
+            // the phone stops holding its RPA and advertises again.
+            if let Ok(dev) = adapter.device(addr) {
+                let _ = tokio::time::timeout(Duration::from_millis(1200), dev.disconnect()).await;
+            }
+            // Removing the entry is the half WE need: it drops the cached
+            // advertisement so the next run's discovery cannot re-serve this
+            // dead RPA — the same reason `forget_stale_device` exists.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(1200), adapter.remove_device(addr)).await;
+        });
+    });
+    let _ = worker.join();
+    note_session_addr(None);
+}
+
 /// Ms since we last heard from the phone over any transport (huge if never).
 pub(crate) fn peer_contact_age_ms() -> u64 {
     let last = LAST_PEER_CONTACT_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -889,6 +945,9 @@ pub(crate) async fn run_ble_persistent_loop(
         // subscription, but bluer characteristics are reference-
         // counted under the hood so the writer's clone is safe.
         let client_arc = Arc::new(client);
+        // Remember the live session's RPA so a process exit can hand the link
+        // back (see `shutdown_link_blocking`). Cleared in the teardown below.
+        note_session_addr(Some(client_arc.address));
         let writer_transport = transport.clone();
         let writer_client = client_arc.clone();
         let writer_fn: SessionWriter = Arc::new(move |frame: AudioOpFrame| {
@@ -1040,6 +1099,18 @@ pub(crate) async fn run_ble_persistent_loop(
                     // notification — must ride the BLE STATE path too so the
                     // notification works on a BLE-only link (AP isolation).
                     crate::media_remote::fill_now_playing(&mut state).await;
+                    // Shared Do Not Disturb (LWW) — must ride the BLE STATE path too
+                    // so local toggles reach the phone in ~50ms instead of waiting
+                    // minutes for LAN.
+                    let (dnd_on, dnd_at) = crate::dnd::state();
+                    state.dnd = dnd_on;
+                    state.dnd_changed_at = dnd_at;
+                    if let Some(mw) = crate::MEDIA_WATCH.get() {
+                        state.smart_switch_enabled =
+                            mw.enabled.load(std::sync::atomic::Ordering::Relaxed);
+                        state.smart_switch_changed_at =
+                            mw.enabled_changed_at.load(std::sync::atomic::Ordering::Relaxed);
+                    }
                     match audio_signal::write_state(&st_client, st_transport.clone(), &state).await
                     {
                         Ok(()) => {
@@ -1088,6 +1159,17 @@ pub(crate) async fn run_ble_persistent_loop(
                             // device or characteristic is actually gone.
                             if !state_write_means_link_gone(&e) {
                                 busy_fail += 1;
+                                // A busy bearer is proof of a LIVE link — BlueZ
+                                // only reports it for a device it is connected
+                                // to — so it counts as presence and as contact
+                                // just as a successful write does. Without this,
+                                // a long bulk transfer (clipboard image, contacts
+                                // backfill) starved both clocks for its whole
+                                // duration: the proximity watcher read the phone
+                                // as having left, and the mirror pills were swept
+                                // while the phone sat right there.
+                                touch_presence();
+                                touch_peer_contact();
                                 // Back off hard rather than hammering: each retry
                                 // re-seals the frame and therefore burns a Noise
                                 // nonce whether or not the bytes ever leave, and
@@ -1244,6 +1326,7 @@ pub(crate) async fn run_ble_persistent_loop(
         // with "Bluetooth operation in progress: In Progress". Tearing the old
         // one down here keeps the adapter clean so reconnect is reliable.
         let dropped_addr = client_arc.address;
+        note_session_addr(None); // this session is over; nothing for exit to undo
         if let Ok(dev) = adapter.device(dropped_addr) {
             let _ = tokio::time::timeout(Duration::from_secs(3), dev.disconnect()).await;
         }

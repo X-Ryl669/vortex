@@ -129,6 +129,36 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         .enable_all()
         .build()
         .expect("tokio runtime");
+    // Hand the BLE link back on SIGTERM/SIGINT too.
+    //
+    // Tauri's `RunEvent::Exit` covers a tray quit, but a session logout, a
+    // `systemctl --user stop`, or a plain `kill` sends a signal that ends the
+    // process without it — and that is the common path, because this app is
+    // started from an autostart entry and dies with the session. Without the
+    // teardown BlueZ keeps the GATT connection, the phone goes on believing a
+    // peer is attached and stops advertising discoverably, and the next login's
+    // instance scans for something it will never see.
+    rt.spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            tracing::warn!("shutdown signals unavailable; BLE teardown on exit is best-effort");
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        tracing::info!("caught a shutdown signal — releasing the phone link");
+        crate::mirror_inject::stop();
+        crate::ble::shutdown_link_blocking();
+        // The signal is ours now, so the default disposition never runs: exit
+        // explicitly, or the process would sit here with nothing to stop it.
+        std::process::exit(0);
+    });
+
     rt.block_on(async move {
         // Identity store: Secret Service is mandatory per the V1
         // security baseline ("if secure storage is unavailable, V1

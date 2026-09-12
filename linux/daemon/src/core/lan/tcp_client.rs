@@ -25,6 +25,17 @@ pub struct LanReconnectOutcome {
     /// Peer-reported app state (battery, device class, locale, theme,
     /// earbuds). Populated after the post-handshake app-data exchange.
     pub peer_state: Option<crate::core::appstate::AppState>,
+    /// How long ago [`peer_state`] was actually read off the wire.
+    ///
+    /// It is exchanged EARLY in the round and the caller only sees it at the
+    /// END, after bulk-sync — which can sit for its full idle timeout when the
+    /// phone is busy. A snapshot is a level, not an event, so applying a stale
+    /// one to the UI undoes newer truth: live-caught a 15s-old `ringing`
+    /// replacing the in-call pill of a call that had been answered seven
+    /// seconds earlier, which also turned it into a "missed call". The caller
+    /// cannot tell without this, because nothing else in the outcome says when
+    /// any of it happened.
+    pub peer_state_age: std::time::Duration,
     /// Bulk-sync datasets the phone shipped because our cached hash was
     /// stale: (frame type, reassembled JSON bytes). Empty when everything
     /// matched, no request was made, or the peer predates BULK_SYNC.
@@ -282,6 +293,7 @@ pub async fn run_lan_reconnect(
     // proof (deferred to V2). App-level state lives in a separate
     // post-handshake exchange so we can evolve it without touching
     // pairing code.
+    let peer_state_read_at = std::time::Instant::now();
     let peer_state = match crate::core::appstate::exchange_app_state(
         &mut stream,
         &mut transport,
@@ -340,6 +352,7 @@ pub async fn run_lan_reconnect(
         remote: addr,
         peer_counter,
         peer_state,
+        peer_state_age: peer_state_read_at.elapsed(),
         bulk,
         bulk_status,
     })

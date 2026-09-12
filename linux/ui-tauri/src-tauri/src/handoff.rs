@@ -35,12 +35,30 @@ pub(crate) static HANDOFF_TX: std::sync::OnceLock<UnboundedSender<HandoffEvent>>
     std::sync::OnceLock::new();
 
 /// LAN / BLE-STATE backstop: feed a peer AppState's `handoff` into the consumer.
-/// Idempotent — the consumer dedups by URL, so a duplicate delivery just
-/// refreshes (and heartbeats) the pill; an empty url clears it. The additive
-/// path used when the dedicated BLE HANDOFF frame can't get through.
+/// An empty url clears the pill; anything else refreshes it, which is
+/// idempotent because re-publishing the same pill is a no-op to the user.
+/// The additive path used when the dedicated BLE HANDOFF frame can't get
+/// through.
+///
+/// `open_now` is STRIPPED here, and that is the whole point of this function
+/// existing separately from the frame path.
+///
+/// An AppState is a snapshot the phone re-sends on every heartbeat — 12s over
+/// BLE, and again over LAN. "Open this page now" is an EVENT. Feeding the event
+/// straight out of a repeated snapshot meant one Share opened the page, and
+/// then opened it again on every beat for as long as the phone kept the share
+/// in its snapshot: a new browser tab every few seconds, for ever. (The phone
+/// no longer keeps it there either — see `forwardHandoff` — but a laptop must
+/// not depend on the peer's build to avoid spawning processes in a loop.)
+///
+/// So a Share that arrives only over this path becomes a pill the user clicks,
+/// rather than nothing and rather than a tab storm. Opening on its own stays
+/// with the dedicated HANDOFF frame, which is sent once per Share.
 pub(crate) fn dispatch_appstate_handoff(handoff: &Option<HandoffEvent>) {
     if let (Some(ev), Some(tx)) = (handoff.as_ref(), HANDOFF_TX.get()) {
-        let _ = tx.send(ev.clone());
+        let mut ev = ev.clone();
+        ev.open_now = false;
+        let _ = tx.send(ev);
     }
 }
 
@@ -82,16 +100,18 @@ pub(crate) fn spawn_consumer(
             let _ = live_tx.send(handoff_pill(&ev, &domain, cached.clone()));
             // If the favicon isn't cached yet, fetch it off-thread and re-publish
             // ONCE it lands — but only if we're still on this same page.
-            if cached.is_none() && !domain.is_empty() {
+            if cached.is_none() && !domain.is_empty() && !favicon_missed(&domain) {
                 let live_tx = live_tx.clone();
                 let ev = ev.clone();
                 let domain2 = domain.clone();
                 tokio::spawn(async move {
-                    let id = tokio::task::spawn_blocking(move || ensure_favicon(&domain2))
+                    let domain3 = domain2.clone();
+                    let id = tokio::task::spawn_blocking(move || ensure_favicon(&domain3))
                         .await
                         .ok()
                         .flatten();
                     if id.is_none() {
+                        note_favicon_miss(&domain2);
                         return;
                     }
                     let still_here =
@@ -220,6 +240,36 @@ fn clear_pill() -> LiveActivity {
 /// resolves the pill icon to the fetched favicon).
 fn favicon_app_id(domain: &str) -> String {
     format!("handoff_{domain}")
+}
+
+/// Domains whose favicon fetch has already failed, so it is not retried on
+/// every beat.
+///
+/// A success caches itself — the PNG on disk is the cache, and `cached_favicon`
+/// finds it. A FAILURE cached nothing, and the page the user is reading is
+/// re-asserted every 25s by the phone (plus every AppState heartbeat on two
+/// transports). So a site with no reachable `/favicon.ico` had us spawn `curl`
+/// with a 4s timeout, over and over, for as long as the page stayed open.
+///
+/// Bounded, and cleared wholesale when it fills: this is a "don't bother again
+/// soon" hint, not state worth keeping precisely.
+static FAVICON_MISSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const FAVICON_MISSES_MAX: usize = 256;
+
+fn favicon_missed(domain: &str) -> bool {
+    FAVICON_MISSES
+        .lock()
+        .map(|g| g.iter().any(|d| d == domain))
+        .unwrap_or(false)
+}
+
+fn note_favicon_miss(domain: &str) {
+    if let Ok(mut g) = FAVICON_MISSES.lock() {
+        if g.len() >= FAVICON_MISSES_MAX {
+            g.clear();
+        }
+        g.push(domain.to_string());
+    }
 }
 
 /// The synthetic app_id if this domain's favicon is ALREADY cached, else None.

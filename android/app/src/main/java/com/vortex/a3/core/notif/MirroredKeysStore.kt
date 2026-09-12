@@ -37,11 +37,24 @@ object MirroredKeysStore {
      *  worst case of losing the last write is one stale notification, which the
      *  reconnect catch-up already mitigates. */
     fun save(ctx: Context, keys: Set<String>) {
-        // `take` on a HashSet takes an ARBITRARY subset — hash order, not
-        // recency — so trimming could equally well drop a notification that is
-        // on screen right now and keep one from hours ago. The dismissal of the
-        // dropped one then never syncs. An Android SBN key ends with the post
-        // ID, which increases over time, so sorting by key keeps the newest.
+        // Trimming drops SOMEBODY's key, and which one is not something this
+        // store can choose well.
+        //
+        // `take` on a HashSet takes an arbitrary subset in hash order. Sorting
+        // first was meant to fix that — the note here used to claim an SBN key
+        // "ends with the post ID, which increases over time", so the tail would
+        // be the newest. It does not: the key is `userId|pkg|id|tag|uid`, and
+        // `id` is the posting app's own notification id, not a clock. Sorting
+        // therefore orders by PACKAGE NAME, so `takeLast` keeps whoever is
+        // latest in the alphabet.
+        //
+        // Kept anyway, because it is no worse than hash order and it is at
+        // least stable: the same set trims to the same subset every time,
+        // instead of shuffling which notification loses its dismissal on each
+        // save. Recency would need a timestamp per key, and this StringSet has
+        // nowhere to put one — worth doing only if 300 live mirrored
+        // notifications ever turns out to be a real ceiling rather than a
+        // theoretical one.
         val bounded = if (keys.size > MAX) keys.sorted().takeLast(MAX).toSet() else keys
         try {
             prefs(ctx).edit().putStringSet(FIELD, bounded).apply()

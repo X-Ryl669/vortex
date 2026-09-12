@@ -15,6 +15,7 @@ import {
   Loader2,
   Plus,
   BellRing,
+  SwitchCamera,
 } from "lucide-vue-next";
 import {
   activeEarbuds,
@@ -48,6 +49,22 @@ async function toggleCamera() {
     await invoke("set_camera_request", { on: cameraOn.value });
   } catch {
     cameraOn.value = !cameraOn.value; // revert on failure
+  }
+}
+
+// Which lens the phone opens. The phone has honoured `camera_facing` from the
+// start and the strings for this button were already written; nothing ever
+// called the command, so every session was stuck on the default front lens.
+// Shown only while the camera is on — there is nothing to flip otherwise.
+const cameraFacing = ref<"front" | "back">("front");
+async function flipCamera() {
+  const next = cameraFacing.value === "front" ? "back" : "front";
+  cameraFacing.value = next;
+  try {
+    await invoke("set_camera_facing", { facing: next });
+  } catch (e) {
+    cameraFacing.value = next === "front" ? "back" : "front"; // revert
+    console.warn("set_camera_facing failed", e);
   }
 }
 
@@ -183,6 +200,10 @@ const earbudsStatus = computed(() => {
             {{ t("mirror.use_as_webcam") }}
             <!-- Continuity camera ships Experimental in v1 (v4l2loopback dep). -->
             <span class="vx-tag absolute -top-1.5 right-2">{{ t("mirror.experimental") }}</span>
+          </button>
+          <button v-if="cameraOn" class="vx-chip" @click="flipCamera">
+            <SwitchCamera class="h-3.5 w-3.5" />
+            {{ cameraFacing === "front" ? t("mirror.cam_front") : t("mirror.cam_back") }}
           </button>
         </div>
       </div>

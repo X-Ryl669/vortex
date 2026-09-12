@@ -219,6 +219,7 @@ internal fun VortexStack.startCallFlow(): com.vortex.a3.core.call.CallFlowOrches
             }
             VortexService.callEventBus.tryEmit(ev)
             lanServer?.nudge()
+            pushStateViaBle()
         },
     )
     if (!callFlow.start()) {
@@ -288,6 +289,22 @@ internal fun VortexStack.forwardCallEvents() {
         VortexService.callEventBus.collect { ev ->
             if (!com.vortex.a3.core.notif.NotificationMirrorSetting.isEnabled()) return@collect
             val server = gattServer ?: return@collect
+            // Drop an event this call has already moved past.
+            //
+            // The collector is sequential and a single `sendCallEncrypted` waits
+            // up to 1.5 s for the stack's notify ack, so anything queued ahead of
+            // the end delays it by that much — the laptop's mirrored timer keeps
+            // counting for exactly as long. Worse, a stale `active` sent AFTER
+            // the end reads as a different (id, phase) on the laptop and rebuilds
+            // the pill the end had just cleared.
+            val cur = VortexService.currentCall
+            if (ev.phase != com.vortex.a3.core.call.CallEvent.PHASE_ENDED &&
+                cur != null && cur.id == ev.id &&
+                cur.phase == com.vortex.a3.core.call.CallEvent.PHASE_ENDED
+            ) {
+                Log.i(VortexStack.TAG, "dropping a call update the end has overtaken")
+                return@collect
+            }
             // Stamp the send time (clock-skew-proof timer) + the live audio
             // state (mute/speaker/earbuds) so the laptop pill's card shows
             // the right toggles.

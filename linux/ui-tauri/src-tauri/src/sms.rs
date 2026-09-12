@@ -74,9 +74,13 @@ fn offer_login_code(known: &[SmsMessage], incoming: &[SmsMessage]) {
         return;
     };
 
-    // The code itself is never logged — it is a credential.
+    // Neither the code nor the sender is logged. The code is a credential, and
+    // the sender is the other half of "who sends this person login codes" —
+    // `call.rs` already refuses to log a number for the same reason, and this
+    // path was the one place that still did. The user sees both on screen,
+    // which is where they belong.
     let sender = msg.address.clone();
-    tracing::info!(from = %sender, "sms: login code → clipboard");
+    tracing::info!("sms: login code → clipboard");
     if let Err(e) = crate::clipboard_sync::set_local_secret(&code) {
         tracing::warn!("sms: could not put the login code on the clipboard: {e}");
         return;
@@ -110,6 +114,9 @@ pub(crate) fn clear(app: &AppHandle) {
     {
         let _ = std::fs::remove_file(&p);
     }
+    // The store is gone; a cached hash of it would tell the next phone our
+    // history matches theirs and skip the reconcile that repopulates it.
+    invalidate_ids_hash();
     let _ = app.emit("vortex:sms", Vec::<SmsMessage>::new());
     let _ = app.emit("vortex:sms-history", Vec::<SmsMessage>::new());
 }
@@ -235,6 +242,7 @@ pub(crate) fn merge_history(app: &AppHandle, json: &[u8]) {
             let _ = vortex_l3_daemon::core::fs_private::write_private(&p, &bytes);
         }
     }
+    invalidate_ids_hash();
     if let Some(p) = history_since_path() {
         let _ = vortex_l3_daemon::core::fs_private::write_private(&p, since.to_string().as_bytes());
     }
@@ -244,7 +252,72 @@ pub(crate) fn merge_history(app: &AppHandle, json: &[u8]) {
         since,
         "← sms history merged (LAN bulk-sync)"
     );
-    let _ = app.emit("vortex:sms-history", merged);
+    // A big batch is a backfill round with more behind it — coalesce. A small
+    // one is the watermark catching up, and it is the path a just-sent message
+    // sometimes confirms through (the frontend reconciles optimistic sends on
+    // this event), so that one goes out at once, exactly as before.
+    if batch_len >= BACKFILL_BATCH {
+        schedule_history_emit(app);
+    } else {
+        let _ = app.emit("vortex:sms-history", merged);
+    }
+}
+
+/// A merged batch at least this big is part of a backfill rather than a normal
+/// catch-up. Well above what a few minutes of messages produces and far below
+/// the 5000 the phone serves per round, so it classifies both ends correctly
+/// without the laptop having to know the phone's page size.
+const BACKFILL_BATCH: usize = 256;
+
+/// How long the history list must stop changing before it is pushed to the page.
+///
+/// The phone serves up to 5000 messages per bulk-sync round, and the laptop's
+/// watermark self-paginates the rest — so a first sync of a long history is a
+/// run of rounds, each one merging and then emitting the WHOLE accumulated list
+/// to the webview. Ten rounds of a list growing towards 50,000 messages is ten
+/// full serializations across the IPC bridge and ten re-renders of the Messages
+/// page, to show a list that is not finished yet.
+///
+/// Sits above the 2s the heartbeat is pinned to while work is queued, so a
+/// backfill collapses to a single emit once it actually stops. Costs nothing in
+/// responsiveness: this is the HISTORY list. A newly arrived message rides the
+/// separate `vortex:sms` event from `deliver`, which is untouched and still
+/// immediate.
+const HISTORY_EMIT_QUIET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// When the history store last changed, and whether a coalescing task is awake.
+static HISTORY_DIRTY_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+static HISTORY_EMIT_AWAKE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the history changed and make sure exactly one task is waiting to push it.
+fn schedule_history_emit(app: &AppHandle) {
+    if let Ok(mut g) = HISTORY_DIRTY_AT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+    if HISTORY_EMIT_AWAKE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // a task is already waiting; it will see the fresh stamp
+    }
+    let app = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(HISTORY_EMIT_QUIET / 3).await;
+            let quiet = HISTORY_DIRTY_AT
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map(|t| t.elapsed() >= HISTORY_EMIT_QUIET)
+                .unwrap_or(true);
+            if quiet {
+                break;
+            }
+        }
+        // Cleared BEFORE the emit, so a merge landing during it schedules a
+        // fresh task rather than being swallowed.
+        HISTORY_EMIT_AWAKE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = app.emit("vortex:sms-history", get_sms_history());
+    });
 }
 
 /// Canonical id-list JSON of the history store (compact array, ids
@@ -261,9 +334,38 @@ fn ids_json() -> Vec<u8> {
 }
 
 /// Sha256-hex of the canonical id list, for the bulk-sync request.
+/// Memoized [`ids_hash`]. `None` = not computed since the store last changed.
+///
+/// The hash is asked for on EVERY LAN heartbeat round, and computing it means
+/// reading the whole history file, deserializing every message into a struct,
+/// re-parsing each id, sorting, and re-serializing — for a store that only
+/// changes when a batch merges or the phone reports deletions. The heartbeat is
+/// pinned to 2s while a call is mirrored or a file batch is pulling, so on a
+/// phone with a few thousand messages that was megabytes of parse per second,
+/// invisible on a test account with twenty.
+///
+/// Invalidated at the three places the store is written. Nothing else writes
+/// that file, so an explicit invalidation is exact and needs no mtime dance.
+static IDS_HASH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn invalidate_ids_hash() {
+    if let Ok(mut g) = IDS_HASH.lock() {
+        *g = None;
+    }
+}
+
 pub(crate) fn ids_hash() -> String {
     use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(ids_json()))
+    if let Ok(g) = IDS_HASH.lock() {
+        if let Some(h) = g.as_ref() {
+            return h.clone();
+        }
+    }
+    let hash = hex::encode(Sha256::digest(ids_json()));
+    if let Ok(mut g) = IDS_HASH.lock() {
+        *g = Some(hash.clone());
+    }
+    hash
 }
 
 /// The phone's full id list arrived (our hash was stale): prune history
@@ -295,8 +397,9 @@ pub(crate) fn reconcile_ids(app: &AppHandle, json: &[u8]) {
             let _ = vortex_l3_daemon::core::fs_private::write_private(&p, &bytes);
         }
     }
+    invalidate_ids_hash();
     tracing::info!(pruned, total = after.len(), "sms history pruned (phone deletions)");
-    let _ = app.emit("vortex:sms-history", after);
+    schedule_history_emit(app);
 }
 
 /// Tauri command: the full synced SMS history (instant, from disk).

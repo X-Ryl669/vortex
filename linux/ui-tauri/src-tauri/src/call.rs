@@ -63,6 +63,15 @@ pub(crate) const CALL_PILL_KEY: &str = "vortex-call";
 /// loss of contact, not an inter-beat gap.
 const BANNER_STALE_MS: u64 = 35_000;
 
+/// No contact with the phone over ANY transport for this long → the mirrored
+/// call is no longer something we can stand behind, so the in-call pill's
+/// keep-alive stands down and lets the sweeper reap it.
+///
+/// Same 35s, and for the same arithmetic: the laptop's own BLE state heartbeat
+/// beats every 12s and refreshes peer contact on every successful write, so
+/// three missed beats is a real loss of contact rather than an inter-beat gap.
+const CONTACT_LOST_MS: u64 = 35_000;
+
 /// True while a call is mirrored on the laptop (ringing banner or in-call pill
 /// up). The LAN heartbeat reads this to poll briskly (≈2 s) while it's set so
 /// the call-END — which arrives as `call=None` on the next AppState — clears the
@@ -524,7 +533,6 @@ pub(crate) async fn spawn_consumer(
     {
         let state = state.clone();
         let tick_gen = tick_gen.clone();
-        let writer_for_keepalive = call_writer.clone();
         tokio::spawn(async move {
             while let Some(ev) = call_rx.recv().await {
                 // A call frame is proof of live phone contact (the LAN heartbeat
@@ -756,24 +764,37 @@ pub(crate) async fn spawn_consumer(
                             playing: None,
                         };
                         let _ = live_tx.send(mk_pill());
-                        // Slow keep-alive: re-publish every 30s so the laptop's
-                        // 90s staleness sweeper doesn't drop the pill on a long
-                        // call. Far below the 1/sec that starved the D-Bus iface.
-                        // SAFETY: stop refreshing once the BLE writer is gone
-                        // (link dropped) — the call's `ended` rides BLE too, so
-                        // a drop would otherwise strand the pill forever; letting
-                        // the sweeper reap it (≤90s) self-heals. On reconnect the
-                        // phone's replay=1 re-sends `active` and the pill returns.
-                        let writer = writer_for_keepalive.clone();
+                        // Keep-alive: re-publish every 15s so the laptop's 90s
+                        // staleness sweeper doesn't drop the pill on a long call.
+                        // Far below the 1/sec that starved the D-Bus iface.
+                        //
+                        // SAFETY: stop refreshing once we have lost contact with
+                        // the phone over EVERY transport — the call's `ended`
+                        // rides those links, so a drop would otherwise strand the
+                        // pill forever; letting the sweeper reap it self-heals,
+                        // and on reconnect the phone's replay=1 re-sends `active`
+                        // and the pill returns. This used to key off the BLE
+                        // writer alone, which reaped a healthy pill whenever BLE
+                        // renegotiated mid-call while LAN carried on fine.
+                        //
+                        // It reads peer contact and never touches it: this task
+                        // publishes the laptop's own view and is not evidence of
+                        // anything about the phone. Touching it here would also
+                        // pin the shared liveness clock for every OTHER mirror
+                        // pill, so none of them could ever be swept.
                         let state_ka = state.clone();
                         tokio::spawn(async move {
                             loop {
-                                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                                 if tick_gen2.load(Ordering::SeqCst) != my_gen {
                                     break; // call ended / re-answered → stop
                                 }
-                                if writer.lock().await.is_none() {
-                                    tracing::info!("call pill keep-alive: BLE link gone, letting it expire");
+                                if crate::ble::peer_contact_age_ms() > CONTACT_LOST_MS {
+                                    tracing::info!(
+                                        "call pill keep-alive: no contact with the phone for over {}s \
+                                         — letting the pill expire",
+                                        CONTACT_LOST_MS / 1000
+                                    );
                                     break;
                                 }
                                 // Rebuild from the CURRENT stashed state so a

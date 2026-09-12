@@ -87,6 +87,15 @@ pub(crate) fn dispatch_appstate_call(
     };
     match call {
         Some(ev) => {
+            // Explicit ended carried over AppState: clear tracking and deliver at once.
+            if ev.phase == vortex_l3_daemon::core::call_event::CallEvent::PHASE_ENDED {
+                if let Ok(mut t) = LAST_APPSTATE_CALL_SOME_AT.lock() {
+                    *t = None;
+                }
+                *last = None;
+                let _ = tx.send(ev.clone());
+                return;
+            }
             if let Ok(mut t) = LAST_APPSTATE_CALL_SOME_AT.lock() {
                 *t = Some(std::time::Instant::now());
             }
@@ -96,20 +105,19 @@ pub(crate) fn dispatch_appstate_call(
         None => {
             // Debounce: ignore a transient `None` while the call is still being
             // re-sent on the other transport / will return on the next beat.
-            // Only a SUSTAINED absence (no `call` for >5s — the in-call LAN
-            // heartbeat is pinned to ~2s, so that's ~2 missed beats) is a real
-            // end. The normal call-end clears the pill immediately via the
-            // explicit `ended` CALL frame; this synthesis is only the backstop
-            // for a lost `ended`, so a few seconds' delay here is harmless and
-            // it stops the pill flickering mid-call.
+            // Explicit PHASE_ENDED is handled immediately above (0ms); this fallback
+            // only handles a remote crash / lost connection without flickering the banner.
             let recent = LAST_APPSTATE_CALL_SOME_AT
                 .lock()
                 .ok()
                 .and_then(|g| *g)
-                .map(|t| t.elapsed() < std::time::Duration::from_secs(5))
+                .map(|t| t.elapsed() < std::time::Duration::from_millis(4500))
                 .unwrap_or(false);
             if recent {
                 return;
+            }
+            if let Ok(mut t) = LAST_APPSTATE_CALL_SOME_AT.lock() {
+                *t = None;
             }
             // Call gone per AppState. If we were tracking one, clear the pill.
             if let Some(id) = last.take() {

@@ -16,6 +16,22 @@ import java.util.UUID
 object NoteStore {
     private const val FILE = "notes.json"
 
+    /** How long a tombstone is kept before it is dropped.
+     *
+     *  A deleted item has to stay in the set or the delete stops propagating and
+     *  the peer hands the note back. But "stays" was literally for ever: every
+     *  note ever deleted was persisted and re-sent in full on every sync and
+     *  every reconnect, so the cost of this feature grew with how much the user
+     *  had ever thrown away.
+     *
+     *  Thirty days, matching the laptop's `notes.rs`. A device offline LONGER
+     *  than that still holds the live item and resurrects it on the next merge —
+     *  the standard trade-off for a LWW-element-set, and an easy one where both
+     *  devices are one person's and sync on every connection. Both sides must
+     *  use the SAME window, or the shorter one keeps re-expiring what the longer
+     *  one keeps handing back. */
+    private const val TOMBSTONE_TTL_MS = 30L * 24 * 60 * 60 * 1000
+
     private var file: File? = null
     /** Full set incl. tombstones — the sync source of truth. */
     private var all: List<Note> = emptyList()
@@ -28,8 +44,20 @@ object NoteStore {
         if (file != null) return
         val f = File(context.applicationContext.filesDir, FILE)
         file = f
-        all = if (f.exists()) Note.listFromBytes(f.readBytes()) else emptyList()
+        all = prune(if (f.exists()) Note.listFromBytes(f.readBytes()) else emptyList())
         publish()
+    }
+
+    /** Drop tombstones older than [TOMBSTONE_TTL_MS]. Live items are untouched.
+     *  Applied wherever [all] is assigned, so a set loaded from disk and a set
+     *  just merged are both clean before anything else reads them. */
+    fun prune(items: List<Note>): List<Note> {
+        val cutoff = now() - TOMBSTONE_TTL_MS
+        val kept = items.filter { !it.deleted || it.updatedAt >= cutoff }
+        if (kept.size != items.size) {
+            android.util.Log.i("VortexNotes", "expired tombstones dropped: ${items.size - kept.size}")
+        }
+        return kept
     }
 
     private fun publish() {
@@ -51,13 +79,14 @@ object NoteStore {
     fun snapshot(): List<Note> = all
 
     private fun afterLocalEdit() {
+        all = prune(all)
         persist(); publish(); onLocalEdit?.invoke()
     }
 
     /** Replace the full set incl. tombstones — used by the sync merge. Persists +
      *  publishes but does NOT fire [onLocalEdit] (avoids a push echo). */
     fun replaceAll(items: List<Note>) {
-        all = items
+        all = prune(items)
         persist(); publish()
     }
 

@@ -316,6 +316,19 @@ watch(
     tailCount.value = TAIL_STEP;
     draft.value = getDraft(address);
     markConversationRead(address);
+    // …and on the PHONE too. `markConversationRead` is only our own watermark,
+    // so the laptop's badge cleared while the phone kept buzzing about a
+    // conversation the user had already read here — which is the whole point of
+    // mirroring it. Both ends of `mark_sms_read` were already built (the command
+    // seals a MARK_READ over BLE with a LAN fallback, and `CallController`
+    // applies it to the SMS provider); nothing was calling it.
+    //
+    // Best-effort by nature: the phone can only write the provider when it is
+    // the default SMS app, and it says so in its own log. Not worth surfacing
+    // here — the laptop's own read state is already correct either way.
+    void invoke("mark_sms_read", { thread: threadFor(address), number: address }).catch(
+      (e) => console.warn("mark_sms_read failed", e),
+    );
     if (!threadCoveredByHistory(address)) {
       void loadThread(address, threadFor(address));
     }
@@ -331,11 +344,17 @@ watch(draft, (text) => {
 watch(
   activeName,
   (name) => {
-    void invoke("set_active_chat", { name: activeNumber.value ? name : "" });
+    void invoke("set_active_chat", { name: activeNumber.value ? name : "" }).catch((e) =>
+      console.warn("set_active_chat failed", e),
+    );
   },
   { immediate: true },
 );
-onUnmounted(() => void invoke("set_active_chat", { name: "" }));
+onUnmounted(() =>
+  void invoke("set_active_chat", { name: "" }).catch((e) =>
+    console.warn("set_active_chat clear failed", e),
+  ),
+);
 async function send() {
   const body = draft.value.trim();
   if (!body || !activeNumber.value) return;

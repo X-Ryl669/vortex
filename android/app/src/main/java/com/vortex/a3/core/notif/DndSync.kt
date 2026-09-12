@@ -95,11 +95,34 @@ object DndSync {
         val dnd = filterIsDnd(filter)
         if (dnd == on.get()) return
         settleHandler.removeCallbacksAndMessages(null)
-        settleHandler.postDelayed({ confirmLocalChange() }, SETTLE_MS)
+        settleHandler.postDelayed({ confirmLocalChange() }, settleMs())
     }
 
     private val settleHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private const val SETTLE_MS = 750L
+
+    /** How long to let the filter settle before believing it.
+     *
+     *  The long wait only ever existed for ONE case: the filter passing through
+     *  an intermediate value on its way to the one WE just asked for. Outside
+     *  that window nothing is passing through — the callback carries the user's
+     *  own toggle — and making every toggle wait for a hazard that is not
+     *  present is what made this sync feel slow. So the wait follows the
+     *  hazard: [SETTLE_AFTER_SELF_MS] while our own write could still be
+     *  landing, [SETTLE_MS] otherwise.
+     *
+     *  The value check in [confirmLocalChange] is still the real guard; this
+     *  only decides when to run it. */
+    private fun settleMs(): Long {
+        val since = android.os.SystemClock.elapsedRealtime() - lastSelfApplyAtMs.get()
+        return if (since < SELF_APPLY_WINDOW_MS) SETTLE_AFTER_SELF_MS else SETTLE_MS
+    }
+
+    private const val SETTLE_MS = 200L
+    private const val SETTLE_AFTER_SELF_MS = 900L
+    private const val SELF_APPLY_WINDOW_MS = 3_000L
+
+    /** When we last asked the platform to change the filter ourselves. */
+    private val lastSelfApplyAtMs = AtomicLong(0L)
 
     /** Re-read the filter after it has had time to settle, and only then treat
      *  a disagreement as the user's doing. */
@@ -121,7 +144,12 @@ object DndSync {
         changedAt.set(at)
         save()
         Log.i(TAG, "changed here -> dnd=$dnd at=$at; propagating")
+        // BLE first: one STATE frame on the link that is already up reaches the
+        // laptop in ~200 ms and costs no radio wake of its own. The LAN nudge
+        // behind it is the backstop for a BLE link that is down or wedged — it
+        // only re-announces mDNS, so it costs nothing when BLE already won.
         com.vortex.a3.service.VortexService.nudgeAppState()
+        com.vortex.a3.service.VortexService.liveLan?.nudge()
     }
 
     /** Apply the laptop's setting if its toggle is newer than ours. */
@@ -149,6 +177,10 @@ object DndSync {
             NotificationListenerService.INTERRUPTION_FILTER_ALL
         }
         try {
+            // Stamp BEFORE the write: the callback for our own change can land
+            // while `requestInterruptionFilter` is still returning, and it must
+            // find the longer settle window already open.
+            lastSelfApplyAtMs.set(android.os.SystemClock.elapsedRealtime())
             svc.requestInterruptionFilter(want)
             Log.i(TAG, "adopted the laptop's setting: dnd=$peerOn")
         } catch (t: Throwable) {

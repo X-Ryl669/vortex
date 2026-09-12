@@ -27,7 +27,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `signal` is for the shutdown hook: Tauri's RunEvent::Exit covers a tray quit,
+# but a session logout or a `systemctl` stop sends SIGTERM, which kills the
+# process without it — and that is the path that leaves the BLE link dangling.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"

@@ -248,7 +248,12 @@ pub(crate) async fn watch() {
             "fc:accept" => true,
             "fc:decline" => false,
             "fc:copy" | "fc:open" => {
-                act_on_received(id, &key).await;
+                // Off the router. `fc:copy` reads the whole file and hands it to
+                // the clipboard; awaiting that here meant a consent prompt's
+                // Accept sat unanswered behind someone copying a large image,
+                // and a consent prompt is the one thing on this channel with a
+                // deadline (it declines after 45s).
+                tokio::spawn(async move { act_on_received(id, &key).await });
                 continue;
             }
             _ => continue, // not ours (call:/act: handled by their own watchers)

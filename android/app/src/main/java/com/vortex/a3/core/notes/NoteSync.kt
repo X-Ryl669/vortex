@@ -41,6 +41,29 @@ object NoteSync {
     fun sig(items: List<Note>): String =
         items.map { "${it.id}:${it.updatedAt}:${it.deleted}" }.sorted().joinToString("|")
 
+    /** Do WE hold anything the peer's set does not — an item they lack, or a
+     *  newer version of one they have?
+     *
+     *  This is the reply condition, and it used to be `sig(merged) != sig(remote)`,
+     *  which was an equivalent proxy only while neither side ever dropped
+     *  anything. Once tombstones expire it is not: a peer still holding one we
+     *  have already dropped makes the signatures differ for ever, and answering
+     *  that difference is an endless exchange — they send it, we merge and
+     *  re-prune, reply, they reply. Which is exactly the window where one device
+     *  has updated and the other has not.
+     *
+     *  Asking the question the comment always claimed to ask — do they need
+     *  anything FROM US — makes a set that is merely smaller than theirs silent,
+     *  while still replying whenever we genuinely have something to contribute. */
+    fun weHoldMore(ours: List<Note>, remote: List<Note>): Boolean {
+        val theirs = HashMap<String, Long>(remote.size)
+        for (r in remote) theirs[r.id] = r.updatedAt
+        return ours.any { o ->
+            val t = theirs[o.id]
+            t == null || o.updatedAt > t
+        }
+    }
+
     fun buildChunks(items: List<Note>): List<ByteArray> {
         val json = Note.listToBytes(items)
         val total = ((json.size + CHUNK_DATA - 1) / CHUNK_DATA).coerceAtLeast(1)
@@ -131,11 +154,14 @@ object NoteSync {
         val (total, idx, data) = parseChunk(payload) ?: return
         val remote = asm.add(total, idx, data) ?: return
         val before = NoteStore.snapshot()
-        val merged = merge(before, remote)
+        // Prune here too, not only in the store: `merged` is what we reply with,
+        // and re-sending a tombstone we have just expired would hand it straight
+        // back to us on the next round.
+        val merged = NoteStore.prune(merge(before, remote))
         if (sig(merged) != sig(before)) {
             NoteStore.replaceAll(merged) // persist + publish (no echo)
         }
-        if (sig(merged) != sig(remote)) {
+        if (weHoldMore(merged, remote)) {
             sendFull(merged)
         }
     }

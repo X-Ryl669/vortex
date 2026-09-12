@@ -837,10 +837,16 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      * BLE isn't up; the LAN nudge alongside (in the caller) is the fallback.
      */
     fun pushStateViaBle() {
-        val peerPub = peerStore.list().firstOrNull()?.peerStaticPub ?: return
         val server = gattServer ?: return
+        // Everything below happens OFF the caller's thread. Callers include the
+        // TelephonyCallback (main thread) on the call-end path, and both
+        // `peerStore.list()` — an EncryptedSharedPreferences read, so file I/O
+        // plus AES — and building the snapshot are too slow to sit in front of
+        // the one frame whose latency the user can see.
         scope.launch {
             try {
+                val peerPub =
+                    peerStore.list().firstOrNull()?.peerStaticPub ?: return@launch
                 val json = buildLocalAppState().toJsonBytes()
                 if (server.sendStateEncrypted(peerPub, json)) {
                     lastBleStatePushAtMs = android.os.SystemClock.elapsedRealtime()

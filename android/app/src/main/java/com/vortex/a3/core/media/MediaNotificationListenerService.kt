@@ -596,6 +596,27 @@ class MediaNotificationListenerService : NotificationListenerService() {
         @Volatile
         private var callNotifKey: String? = null
 
+        /** True when the notification [callNotifKey] points at was an ONGOING
+         *  one (a live call), not a missed-call card or another dialer
+         *  notification that merely shares the package. Only an ongoing one
+         *  disappearing is worth chasing telephony over. */
+        @Volatile
+        private var callNotifOngoing = false
+
+        /** Bounded re-check after the dialer's ongoing call notification
+         *  disappears while telephony still reports a call.
+         *
+         *  Dialers drop that notification the moment the user taps the red
+         *  button; `TelephonyManager` only flips to IDLE once the call is torn
+         *  down, which is a few hundred milliseconds later on AOSP and closer
+         *  to a second on MIUI. Waiting for the callback alone is what left the
+         *  laptop pill counting 1-2 seconds past the hang-up. Polling at
+         *  [END_RECHECK_STEP_MS] hands the end over the instant telephony
+         *  agrees, and [END_RECHECK_MAX_MS] bounds the chase so a notification
+         *  the dialer merely reshuffled never ends a live call. */
+        private const val END_RECHECK_STEP_MS = 100L
+        private const val END_RECHECK_MAX_MS = 2_500L
+
         /** CAL-13 — second connect signal, for dialers whose notification never
          *  sets `EXTRA_SHOW_CHRONOMETER` (MIUI's does not: every poll of a real
          *  28-second call logged `chrono=false`, so the laptop pill sat on
@@ -675,6 +696,8 @@ class MediaNotificationListenerService : NotificationListenerService() {
             if (cur.phase == com.vortex.a3.core.call.CallEvent.PHASE_ENDED) return
             resetCallConnectStateIfNew(cur.id)
             callNotifKey = sbn.key
+            callNotifOngoing = ((sbn.notification?.flags ?: 0) and
+                android.app.Notification.FLAG_ONGOING_EVENT) != 0
             val n = sbn.notification ?: return
             // Fill in who is calling when telephony would not say.
             //
@@ -808,6 +831,8 @@ class MediaNotificationListenerService : NotificationListenerService() {
         private fun handleCallRemoved(key: String) {
             if (key != callNotifKey) return
             callNotifKey = null
+            val wasOngoing = callNotifOngoing
+            callNotifOngoing = false
             val cur = VortexService.currentCall ?: return
             if (cur.phase == com.vortex.a3.core.call.CallEvent.PHASE_ENDED) return
             // A vanished notification is a HINT that the call ended, not proof.
@@ -823,14 +848,101 @@ class MediaNotificationListenerService : NotificationListenerService() {
             //
             // Telephony knows the truth, and READ_PHONE_STATE is already
             // required for the call mirror to work at all.
-            if (telephonyBusy()) {
-                Log.i(TAG, "dialer notification removed but telephony is still busy — not ending")
+            if (!telephonyBusy()) {
+                emitEnded(cur, "dialer call notification removed")
                 return
             }
+            // Telephony has not caught up yet. That is the COMMON case for a
+            // hang-up, not an oddity: the dialer cancels its notification as
+            // soon as the red button is tapped, while `CALL_STATE_IDLE` waits
+            // for the teardown. Discarding the signal here (what we used to do)
+            // meant the end reached the laptop only when the TelephonyCallback
+            // fired, and the mirrored timer ticked on for another beat or two.
+            //
+            // So chase it — but only for a notification that was ONGOING, and
+            // only for a bounded window, so the cases the discard existed to
+            // protect (a missed-call card swiped away, MIUI cancelling the
+            // ringing notification on answer, a call-waiting reshuffle) still
+            // cannot end a live call.
+            if (!wasOngoing) {
+                Log.i(TAG, "a non-ongoing dialer notification went away — not an end")
+                return
+            }
+            Log.i(TAG, "dialer notification removed, telephony still busy — chasing the end")
+            scheduleEndRecheck(cur, 0L)
+        }
+
+        /** Poll telephony every [END_RECHECK_STEP_MS] until it agrees the call
+         *  is over, the dialer posts a replacement notification (so the call is
+         *  alive and was only reshuffled), or [END_RECHECK_MAX_MS] elapses. */
+        private fun scheduleEndRecheck(cur: com.vortex.a3.core.call.CallEvent, waitedMs: Long) {
+            val h = instance?.liveHeartbeatHandler ?: return
+            h.postDelayed({
+                val now = VortexService.currentCall
+                if (now == null || now.id != cur.id ||
+                    now.phase == com.vortex.a3.core.call.CallEvent.PHASE_ENDED
+                ) {
+                    return@postDelayed // ended by another path, or a new call
+                }
+                // Replaced, not removed: the dialer swapped its notification
+                // (MIUI does this on answer, and on a call-waiting swap). Re-adopt
+                // it and stop chasing — the call is still up.
+                //
+                // Reading the active notifications is a binder round-trip, so it
+                // runs on the first tick and then only every 500 ms; telephony's
+                // own state, which is what we are really waiting on, is a local
+                // read and is checked on every one.
+                val replacement = if (waitedMs % 500L == 0L) {
+                    try {
+                        instance?.activeNotifications?.firstOrNull { isCallNotification(it) }
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "active notifications unreadable: ${t.message}")
+                        null
+                    }
+                } else {
+                    null
+                }
+                if (replacement != null) {
+                    trackCallNotification(replacement)
+                    Log.i(TAG, "dialer reposted its call notification — not an end")
+                    return@postDelayed
+                }
+                if (!telephonyBusy()) {
+                    emitEnded(now, "dialer notification gone and telephony idle")
+                    return@postDelayed
+                }
+                val waited = waitedMs + END_RECHECK_STEP_MS
+                if (waited >= END_RECHECK_MAX_MS) {
+                    Log.i(
+                        TAG,
+                        "call notification gone but telephony stayed busy for ${END_RECHECK_MAX_MS}ms " +
+                            "— leaving the call up",
+                    )
+                    return@postDelayed
+                }
+                scheduleEndRecheck(cur, waited)
+            }, END_RECHECK_STEP_MS)
+        }
+
+        /** Publish the end on every path at once: the CALL frame (BLE), the
+         *  AppState snapshot (BLE + LAN backstop), and an immediate push so
+         *  neither waits for the next heartbeat. */
+        private fun emitEnded(cur: com.vortex.a3.core.call.CallEvent, why: String) {
             val ended = cur.copy(phase = com.vortex.a3.core.call.CallEvent.PHASE_ENDED)
-            VortexService.currentCall = null
+            // Keep the EXPLICIT ended in the AppState snapshot briefly rather
+            // than clearing it, so the laptop reads an end instead of inferring
+            // one from `call == null` (which it debounces). Mirrors what the
+            // orchestrator's own end path does.
+            VortexService.currentCall = ended
             VortexService.callEventBus.tryEmit(ended)
-            Log.i(TAG, "dialer call notification removed → END")
+            VortexService.appStateNudge?.invoke()
+            val h = instance?.liveHeartbeatHandler
+            h?.postDelayed({
+                if (VortexService.currentCall?.phase == com.vortex.a3.core.call.CallEvent.PHASE_ENDED) {
+                    VortexService.currentCall = null
+                }
+            }, 6000)
+            Log.i(TAG, "$why → END")
         }
 
         /** Is a call still up according to the telephony stack?

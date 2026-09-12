@@ -288,13 +288,44 @@ pub(crate) fn laptop_on_headset_call() -> bool {
 }
 
 /// Keep [`laptop_on_headset_call`] current for the saved earbuds.
-pub(crate) fn spawn_headset_call_watch(mac: String) {
+///
+/// The 2 s cadence is not negotiable — the acceptance gate reads this flag
+/// synchronously on the frame path, and a call that starts between two ticks is
+/// a call the phone could take the microphone out of. What IS negotiable is
+/// what each tick costs.
+///
+/// `headset_mic_in_use` opens with `pactl list cards`, a subprocess fork and a
+/// multi-kilobyte parse. Unconditionally, every two seconds, for the entire life
+/// of the app: ~43,000 forks a day on a laptop, for a question that can only be
+/// "yes" while the earbuds are connected to this machine — which, for a
+/// phone-centric user, is most of the time false. The rest of this codebase
+/// already refuses to fork `pactl` on a hot path (see `audio_sink_cache`, built
+/// for exactly this); this watcher was the one that still did.
+///
+/// So the tick opens with BlueZ's own `Connected` property, a cached D-Bus read
+/// with no process behind it. Deliberately that and not `audio_active`: this
+/// gate may only ever be weaker than the question it guards, and "connected at
+/// all" cannot be false while a call is running through these buds here,
+/// whereas "has a live A2DP sink" could be during an HFP switch.
+pub(crate) fn spawn_headset_call_watch(adapter: bluer::Adapter, mac: String) {
     tokio::spawn(async move {
+        let Ok(addr) = mac.parse::<bluer::Address>() else { return };
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
         let mut last = false;
         loop {
             tick.tick().await;
-            let now = vortex_l3_daemon::core::audio_switch::headset_mic_in_use(&mac).await;
+            let connected = match adapter.device(addr) {
+                Ok(d) => d.is_connected().await.unwrap_or(false),
+                Err(_) => false,
+            };
+            // Not here → no call through them here. Said explicitly rather than
+            // left at the previous value, so unplugging mid-call releases the
+            // gate instead of latching it.
+            let now = if connected {
+                vortex_l3_daemon::core::audio_switch::headset_mic_in_use(&mac).await
+            } else {
+                false
+            };
             if now != last {
                 tracing::info!(on_call = now, "laptop headset-call state changed");
                 last = now;
@@ -427,7 +458,7 @@ pub(crate) async fn setup_audio(
     // Keep the "am I on a call through these earbuds" flag fresh for the
     // acceptance gate above.
     if let Some(saved) = get_saved_earbuds() {
-        spawn_headset_call_watch(saved.address.clone());
+        spawn_headset_call_watch(adapter.clone(), saved.address.clone());
         spawn_a2dp_profile_watch(adapter.clone(), saved.address.clone());
     }
 

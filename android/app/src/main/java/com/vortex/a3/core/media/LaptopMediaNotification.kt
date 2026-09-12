@@ -22,6 +22,7 @@ import com.vortex.a3.core.call.CallControl
 import com.vortex.a3.service.VortexService
 import java.net.HttpURLConnection
 import java.net.URL
+import com.vortex.a3.core.registerInternalReceiver
 
 /**
  * The LAPTOP's now-playing on this phone: a MediaStyle notification (system
@@ -384,13 +385,7 @@ object LaptopMediaNotification {
                     }
                 }
             }
-            val filter = IntentFilter(ACTION_MEDIA)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                ctx.registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                @Suppress("UnspecifiedRegisterReceiverFlag")
-                ctx.registerReceiver(r, filter)
-            }
+            ctx.registerInternalReceiver(r, IntentFilter(ACTION_MEDIA))
             receiverRegistered = true
         }
     }

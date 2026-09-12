@@ -13,9 +13,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-static PAYLOAD: Mutex<Option<String>> = Mutex::new(None);
+/// The text to hand over, and when it was queued (for [`PAYLOAD_TTL`]).
+static PAYLOAD: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Longest thing worth sending this way. A URL or a short snippet is the point;
@@ -23,9 +24,38 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// which handle size properly. Also bounds what a heartbeat has to carry.
 const MAX_LEN: usize = 2048;
 
+/// How long the text stays in the outgoing snapshot.
+///
+/// Like a Share, this is an EVENT carried on a snapshot the laptop re-sends on
+/// every heartbeat, and the phone acts on the rising edge of `seq` alone. So
+/// once the phone has had several beats to see it there is nothing left to
+/// deliver — and up to 2 KB of dead text was riding every BLE beat for the rest
+/// of the process, fragmenting an AppState that otherwise fits one notify.
+///
+/// The seq is deliberately NOT rewound: the phone keeps advancing past it and
+/// ignores a snapshot whose text is empty, so clearing costs nothing and a
+/// later send still reads as new. Long enough that a phone reachable only over
+/// LAN, or one that was briefly out of range, still gets several beats.
+const PAYLOAD_TTL: Duration = Duration::from_secs(120);
+
 /// Read by the outgoing AppState builders (BLE + LAN).
+///
+/// Expiry happens HERE, on read, rather than on a timer: `send` is called from
+/// the tray menu and the `--share` entry point as well as a Tauri command, and
+/// only some of those run inside a tokio runtime. A lazy check needs no
+/// runtime and cannot be missed.
 pub fn pending() -> (Option<String>, u64) {
-    let text = PAYLOAD.lock().ok().and_then(|g| g.clone());
+    let mut text = None;
+    if let Ok(mut g) = PAYLOAD.lock() {
+        match g.as_ref() {
+            Some((_, at)) if at.elapsed() >= PAYLOAD_TTL => {
+                *g = None;
+                tracing::info!("send-to-phone: delivery window closed, snapshot cleared");
+            }
+            Some((t, _)) => text = Some(t.clone()),
+            None => {}
+        }
+    }
     (text, SEQ.load(Ordering::SeqCst))
 }
 
@@ -51,7 +81,7 @@ pub fn send(text: &str) -> Result<(), String> {
         .map(|prev| now_ms.max(prev + 1))
         .unwrap_or(now_ms);
     if let Ok(mut g) = PAYLOAD.lock() {
-        *g = Some(text.to_string());
+        *g = Some((text.to_string(), Instant::now()));
     }
     // Both transports, and now rather than on the next beat: the user is
     // reaching for the phone as they click.
