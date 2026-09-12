@@ -397,7 +397,23 @@ This is where these features usually fail, and it is all daemon-side:
      without a round trip.
 
    **The Windows half has never run.** There is no Windows machine in this
-   project's loop, so ProjFS is verified only as far as a cross-compile reaches:
+   project's loop, so ProjFS is verified only as far as a cross-compile reaches.
+   A whole binary does cross-build from Linux, which is further than a check:
+
+   ```text
+   cd linux/ui-tauri && npm run build          # the embedded frontend
+   cd src-tauri && cargo build --release \
+       --target x86_64-pc-windows-gnu \
+       --features custom-protocol --bin vortex-ui-tauri
+   ```
+
+   needing only mingw-w64 (`-gnu`, not `-msvc`: an MSVC cross-link wants
+   `lib.exe`). The result imports all eleven `Prj*` entry points from
+   `projectedfslib.dll`, which is the strongest check available here that the
+   FFI is wired correctly rather than merely type-correct. Ship
+   `WebView2Loader.dll` beside it — it is a dynamic import, and the app will
+   not start without it.
+
    `cargo check --all-targets --target x86_64-pc-windows-gnu` is clean, which
    type-checks every callback signature, struct layout and constant against the
    real Win32 metadata — and nothing about behaviour. What that cannot catch is
@@ -459,6 +475,17 @@ listener — worth doing, and the natural companion to step 3.
 
 ## 9. Open questions
 
+- **ProjFS is imported at load time, and that is wrong for shipping.** The
+  eleven `Prj*` calls are ordinary static imports, so if `projectedfslib.dll`
+  is absent — possible on a machine where the optional feature has never been
+  enabled — Windows refuses to start the *whole app*, with a missing-DLL error
+  rather than the mount politely declining. A user who never wanted to browse
+  their phone's files would lose notifications, clipboard and calls with it.
+  The fix is to reach ProjFS through `LoadLibrary`/`GetProcAddress` instead,
+  which costs the compiler-checked signatures the `windows` crate currently
+  gives us — a bad trade while nothing has run, a necessary one before release.
+  (Delay-loading is not the answer on its own: a delay-load failure raises a
+  structured exception, so it needs a failure hook to become an error.)
 - ~~**Windows `FileSizeLimitInBytes`:** ship a registry tweak in the installer,
   document it, or skip straight to ProjFS?~~ **Answered: straight to ProjFS**,
   so the limit never applies. What replaces it as a Windows deployment question
