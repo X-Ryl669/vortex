@@ -437,6 +437,9 @@ fn ensure_injector_health() {
     crate::mirror_inject::spawn_health_check(|| RUNNING.load(Ordering::SeqCst));
 }
 
+/// Linux-only: the fallback it registers is a BlueZ HID profile over D-Bus.
+/// Elsewhere Universal Control rides the adb transport, which needs none of it.
+#[cfg(target_os = "linux")]
 pub(crate) fn ensure_bt_hid() {
     if BT_HID_INIT.swap(true, Ordering::SeqCst) {
         return;
@@ -465,6 +468,8 @@ static HOGP_INIT: AtomicBool = AtomicBool::new(false);
 /// peripheral announcing itself as a mouse; leaving that up permanently would
 /// put the laptop on every nearby scanner's list for a feature the user is not
 /// using. `uc_stop` withdraws it.
+/// Linux-only: HID-over-GATT means a BlueZ GATT server.
+#[cfg(target_os = "linux")]
 pub(crate) fn ensure_hogp() {
     if HOGP_INIT.swap(true, Ordering::SeqCst) {
         return;
@@ -506,7 +511,9 @@ pub(crate) fn stop_hogp() {
     if !HOGP_INIT.swap(false, Ordering::SeqCst) {
         return;
     }
+    #[cfg(target_os = "linux")]
     let Some(server) = crate::mirror_inject::get_hogp() else { return };
+    #[cfg(target_os = "linux")]
     tauri::async_runtime::spawn(async move {
         server.stop().await;
     });

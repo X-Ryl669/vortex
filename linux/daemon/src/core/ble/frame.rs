@@ -212,7 +212,12 @@ pub mod ty {
     /// Additive by design: both sides log-and-ignore an unknown frame type, so
     /// a peer without this build is unaffected. Mirrors Kotlin
     /// `FrameType.PEER_HANDOFF`.
-    pub const PEER_HANDOFF: u8 = 0x4F;
+    // 0x54, not 0x4F: upstream took 0x4F for PHONE_FILES while this was on a
+    // branch, and two meanings for one type byte is a protocol that cannot be
+    // read. This one moved because it is the one that has never shipped —
+    // nothing but these two repositories has ever sent it. Sits just past the
+    // FS block below, keeping this branch's additions contiguous.
+    pub const PEER_HANDOFF: u8 = 0x54;
     /// Ranged-filesystem request. `sub` carries the op (`core::fs_proto::op`),
     /// the payload a JSON request — plus a binary byte tail for `WRITE`.
     ///

@@ -1004,7 +1004,6 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             adv.startPresenceLoop(
                 scope = scope,
                 rotationWindowSec = 60L,
-                isConnected = { gattServer?.hasActiveConnection() == true },
                 onError = { reason -> Log.w(TAG, "presence adv error: $reason") },
             )
             Log.i(TAG, "presence loop started (have ${peerStore.list().size} peer(s))")

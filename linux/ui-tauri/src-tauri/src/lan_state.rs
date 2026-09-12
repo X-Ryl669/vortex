@@ -74,6 +74,9 @@ pub(crate) fn dispatch_lock_command(state: &vortex_l3_daemon::core::appstate::Ap
                 tracing::warn!(%cmd, seq, "remote lock command failed: {e}");
                 // The phone's unlock button hits the same polkit gate as
                 // proximity unlock; tell the user rather than dropping it.
+                // polkit is a Linux notion; elsewhere a failed unlock has no
+                // "denied by policy" case to distinguish.
+                #[cfg(target_os = "linux")]
                 if vortex_l3_daemon::core::session_lock::is_unlock_denied(&e) {
                     crate::proximity::warn_unlock_denied_once().await;
                 }

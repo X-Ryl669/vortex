@@ -158,7 +158,9 @@ object FrameType {
      *  the AEAD payload an optional UTF-8 successor name for the UI.
      *  Additive: both sides log-and-ignore unknown frame types, so a peer
      *  without this build is unaffected. Mirrors Rust `ty::PEER_HANDOFF`. */
-    const val PEER_HANDOFF: Byte = 0x4F
+    // 0x54, not 0x4F — see the note on the Rust side: upstream took 0x4F for
+    // PHONE_FILES, and PEER_HANDOFF is the one that has never shipped.
+    const val PEER_HANDOFF: Byte = 0x54
     /** Ranged-filesystem request. `sub` carries the op
      *  ([com.vortex.a3.core.fs.FsOp]), the payload a JSON request — plus a
      *  binary byte tail for WRITE.

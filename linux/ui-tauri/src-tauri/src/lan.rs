@@ -59,6 +59,7 @@ const CLAIM_DEFER_TIMEOUT: Duration = Duration::from_secs(20);
 /// Resolve once the orchestrator is no longer mid-flow. `Failed` counts as
 /// settled — the flow is over either way, and only `Idle`-watching is what
 /// let a failed switch pin a pending claim open.
+#[cfg(target_os = "linux")]
 async fn wait_for_settled(
     mut rx: tokio::sync::watch::Receiver<
         vortex_l3_daemon::core::audio_orchestrator::SwitchState,

@@ -138,7 +138,7 @@ pub(crate) async fn notify_received(path: PathBuf, kind: &str) {
         ("fc:copy".to_string(), "Copy".to_string()),
         ("fc:open".to_string(), "Open".to_string()),
     ];
-    match notification_display::show_call_banner(title, &body, "vortex", &actions, 0, false).await {
+    match crate::notify::show_banner(title, &body, "vortex", &actions, 0, true).await {
         Ok(id) => {
             if let Ok(mut g) = RECEIVED.lock() {
                 g.push((id, path));
@@ -192,7 +192,7 @@ async fn act_on_received(id: u32, key: &str) {
         }
         _ => {}
     }
-    let _ = notification_display::close(id).await;
+    let _ = crate::notify::close(id).await;
 }
 
 fn fmt_bytes(n: u64) -> String {

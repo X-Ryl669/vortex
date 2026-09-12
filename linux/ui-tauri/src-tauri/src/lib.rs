@@ -133,6 +133,11 @@ mod proximity;
 mod ring;
 mod sms;
 mod tray;
+// The two tray implementations behind it — see `tray.rs` for why there are two.
+#[cfg(target_os = "linux")]
+mod tray_ksni;
+#[cfg(not(target_os = "linux"))]
+mod tray_tauri;
 mod universal_control;
 #[cfg(target_os = "linux")]
 mod virtual_display;
@@ -552,6 +557,7 @@ pub fn run() {
             // Universal Control is the one switch that used to forget itself: it
             // lives entirely in this process, so a reboot or a quit left the edge
             // unarmed with the switch showing off. Put it back the way it was.
+            #[cfg(target_os = "linux")]
             universal_control::ensure_bt_hid();
             // Per-user setup a package cannot do for us (autostart entry,
             // enabling the GNOME extension). Idempotent, so it also repairs an
@@ -686,6 +692,7 @@ pub fn run() {
                 // — leaving the phone believing a peer is still attached, and
                 // the next run scanning for an advertisement it will therefore
                 // never send.
+                #[cfg(target_os = "linux")]
                 crate::ble::shutdown_link_blocking();
             }
         });

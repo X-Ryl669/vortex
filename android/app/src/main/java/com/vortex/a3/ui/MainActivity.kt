@@ -343,20 +343,6 @@ class MainActivity : ComponentActivity() {
     /** The folder picker behind "let the laptop browse a folder". The grant is
      *  persisted on the way back so it survives a restart; a cancelled pick
      *  returns null and simply changes nothing. */
-    private val folderPickLauncher = registerForActivityResult(
-        ActivityResultContracts.OpenDocumentTree(),
-    ) { uri ->
-        if (uri != null) com.vortex.a3.core.files.PhoneFiles.persistGrant(this, uri)
-    }
-
-    internal fun pickSharedFolder() {
-        try {
-            folderPickLauncher.launch(null)
-        } catch (e: Exception) {
-            android.util.Log.w("PhoneFiles", "no folder picker available: ${e.message}")
-        }
-    }
-
     internal fun requestMediaPermission() {
         val missing = com.vortex.a3.core.media.mediaReadPermissions().filter {
             androidx.core.content.ContextCompat.checkSelfPermission(this, it) !=

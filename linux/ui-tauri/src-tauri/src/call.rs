@@ -503,7 +503,7 @@ pub(crate) async fn spawn_consumer(
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tick.tick().await;
-                if crate::ble::peer_contact_age_ms() <= BANNER_STALE_MS {
+                if crate::presence::peer_contact_age_ms() <= BANNER_STALE_MS {
                     continue;
                 }
                 let id = {
@@ -521,7 +521,7 @@ pub(crate) async fn spawn_consumer(
                          its buttons could not have worked",
                         BANNER_STALE_MS / 1000
                     );
-                    let _ = notification_display::close(id).await;
+                    let _ = crate::notify::close(id).await;
                 }
             }
         });
@@ -790,7 +790,7 @@ pub(crate) async fn spawn_consumer(
                                 if tick_gen2.load(Ordering::SeqCst) != my_gen {
                                     break; // call ended / re-answered → stop
                                 }
-                                if crate::ble::peer_contact_age_ms() > CONTACT_LOST_MS {
+                                if crate::presence::peer_contact_age_ms() > CONTACT_LOST_MS {
                                     tracing::info!(
                                         "call pill keep-alive: no contact with the phone for over {}s \
                                          — letting the pill expire",

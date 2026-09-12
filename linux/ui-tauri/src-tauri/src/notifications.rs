@@ -411,6 +411,9 @@ pub(crate) fn spawn_subsystem(
                 tokio::spawn(async move {
                     // Take down anything a previous run left on screen before
                     // we post anything new — see `sweep_stale`.
+                    // Survivors of a previous run are a freedesktop notion —
+                    // a toast has no persistent server holding one.
+                    #[cfg(target_os = "linux")]
                     vortex_l3_daemon::core::notification_display::sweep_stale().await;
                     while let Some(notif) = ble_notif_rx.recv().await {
                         // Laptop-internal nudge (a BLE frame dropped, or we
@@ -561,7 +564,9 @@ pub(crate) fn spawn_subsystem(
                                 // detached so they outlive us, and only this
                                 // record lets a later run take down survivors
                                 // whose action mappings died with the process.
+                                #[cfg(target_os = "linux")]
                                 vortex_l3_daemon::core::notification_display::remember_live_id(id);
+                                #[cfg(target_os = "linux")]
                                 if replaces_id != 0 && replaces_id != id {
                                     vortex_l3_daemon::core::notification_display::forget_live_id(
                                         replaces_id,

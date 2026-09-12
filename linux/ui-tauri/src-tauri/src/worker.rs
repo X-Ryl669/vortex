@@ -179,6 +179,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
     // teardown BlueZ keeps the GATT connection, the phone goes on believing a
     // peer is attached and stops advertising discoverably, and the next login's
     // instance scans for something it will never see.
+    #[cfg(target_os = "linux")]
     rt.spawn(async {
         use tokio::signal::unix::{signal, SignalKind};
         let (Ok(mut term), Ok(mut int)) = (
@@ -786,7 +787,10 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                         Ok(g) => g,
                         Err(_) => continue,
                     };
+                    #[cfg(target_os = "linux")]
                     let ble_live = !auto_ble_writers.lock().await.is_empty();
+                    #[cfg(not(target_os = "linux"))]
+                    let ble_live = crate::ble_portable::link_is_up();
                     // Cooldown: mdns-sd re-resolves the service every few
                     // seconds even while we're already connected, so this
                     // gate — not the resolve rate — is what decides how

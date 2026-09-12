@@ -7,11 +7,13 @@ pub mod audio_lan_session;
 pub mod audio_op;
 #[cfg(target_os = "linux")]
 pub mod audio_orchestrator;
+#[cfg(target_os = "linux")]
 pub mod audio_route;
 pub mod audio_sink_cache;
 #[cfg(target_os = "linux")]
 pub mod audio_switch;
 pub mod audio_switch_persistence;
+#[cfg(target_os = "linux")]
 pub mod hogp;
 #[cfg(target_os = "linux")]
 pub mod media_runtime;
@@ -58,4 +60,5 @@ pub mod platform;
 pub mod session_lock;
 pub mod status;
 pub mod storage;
+#[cfg(target_os = "linux")]
 pub mod bt_hid;

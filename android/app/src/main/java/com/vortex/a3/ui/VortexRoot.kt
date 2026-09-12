@@ -171,9 +171,7 @@ fun VortexRoot(
                 // Re-read whenever the settings screen is shown: the picker is
                 // a separate activity, so a grant taken there lands while this
                 // composition is away.
-                val sharedFolderCount = remember(showSettings) {
-                    com.vortex.a3.core.files.PhoneFiles.grantedTrees(activity).size
-                }
+
                 // Re-checked each time Settings opens AND after either toggle
                 // moves: the flip that turns a row on is what asks for the
                 // grant, and the hint should follow the answer.
@@ -266,8 +264,6 @@ fun VortexRoot(
                         onPickSharedFolder = actions.onPickSharedFolder,
                         screenControlOn = screenControlOn,
                         onScreenControlClick = actions.onOpenScreenControl,
-                        sharedFolderCount = sharedFolderCount,
-                        onSharedFoldersClick = actions.onPickSharedFolder,
                         allFilesOn = allFilesOn,
                         onAllFilesClick = actions.onOpenAllFilesAccess,
                         onBack = { showSettings = false },

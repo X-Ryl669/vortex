@@ -97,7 +97,11 @@ static SMART_SWITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 // ── Continuity camera (GStreamer) ─────────────────────────────────────────
 
 #[tauri::command]
-pub(crate) fn set_camera_request(_on: bool) {}
+/// Answers with the same error the other stubs do, now that the Linux side is
+/// fallible: a caller that logs the reason gets one instead of silent success.
+pub(crate) fn set_camera_request(_on: bool) -> Result<(), String> {
+    Err(UNSUPPORTED.to_string())
+}
 
 #[tauri::command]
 pub(crate) fn set_camera_facing(_facing: String) {}

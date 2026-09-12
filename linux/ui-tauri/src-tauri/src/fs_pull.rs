@@ -32,8 +32,8 @@ pub(crate) fn spawn() {
     tokio::spawn(async move {
         loop {
             notify.notified().await;
-            while let Some((token, name, _mime, id)) = pop_front() {
-                pull_one(&token, &name, id).await;
+            while let Some((token, name, _mime, id, kind)) = pop_front() {
+                pull_one(&token, &name, id, &kind).await;
             }
         }
     });
@@ -71,13 +71,16 @@ fn clear_in_flight(token: &str) {
     }
 }
 
-fn pop_front() -> Option<(String, String, String, u64)> {
+/// `(token, name, mime, id, kind)`. `kind` is what the phone called this file —
+/// a capture it sent by itself, or something a person shared — and it decides
+/// which folder it lands in, so it has to survive the move to ranged reads.
+fn pop_front() -> Option<(String, String, String, u64, String)> {
     crate::PENDING_FILE_OFFERS
         .get()
         .and_then(|m| m.lock().ok().and_then(|mut g| g.pop_front()))
 }
 
-async fn pull_one(token: &str, name: &str, id: u64) {
+async fn pull_one(token: &str, name: &str, id: u64, kind: &str) {
     mark_in_flight(token);
     // Sanitise to a single path component. The name comes from the phone, and
     // a `../` in it would otherwise choose where on this laptop the file lands.
@@ -86,7 +89,13 @@ async fn pull_one(token: &str, name: &str, id: u64) {
         .map(|s| s.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "vortex-file".to_string());
-    let Some(dir) = crate::clipboard_sync::downloads_dir() else {
+    // Captures (the phone sent it by itself) go under the picture folder, and
+    // anything a person shared under downloads — `receive_root` is the single
+    // owner of that rule, and the bulk path this replaces used it too.
+    let subdir = vortex_l3_daemon::core::clipboard_mirror::subdir_for_kind(kind);
+    let Some(dir) = crate::clipboard_sync::receive_root(subdir)
+        .map(|d| crate::clipboard_sync::receive_dir(&d, subdir))
+    else {
         tracing::warn!("file pull: no HOME — dropped");
         crate::transfers::fail(id);
         return;

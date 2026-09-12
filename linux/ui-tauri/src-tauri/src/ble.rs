@@ -27,6 +27,94 @@ use crate::NotifWriter;
 /// a wedged controller.
 const CONNECT_WEDGE_THRESHOLD: u32 = 6;
 
+/// The RPA of the BLE session that is live right now, so the app can hand the
+/// link back on its way out. `None` between sessions.
+///
+/// Everything else about teardown was already handled — the loop disconnects
+/// and forgets the device whenever the listener returns. What was missing is
+/// that a PROCESS EXIT never reaches that code: the loop dies with the process
+/// and BlueZ, which owns the connection independently of us, keeps it open.
+/// The phone's GATT server therefore still sees a connected peer, holds its
+/// RPA and stops advertising in a way a scan can find — so the freshly started
+/// app scans, backs off 15s → 60s, and never reconnects. Measured on this
+/// machine: BLE dead for six minutes after a restart, with LAN quietly
+/// covering for it. Clearing the entry by hand and letting it reconnect took
+/// eleven seconds.
+static SESSION_ADDR: std::sync::Mutex<Option<bluer::Address>> =
+    std::sync::Mutex::new(None);
+
+fn note_session_addr(addr: Option<bluer::Address>) {
+    if let Ok(mut g) = SESSION_ADDR.lock() {
+        *g = addr;
+    }
+}
+
+/// Hand the BLE link back before the process goes away.
+///
+/// Synchronous and hard-bounded, because it runs from Tauri's `RunEvent::Exit`
+/// on the main thread: an exit that hangs on D-Bus is worse than one that
+/// leaves a stale entry. Its own runtime rather than the worker's, which may
+/// already be shutting down by the time this runs.
+pub(crate) fn shutdown_link_blocking() {
+    let Some(addr) = SESSION_ADDR.lock().ok().and_then(|g| *g) else {
+        return; // no live session — nothing to hand back
+    };
+    tracing::info!(%addr, "shutting down — dropping the BLE link so the phone re-advertises");
+    let worker = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok(session) = bluer::Session::new().await else { return };
+            let Ok(adapter) = session.default_adapter().await else { return };
+            // Disconnect is the half the PHONE sees: it ends the GATT link, so
+            // the phone stops holding its RPA and advertises again.
+            if let Ok(dev) = adapter.device(addr) {
+                let _ = tokio::time::timeout(Duration::from_millis(1200), dev.disconnect()).await;
+            }
+            // Removing the entry is the half WE need: it drops the cached
+            // advertisement so the next run's discovery cannot re-serve this
+            // dead RPA — the same reason `forget_stale_device` exists.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(1200), adapter.remove_device(addr)).await;
+        });
+    });
+    let _ = worker.join();
+    note_session_addr(None);
+}
+
+
+/// Does a failed STATE write mean the LINK is gone, or only that the ATT
+/// bearer was busy?
+///
+/// The distinction decides whether we tear the session down, so it has to be
+/// conservative in the safe direction: anything we do not recognise is treated
+/// as busy and the link is kept. A link that is really dead costs us nothing
+/// to keep believing in for a few more beats — `run_listener` returns on a real
+/// disconnect and tears the session down anyway — whereas killing a live link
+/// costs a full scan, IK handshake, resubscribe and bulk re-push.
+///
+/// Matched on substrings because these arrive as D-Bus error text from BlueZ,
+/// not as typed variants.
+fn state_write_means_link_gone(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    // BlueZ says the device, the characteristic, or the D-Bus object is gone.
+    e.contains("not connected")
+        || e.contains("notconnected")
+        || e.contains("does not exist")
+        || e.contains("doesnotexist")
+        || e.contains("unknown object")
+        || e.contains("unknownobject")
+        || e.contains("no such device")
+        || e.contains("object removed")
+        // zbus's wording for UnknownObject, seen live as "the target object was
+        // either not present or removed". Missing it kept a genuinely dead link
+        // "alive" for 40 beats of pointless retries instead of reconnecting.
+        || e.contains("not present or removed")
+        || e.contains("disconnected")
+}
+
+
 /// Last BLE address we completed a Noise IK exchange with, per peer.
 ///
 /// Recorded only *after* IK succeeds, so the address is positively tied to
@@ -1306,8 +1394,8 @@ pub(crate) async fn run_ble_persistent_loop(
                                 // duration: the proximity watcher read the phone
                                 // as having left, and the mirror pills were swept
                                 // while the phone sat right there.
-                                touch_presence();
-                                touch_peer_contact();
+                                crate::presence::touch_presence();
+                                crate::presence::touch_peer_contact();
                                 // Back off hard rather than hammering: each retry
                                 // re-seals the frame and therefore burns a Noise
                                 // nonce whether or not the bytes ever leave, and

@@ -467,7 +467,7 @@ pub(crate) fn spawn_proximity_watch(
                         // The phone answering on the LAN is presence too. The
                         // window matches the pill sweeper's "we are in contact"
                         // threshold.
-                        peer_contact_fresh: crate::ble::peer_contact_age_ms() < AWAY_GRACE_MS,
+                        peer_contact_fresh: crate::presence::peer_contact_age_ms() < AWAY_GRACE_MS,
                         // Only costs a D-Bus round-trip when a lock is possible.
                         media_active: auto_lock_on
                             && vortex_l3_daemon::core::media_runtime::any_player_playing().await,
