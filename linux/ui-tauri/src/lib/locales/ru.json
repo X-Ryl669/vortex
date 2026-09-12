@@ -291,6 +291,7 @@
       "distro": "Система",
       "desktop": "Рабочий стол",
       "bluetooth": "Bluetooth",
+      "bluetooth_discovery": "Поиск по Bluetooth",
       "paired": "Связанный телефон",
       "adb": "adb (функции экрана)",
       "injector": "Передача курсора",

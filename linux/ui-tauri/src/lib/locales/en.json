@@ -291,6 +291,7 @@
       "distro": "System",
       "desktop": "Desktop",
       "bluetooth": "Bluetooth",
+      "bluetooth_discovery": "Bluetooth scanning",
       "paired": "Paired phone",
       "adb": "adb (screen features)",
       "injector": "Cursor sharing",

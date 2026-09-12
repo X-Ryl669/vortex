@@ -83,9 +83,11 @@ fn spawn_video_sender(
     phone_ip: std::net::IpAddr,
     key: [u8; 32],
     au_rx: mpsc::Receiver<Vec<u8>>,
+    input_key: [u8; 32],
+    on_input: Option<mpsc::Sender<mirror_tcp::InputEvent>>,
 ) {
     tokio::spawn(async move {
-        mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx).await;
+        mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx, input_key, on_input).await;
         // On the normal stop path `stop()` has already taken CAST, so this is
         // only reached with a live handle when the transport gave up by itself.
         if CAST.lock().map(|g| g.is_some()).unwrap_or(false) {
@@ -393,7 +395,12 @@ async fn start_portal(
     );
 
     // Push the sealed stream to the phone (we dial it — the phone is the server).
-    spawn_video_sender(phone_ip, key, au_rx);
+    //
+    // No input return channel on this path: it mirrors an EXISTING monitor, and
+    // Mutter's absolute pointer notify is addressed at a ScreenCast stream that
+    // belongs to a remote-desktop session. Only the extend path has one. Making
+    // a real screen touch-drivable is a separate decision, not a side effect.
+    spawn_video_sender(phone_ip, key, au_rx, [0u8; 32], None);
 
     pipeline
         .set_state(gst::State::Playing)
@@ -487,6 +494,10 @@ async fn start_portal(
 const EXTEND_W: u32 = 1560;
 const EXTEND_H: u32 = 720;
 
+/// evdev BTN_LEFT. Mutter's `NotifyPointerButton` takes the evdev code, not an
+/// index — passing 0 there silently does nothing.
+const BTN_LEFT: i32 = 0x110;
+
 /// Cast a NEW monitor to the phone (see [`crate::virtual_display`]).
 ///
 /// Differs from the mirror path in two ways only: the frames come from a
@@ -495,7 +506,10 @@ const EXTEND_H: u32 = 720;
 /// scalable in between, the size would not propagate back and Mutter would pick
 /// the monitor's resolution itself.
 async fn start_extend(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), String> {
-    let monitor = crate::virtual_display::create().await?;
+    // Shared: the input consumer below drives it, and the teardown task at the
+    // end of this function stops it. One owner would mean one of them cannot
+    // have it.
+    let monitor = std::sync::Arc::new(crate::virtual_display::create().await?);
     let node_id = monitor.node_id;
 
     if let Err(e) = gst::init() {
@@ -556,7 +570,45 @@ async fn start_extend(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), S
             .build(),
     );
 
-    spawn_video_sender(phone_ip, key, au_rx);
+    // The second screen accepts input. `monitor` owns the paired
+    // remote-desktop session, so it is what turns a packet into a real event —
+    // and it must outlive the consumer, which is why the consumer owns it.
+    let (input_tx, mut input_rx) = mpsc::channel::<mirror_tcp::InputEvent>(64);
+    let input_key = vortex_l3_daemon::core::mirror_udp::derive_laptop_input_key(&key);
+    spawn_video_sender(phone_ip, key, au_rx, input_key, Some(input_tx));
+    let input_monitor = monitor.clone();
+    tokio::spawn(async move {
+        let monitor = input_monitor;
+        // Coordinates arrive normalised to 0..65535 of the phone's view, so the
+        // phone needs to know nothing about the monitor's real size — and the
+        // size can change under us without the phone caring.
+        let (w, h) = (f64::from(EXTEND_W), f64::from(EXTEND_H));
+        let to_px = |v: u16, span: f64| f64::from(v) / 65535.0 * (span - 1.0);
+        let mut logged = false;
+        while let Some(ev) = input_rx.recv().await {
+            let (x, y) = (to_px(ev.x, w), to_px(ev.y, h));
+            if !logged {
+                logged = true;
+                tracing::info!(kind = ev.kind, x, y, "laptop-cast: first input event applied");
+            }
+            match ev.kind {
+                // A touch is a press at a point: move first, then press, or the
+                // click lands wherever the pointer happened to be.
+                0 => {
+                    monitor.pointer_to(x, y).await;
+                    monitor.pointer_button(BTN_LEFT, true).await;
+                }
+                1 => monitor.pointer_to(x, y).await,
+                2 => {
+                    monitor.pointer_to(x, y).await;
+                    monitor.pointer_button(BTN_LEFT, false).await;
+                }
+                _ => {}
+            }
+        }
+        // The channel closing just means the cast ended; the teardown task
+        // owns removing the monitor, so nothing to do here but stop reading.
+    });
     pipeline
         .set_state(gst::State::Playing)
         .map_err(|e| format!("pipeline play: {e}"))?;

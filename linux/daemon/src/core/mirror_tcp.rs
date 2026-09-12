@@ -188,6 +188,48 @@ pub async fn run_tcp_video_receiver_on(
 // client and opens with `mirror_udp::derive_laptop_media_key`.
 // ===========================================================================
 
+/// Opens sealed INPUT frames coming back from the phone on the laptop-cast
+/// connection — the second screen's touches and pointer.
+///
+/// Same wire as everything else here. The counter is the aad as well as the
+/// nonce source, so a replayed or tampered frame fails to open and can never
+/// move the cursor.
+pub struct MirrorTcpOpener {
+    cipher: ChaCha20Poly1305,
+}
+
+impl MirrorTcpOpener {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self { cipher: ChaCha20Poly1305::new(Key::from_slice(key)) }
+    }
+
+    /// Open one framed message body: `[counter u64 BE][ciphertext]`.
+    pub fn open(&self, body: &[u8]) -> Option<Vec<u8>> {
+        if body.len() < 8 {
+            return None;
+        }
+        let (counter_be, ct) = body.split_at(8);
+        let counter = u64::from_be_bytes(counter_be.try_into().ok()?);
+        let nonce = nonce_from_counter(counter);
+        self.cipher
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad: counter_be })
+            .ok()
+    }
+}
+
+/// One decoded input event from the second screen.
+///
+/// Deliberately the SAME five-byte shape the laptop→phone mirror already uses
+/// (`[type][x u16 BE][y u16 BE]`, coordinates normalised to 0..65535 of the
+/// surface): one protocol understood at both ends, rather than a second one to
+/// keep in step. `x`/`y` are meaningless for the nav types.
+#[derive(Debug, Clone, Copy)]
+pub struct InputEvent {
+    pub kind: u8,
+    pub x: u16,
+    pub y: u16,
+}
+
 /// Seals whole H.265 access units for the laptop→phone TCP stream. One sealer
 /// per cast session; `counter` is monotonic (never reset, not even across a
 /// phone reconnect) so the ChaCha20-Poly1305 nonce never repeats under one key.
@@ -239,6 +281,8 @@ pub async fn run_tcp_video_client(
     phone_ip: IpAddr,
     key: [u8; 32],
     mut au_rx: mpsc::Receiver<Vec<u8>>,
+    input_key: [u8; 32],
+    on_input: Option<mpsc::Sender<InputEvent>>,
 ) {
     let addr = SocketAddr::new(phone_ip, LAPTOP_VIDEO_PORT);
     // ONE sealer for the whole cast: the counter stays monotonic ACROSS
@@ -276,6 +320,82 @@ pub async fn run_tcp_video_client(
         };
         tracing::info!(%addr, "laptop-cast: connected to phone viewer — streaming");
 
+        // Read the input return channel off the SAME connection.
+        //
+        // It is already open and already traverses whatever NAT or AP isolation
+        // made the laptop dial outwards in the first place; a second, inbound
+        // socket would meet exactly the obstacle this design exists to avoid.
+        // Split rather than share, so the video writer never blocks on a read
+        // and a phone that sends no input never stalls the picture.
+        let (rd_half, mut stream) = {
+            let (r, w) = stream.into_split();
+            (r, w)
+        };
+        let input_task = on_input.clone().map(|tx| {
+            let opener = MirrorTcpOpener::new(&input_key);
+            let mut rd = rd_half;
+            tokio::spawn(async move {
+                let mut len_buf = [0u8; 4];
+                // Diagnostics, first of each only: without them a broken link
+                // is indistinguishable from a phone that simply sent nothing,
+                // because a frame that fails to open is dropped silently by
+                // design. One line each says which.
+                let mut logged_first = false;
+                let mut logged_open_fail = false;
+                tracing::info!("laptop-cast: input reader up — waiting for the phone");
+                loop {
+                    // Say WHY on the way out. Returning silently here made a
+                    // reader that died on its first read indistinguishable
+                    // from a phone that sent nothing — which is exactly the
+                    // ambiguity that cost a debugging round.
+                    if let Err(e) = rd.read_exact(&mut len_buf).await {
+                        tracing::info!("laptop-cast: input reader ended: {e}");
+                        return;
+                    }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    // A length the phone could never legitimately send is a
+                    // corrupt or hostile peer: drop the connection rather than
+                    // allocate on its say-so.
+                    if !(8..=4096).contains(&len) {
+                        tracing::warn!(len, "laptop-cast: bad input frame length");
+                        return;
+                    }
+                    let mut body = vec![0u8; len];
+                    if let Err(e) = rd.read_exact(&mut body).await {
+                        tracing::info!("laptop-cast: input reader ended mid-frame: {e}");
+                        return;
+                    }
+                    // A frame that fails to open is a wrong key, a replay or
+                    // tampering. Ignored quietly — a remote party should not be
+                    // able to fill our log by sending rubbish.
+                    if !logged_first {
+                        logged_first = true;
+                        tracing::info!(len, "laptop-cast: first input frame received");
+                    }
+                    let Some(pkt) = opener.open(&body) else {
+                        if !logged_open_fail {
+                            logged_open_fail = true;
+                            tracing::warn!(
+                                "laptop-cast: input frame failed to open — key mismatch?"
+                            );
+                        }
+                        continue;
+                    };
+                    if pkt.len() != 5 {
+                        continue;
+                    }
+                    let ev = InputEvent {
+                        kind: pkt[0],
+                        x: u16::from_be_bytes([pkt[1], pkt[2]]),
+                        y: u16::from_be_bytes([pkt[3], pkt[4]]),
+                    };
+                    if tx.send(ev).await.is_err() {
+                        return; // consumer gone — the cast ended
+                    }
+                }
+            })
+        });
+
         // Discard anything buffered while (re)connecting so we begin near-live;
         // the phone waits for the next keyframe anyway.
         while au_rx.try_recv().is_ok() {}
@@ -296,6 +416,9 @@ pub async fn run_tcp_video_client(
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             tracing::info!(sent, "laptop-cast: phone viewer dropped ({e}) — reconnecting");
+                            if let Some(t) = &input_task {
+                                t.abort(); // its half of this socket is gone
+                            }
                             continue 'session; // self-heal: dial again
                         }
                         Err(_) => {

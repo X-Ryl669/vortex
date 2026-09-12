@@ -97,6 +97,27 @@ pub(crate) fn diagnostics() -> Diagnostics {
     };
     checks.push(bt);
 
+    // A powered adapter is not the same as a working one. BlueZ will accept
+    // StartDiscovery and then never discover — `Discovering` stays false and
+    // no advertising report ever arrives — and every symptom of that looks
+    // exactly like a phone that is switched off. The scan loop counts the
+    // rounds this happens on; say so here, with the fix, because the fix
+    // (power the adapter off and on) drops the user's audio and so has to be
+    // their decision rather than something the app does behind them.
+    let wedged = crate::ble::not_discovering_rounds();
+    if wedged > 0 {
+        checks.push(check(
+            "bluetooth_discovery",
+            "fail",
+            format!(
+                "adapter is powered but not discovering ({wedged} scan round(s)) — \
+                 turn Bluetooth off and on to clear it"
+            ),
+        ));
+    } else {
+        checks.push(check("bluetooth_discovery", "ok", "scanning works"));
+    }
+
     // ── the phone link ───────────────────────────────────────────────────
     let paired = crate::ipc::get_peer_states().len();
     checks.push(if paired > 0 {

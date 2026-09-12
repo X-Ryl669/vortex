@@ -457,32 +457,50 @@ pub(crate) fn downloads_dir() -> Option<PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
         let home = PathBuf::from(std::env::var_os("HOME")?);
-        let dir = xdg_download_dir(&home).unwrap_or_else(|| home.join("Downloads"));
+        let dir = xdg_user_dir(&home, "XDG_DOWNLOAD_DIR").unwrap_or_else(|| home.join("Downloads"));
         tracing::info!("received files → {}", dir.display());
         Some(dir)
     })
     .clone()
 }
 
-/// The download folder's own name ("Téléchargements"), for UI copy — so a
-/// "Saved to …" message can never name a folder the file didn't go to.
-pub(crate) fn downloads_label() -> String {
-    downloads_dir()
-        .and_then(|d| {
-            d.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .filter(|n| !n.is_empty())
-        })
-        .unwrap_or_else(|| "Downloads".to_string())
+/// Where the phone's own captures go: the user's picture folder.
+///
+/// A screenshot or a camera photo is a picture, and the place a Linux desktop
+/// already files pictures is `XDG_PICTURES_DIR`. Shared files still land in
+/// the download folder — that is where a thing someone sent you belongs — but
+/// a capture the phone forwarded by itself is the user's own image, and
+/// burying it among downloads means it is never where they look for it.
+pub(crate) fn pictures_dir() -> Option<PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        let dir = xdg_user_dir(&home, "XDG_PICTURES_DIR").unwrap_or_else(|| home.join("Pictures"));
+        tracing::info!("received captures → {}", dir.display());
+        Some(dir)
+    })
+    .clone()
 }
 
-/// The configured `XDG_DOWNLOAD_DIR`: the environment first, else the
-/// `user-dirs.dirs` file that `xdg-user-dir(1)` reads. Not required to exist —
-/// a configured-but-missing folder is still the user's stated intent, and
-/// `apply_synced_file` creates it; falling back to `~/Downloads` there would
-/// reintroduce exactly the bug this avoids.
-fn xdg_download_dir(home: &std::path::Path) -> Option<PathBuf> {
-    if let Some(v) = std::env::var_os("XDG_DOWNLOAD_DIR") {
+/// The root a received file belongs under: the picture folder for a capture
+/// (`subdir` is set, i.e. the phone sent it by itself), the download folder
+/// for anything a person actually shared.
+pub(crate) fn receive_root(subdir: Option<&str>) -> Option<PathBuf> {
+    if subdir.is_some() {
+        pictures_dir()
+    } else {
+        downloads_dir()
+    }
+}
+
+/// One configured XDG user directory (`XDG_DOWNLOAD_DIR`, `XDG_PICTURES_DIR`,
+/// …): the environment first, else the `user-dirs.dirs` file that
+/// `xdg-user-dir(1)` reads. Not required to exist — a configured-but-missing
+/// folder is still the user's stated intent, and `apply_synced_file` creates
+/// it; falling back to the English default there would reintroduce exactly the
+/// bug this avoids.
+fn xdg_user_dir(home: &std::path::Path, key: &str) -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os(key) {
         if let Some(p) = expand_home(&v.to_string_lossy(), home) {
             return Some(p);
         }
@@ -492,7 +510,7 @@ fn xdg_download_dir(home: &std::path::Path) -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| home.join(".config"));
     let text = std::fs::read_to_string(config.join("user-dirs.dirs")).ok()?;
-    expand_home(&parse_user_dirs(&text, "XDG_DOWNLOAD_DIR")?, home)
+    expand_home(&parse_user_dirs(&text, key)?, home)
 }
 
 /// Pull one key out of a `user-dirs.dirs` file. It's shell-syntax:
@@ -570,15 +588,14 @@ fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
 }
 
 /// Apply a fully-received FILE shared from the phone (instant-share style, NOT the
-/// clipboard): save it to the user's download folder ([`downloads_dir`]) under its
-/// original name. Bytes are never logged; only size + name.
+/// clipboard): save it under its original name in the folder [`receive_root`]
+/// picks. Bytes are never logged; only size + name.
 /// Returns the saved path on success (for the transfer panel), `None` on error.
 ///
-/// `subdir` is the one folder level a capture adds below the download folder
+/// `subdir` is the one folder level a capture adds below that root
 /// (`Screenshots` / `Photos`, from [`Offer::subdir`] — a fixed table, never
-/// the wire value). Same folder scheme as every other received file, one
-/// level down: a screenshot the phone sent by itself should be where the
-/// user already looks for phone files, not in a second tree of its own.
+/// the wire value), and it is also what marks the file as a capture: with it
+/// set the root is the picture folder, without it the download folder.
 pub(crate) async fn apply_synced_file(
     _app: &AppHandle,
     name: &str,
@@ -592,7 +609,7 @@ pub(crate) async fn apply_synced_file(
         .map(|s| s.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "vortex-file".to_string());
-    let Some(dir) = downloads_dir().map(|d| receive_dir(&d, subdir)) else {
+    let Some(dir) = receive_root(subdir).map(|d| receive_dir(&d, subdir)) else {
         tracing::warn!("received file: no HOME — dropped");
         return None;
     };
@@ -650,12 +667,21 @@ pub(crate) fn receive_dir(downloads: &std::path::Path, subdir: Option<&str>) -> 
     }
 }
 
-/// "Downloads/Screenshots" (localised root) for UI copy — the folder a capture
-/// went to, named the way [`downloads_label`] names the root.
+/// "Pictures/Screenshots" (localised root) for UI copy — the folder a file
+/// actually went to, root included, so a "Saved to …" message can never send
+/// the user hunting in the wrong tree. Captures sit under the picture folder
+/// and shares under the download folder; see [`receive_root`].
 pub(crate) fn receive_label(subdir: Option<&str>) -> String {
+    let root = receive_root(subdir)
+        .and_then(|d| {
+            d.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .filter(|n| !n.is_empty())
+        })
+        .unwrap_or_else(|| if subdir.is_some() { "Pictures".into() } else { "Downloads".into() });
     match subdir {
-        Some(s) => format!("{}/{s}", downloads_label()),
-        None => downloads_label(),
+        Some(s) => format!("{root}/{s}"),
+        None => root,
     }
 }
 
@@ -733,8 +759,62 @@ async fn flush_file_batch(batch: Vec<Offer>) {
 /// BLE image-offer consumer: clipboard images stash a pull token immediately;
 /// FILE offers are debounced into one batch (so multiple files / a folder share
 /// raise a SINGLE consent prompt) and pulled only after the user accepts.
+/// Tokens this run has already taken in, newest last.
+///
+/// The token is the content hash of the bytes (the phone stashes a blob under
+/// `sha256(bytes)[..16]`), so it identifies the PICTURE, not the announcement:
+/// the same screenshot announced twice is the same token twice, and a
+/// different one never collides.
+///
+/// Two things produce repeats. An offer now goes out over BLE and is
+/// re-announced on the LAN round while it is still pending, so both can
+/// arrive; and the phone keeps re-announcing until the laptop actually pulls
+/// the bytes. Without this the same capture is saved twice, and `unique_path`
+/// dutifully files the second one as "… (1).jpg".
+static SEEN_OFFER_TOKENS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// How many tokens to remember. An offer stops being re-announced the moment
+/// its bytes are pulled, so the window a repeat can arrive in is seconds —
+/// this is far more history than that needs.
+const SEEN_OFFER_MAX: usize = 256;
+
+/// True the first time a token is seen, false every time after. Empty tokens
+/// are never remembered: they carry no identity to match on.
+fn first_sighting(token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    let Ok(mut g) = SEEN_OFFER_TOKENS.lock() else {
+        return true; // a poisoned lock must not silently drop a file
+    };
+    if g.iter().any(|t| t == token) {
+        return false;
+    }
+    g.push_back(token.to_string());
+    while g.len() > SEEN_OFFER_MAX {
+        g.pop_front();
+    }
+    true
+}
+
+/// The consumer's sender, so a transport that isn't BLE can hand it an offer.
+///
+/// The BLE path is given its own clone at wiring time; the LAN heartbeat runs
+/// far from that and needs the same sink — one consumer, so the debounced
+/// batch, the consent prompt and [`first_sighting`] all see every offer no
+/// matter which link carried it.
+static OFFER_SINK: OnceLock<tokio::sync::mpsc::UnboundedSender<Offer>> = OnceLock::new();
+
+/// Hand an offer to the consumer. `false` when there is no consumer yet
+/// (before wiring) or it has stopped.
+pub(crate) fn submit_offer(offer: Offer) -> bool {
+    OFFER_SINK.get().map(|tx| tx.send(offer).is_ok()).unwrap_or(false)
+}
+
 pub(crate) fn spawn_image_offer_consumer() -> tokio::sync::mpsc::UnboundedSender<Offer> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Offer>();
+    let _ = OFFER_SINK.set(tx.clone());
     tokio::spawn(async move {
         let mut file_buf: Vec<Offer> = Vec::new();
         loop {
@@ -764,6 +844,13 @@ pub(crate) fn spawn_image_offer_consumer() -> tokio::sync::mpsc::UnboundedSender
             // sync off" is a combination that works rather than one that
             // drops files without a word.
             if !CLIPBOARD_SYNC.load(Ordering::Relaxed) && !offer.is_capture() {
+                continue;
+            }
+            // Same bytes, same token, already handled — drop it. See
+            // [`first_sighting`]: two transports announce the same offer and
+            // the phone repeats it until the bytes are pulled.
+            if !first_sighting(&offer.token) {
+                tracing::debug!(token = %offer.token, "offer already taken in; ignoring the repeat");
                 continue;
             }
             if offer.is_file() {
@@ -877,27 +964,35 @@ XDG_DOCUMENTS_DIR="$HOME/Documents"
         assert_eq!(expand_home("", home), None);
     }
 
-    /// A capture goes one named level below the download folder; a share
-    /// stays in the root. The subfolder is whatever the offer's fixed table
-    /// says, never joined from the wire.
+    /// A capture goes under its root (the picture folder, chosen by
+    /// `receive_root`) in the `Phone/` tree the offer's fixed table names; a
+    /// share stays in the root it was given (the download folder). The
+    /// subfolder is only ever that table's value, never joined from the wire —
+    /// which is what the hostile `kind` below checks.
     #[test]
-    fn captures_land_one_level_below_downloads() {
-        let dl = std::path::Path::new("/home/cyril/Téléchargements");
-        assert_eq!(receive_dir(dl, None), dl.to_path_buf());
+    fn captures_land_under_their_root() {
+        let pics = std::path::Path::new("/home/cyril/Images");
+        assert_eq!(receive_dir(pics, None), pics.to_path_buf());
+        let shot = Offer {
+            kind: "screenshot".into(),
+            ..Default::default()
+        };
         assert_eq!(
-            receive_dir(dl, Some("Screenshots")),
-            PathBuf::from("/home/cyril/Téléchargements/Screenshots")
+            receive_dir(pics, shot.subdir()),
+            PathBuf::from("/home/cyril/Images/Phone/Screenshots")
         );
         let o = Offer {
             kind: "photo".into(),
             ..Default::default()
         };
-        assert_eq!(receive_dir(dl, o.subdir()), PathBuf::from("/home/cyril/Téléchargements/Photos"));
+        assert_eq!(receive_dir(pics, o.subdir()), PathBuf::from("/home/cyril/Images/Phone/Photos"));
+        // The desktop's own screenshot folder is a sibling, never the target.
+        assert_ne!(receive_dir(pics, shot.subdir()), pics.join("Screenshots"));
         let hostile = Offer {
             kind: "../x".into(),
             ..Default::default()
         };
-        assert_eq!(receive_dir(dl, hostile.subdir()), dl.to_path_buf());
+        assert_eq!(receive_dir(pics, hostile.subdir()), pics.to_path_buf());
     }
 
     /// Unquoted and single-quoted values are valid shell too.
@@ -912,5 +1007,21 @@ XDG_DOCUMENTS_DIR="$HOME/Documents"
             Some("$HOME/Dl".to_string())
         );
     }
-}
 
+    /// The token is the picture's content hash, so a repeat is the same
+    /// picture arriving again — over the other transport, or re-announced
+    /// before the bytes were pulled. Only the first sighting may be acted on.
+    #[test]
+    fn the_same_token_is_taken_in_once() {
+        let t = "deadbeefdeadbeef";
+        assert!(first_sighting(t));
+        assert!(!first_sighting(t));
+        assert!(!first_sighting(t));
+        // A different picture is untouched by that.
+        assert!(first_sighting("0123456789abcdef"));
+        // An offer with no token carries no identity to match on, so it is
+        // never treated as a repeat — dropping those would lose real files.
+        assert!(first_sighting(""));
+        assert!(first_sighting(""));
+    }
+}

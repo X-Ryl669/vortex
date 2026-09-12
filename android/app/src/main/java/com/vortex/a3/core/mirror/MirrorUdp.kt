@@ -31,6 +31,26 @@ object MirrorUdp {
     fun deriveMediaKey(handshakeHash: ByteArray): ByteArray =
         hkdfSha256(handshakeHash, KEY_INFO, 32)
 
+    private val LAPTOP_INPUT_KEY_INFO =
+        "vortex/mirror/laptop-input".toByteArray(Charsets.US_ASCII)
+
+    /**
+     * Key for the input we send BACK to the laptop over the second-screen cast
+     * connection — touches on the phone driving the laptop's virtual monitor.
+     *
+     * Expanded from the cast's own media key, not the handshake hash: that key
+     * is already 32 secret bytes agreed for this session and delivered over the
+     * authenticated control channel, and it is what both ends hold when the
+     * return channel is set up.
+     *
+     * Its own label because the video and this input share ONE socket. Sealing
+     * both under one key with independent counters would repeat a nonce, which
+     * is the thing these labels exist to prevent. MUST match the Rust
+     * `derive_laptop_input_key`.
+     */
+    fun deriveLaptopInputKey(mediaKey: ByteArray): ByteArray =
+        hkdfSha256(mediaKey, LAPTOP_INPUT_KEY_INFO, 32)
+
     /**
      * RFC 5869 HKDF-SHA256. `salt = None` on the Rust side maps to 32 zero
      * bytes (the `hkdf` crate's behaviour), so we MUST extract with a 32-byte

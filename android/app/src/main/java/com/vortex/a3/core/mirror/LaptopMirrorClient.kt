@@ -47,10 +47,95 @@ class LaptopMirrorClient(
     private val onVideoSize: ((Int, Int) -> Unit)? = null,
 ) {
     private val keySpec = SecretKeySpec(key, "ChaCha20")
+
+    /**
+     * Sealer for the input we send BACK on this same socket — touches driving
+     * the laptop's virtual monitor.
+     *
+     * Own key (see [MirrorUdp.deriveLaptopInputKey]) and own counter. The
+     * counter is monotonic for the life of this client and never reset, not
+     * even across a reconnect, because it is the nonce: repeating one under a
+     * key is the failure the separate labels exist to prevent.
+     */
+    private val inputKeySpec = SecretKeySpec(MirrorUdp.deriveLaptopInputKey(key), "ChaCha20")
+    private var inputCounter = 0L
+    private val inputLock = Any()
+    @Volatile private var loggedFirstSend = false
+    @Volatile private var loggedNoSocket = false
     @Volatile private var running = false
     private var server: ServerSocket? = null
     private var socket: Socket? = null
     private var codec: MediaCodec? = null
+
+    /**
+     * Send one input event to the laptop: `[type][x u16 BE][y u16 BE]`, with
+     * the coordinates normalised to 0..65535 of the surface.
+     *
+     * Normalised so the phone needs to know nothing about the monitor's real
+     * size — and so a size change on the laptop cannot desynchronise it. Same
+     * five-byte shape the laptop→phone direction already uses.
+     *
+     * Best effort and non-throwing: a lost touch is a dropped gesture, never a
+     * crashed viewer. Called from the UI thread, so the write has to be cheap —
+     * it is one small sealed frame on an already-open socket.
+     */
+    fun sendInput(type: Int, xNorm: Int, yNorm: Int) {
+        val out = try {
+            socket?.takeIf { !it.isClosed }?.getOutputStream() ?: run {
+                if (!loggedNoSocket) {
+                    loggedNoSocket = true
+                    Log.w(TAG, "sendInput: no socket — input has nowhere to go")
+                }
+                return
+            }
+        } catch (_: Throwable) {
+            return
+        }
+        if (!loggedFirstSend) {
+            loggedFirstSend = true
+            Log.i(TAG, "sendInput: first packet going out (type=$type)")
+        }
+        val pkt = byteArrayOf(
+            type.toByte(),
+            (xNorm ushr 8).toByte(), xNorm.toByte(),
+            (yNorm ushr 8).toByte(), yNorm.toByte(),
+        )
+        try {
+            // One frame at a time: the counter must not be handed out twice,
+            // and two interleaved writes would corrupt the framing.
+            synchronized(inputLock) {
+                val counter = inputCounter++
+                val counterBe = ByteArray(8)
+                for (i in 0 until 8) {
+                    counterBe[i] = (counter ushr (56 - i * 8)).toByte()
+                }
+                // Nonce = 0u32 || counter, matching the Rust side exactly.
+                val nonce = ByteArray(12)
+                System.arraycopy(counterBe, 0, nonce, 4, 8)
+                val cipher = Cipher.getInstance("ChaCha20-Poly1305")
+                cipher.init(
+                    Cipher.ENCRYPT_MODE,
+                    inputKeySpec,
+                    javax.crypto.spec.IvParameterSpec(nonce),
+                )
+                cipher.updateAAD(counterBe)
+                val ct = cipher.doFinal(pkt)
+                val msgLen = 8 + ct.size
+                val frame = ByteArray(4 + msgLen)
+                frame[0] = (msgLen ushr 24).toByte()
+                frame[1] = (msgLen ushr 16).toByte()
+                frame[2] = (msgLen ushr 8).toByte()
+                frame[3] = msgLen.toByte()
+                System.arraycopy(counterBe, 0, frame, 4, 8)
+                System.arraycopy(ct, 0, frame, 12, ct.size)
+                out.write(frame)
+                out.flush()
+            }
+        } catch (_: Throwable) {
+            // Socket went away mid-gesture. The video path notices and
+            // reconnects; nothing here needs to.
+        }
+    }
 
     /** Blocking: accept the laptop's connection, decode + render until the
      *  stream ends or [stop]. The PHONE is the server here — on real networks

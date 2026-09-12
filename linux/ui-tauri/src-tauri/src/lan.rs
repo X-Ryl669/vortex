@@ -217,14 +217,27 @@ pub(crate) fn note_trusted_prs(prs: Vec<[u8; 32]>) {
     }
 }
 
+/// Rotation buckets of slack accepted either side of ours when matching a
+/// peer's mDNS instance name.
+///
+/// The token rotates once a minute and the phone re-announces on each
+/// boundary, so a couple of buckets would cover clock skew alone. The margin
+/// is wider because the phone legitimately stops rotating: Doze freezes the
+/// coroutine, and rotation is skipped outright while BLE holds the link. A
+/// name a few minutes stale is our peer that was asleep, and refusing it
+/// costs discovery entirely — which is the failure this window is sized
+/// against, having already cost it once. Passing the filter only buys a TCP
+/// connect; the IK handshake is what actually authenticates.
+const BUCKET_SLACK: u64 = 10;
+
 /// Does this mDNS instance name carry a presence token one of our trusted
 /// peers would publish right now?
 ///
-/// Same derivation and the same ±2 bucket tolerance the BLE advertisement
-/// filter uses. Unknown-shaped names are accepted rather than rejected: the
-/// token is a filter, not authentication — the IK handshake is what actually
-/// establishes trust — so being wrong here should cost a wasted dial, never a
-/// phone that cannot be found.
+/// Same derivation as the BLE advertisement filter, with [`BUCKET_SLACK`]
+/// buckets of tolerance. Unknown-shaped names are accepted rather than
+/// rejected: the token is a filter, not authentication — the IK handshake is
+/// what actually establishes trust — so being wrong here should cost a wasted
+/// dial, never a phone that cannot be found.
 fn instance_matches_a_trusted_peer(instance: &str) -> bool {
     use vortex_l3_daemon::core::crypto::presence::{current_bucket, derive_presence_token};
     let lower = instance.to_ascii_lowercase();
@@ -245,8 +258,8 @@ fn instance_matches_a_trusted_peer(instance: &str) -> bool {
         .unwrap_or(0);
     let bucket_now = current_bucket(now_sec, 60);
     prs_list.iter().any(|prs| {
-        [-2i64, -1, 0, 1, 2].iter().any(|d| {
-            let tok = derive_presence_token(prs, (bucket_now as i64 + *d) as u64);
+        (-(BUCKET_SLACK as i64)..=BUCKET_SLACK as i64).any(|d| {
+            let tok = derive_presence_token(prs, (bucket_now as i64 + d) as u64);
             hex == tok.iter().map(|b| format!("{b:02x}")).collect::<String>()
         })
     })
@@ -300,9 +313,13 @@ pub(crate) async fn resolve_peer_addr(fresh: bool) -> Option<std::net::SocketAdd
             // authenticate, so nothing worse than that happens), cache its
             // address, and try the same wrong device again.
             if !instance_matches_a_trusted_peer(&c.instance_name) {
-                tracing::debug!(
+                // INFO, not DEBUG. This is the one branch that turns a
+                // successful resolve into "mDNS empty", and at DEBUG it hid a
+                // total discovery outage behind a log that looked like nobody
+                // had answered at all.
+                tracing::info!(
                     instance = %c.instance_name,
-                    "mdns: a vortex instance that is not our peer — ignoring"
+                    "mdns: resolved a vortex instance whose presence token is not our peer's — ignoring"
                 );
             } else if let Some(ip) = c
                 .addresses
@@ -671,6 +688,20 @@ pub(crate) async fn try_lan_reconnect(
                 // (e.g. we reached it via a hotspot NAT alias).
                 if let Some(s) = &outcome.peer_state {
                     note_peer_reported_ip(s);
+                }
+                // File offers the phone re-announced on this round. Same sink
+                // the BLE path uses, so one consumer sees every offer and its
+                // token dedup covers both links — which matters precisely
+                // because an offer can now arrive twice.
+                for offer in &outcome.offers {
+                    tracing::info!(
+                        name = %offer.name,
+                        bytes = offer.bytes,
+                        "file offer announced over LAN"
+                    );
+                    if !crate::clipboard_sync::submit_offer(offer.clone()) {
+                        tracing::warn!("offer sink is not up; LAN-announced offer dropped");
+                    }
                 }
                 if outcome.peer_counter < local_counter {
                     tracing::warn!(
@@ -1217,7 +1248,13 @@ pub(crate) async fn try_lan_reconnect(
         *LAST_GOOD_PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = None;
         tracing::info!("fast-path IP failed the handshake; cache dropped for rediscovery");
     }
-    Err(last_err.unwrap_or_else(|| "no peer accepted reconnect".to_string()))
+    // Say WHY. Both callers discard this error, so without a line here the
+    // log showed "TCP connecting" every 12 s and then simply nothing — a
+    // refused connection, a handshake rejection and a dead network all looked
+    // identical, and identical to a tick that had quietly succeeded.
+    let err = last_err.unwrap_or_else(|| "no peer accepted reconnect".to_string());
+    tracing::info!(%err, "LAN reconnect attempt failed");
+    Err(err)
 }
 
 

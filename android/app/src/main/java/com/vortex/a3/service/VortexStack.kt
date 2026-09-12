@@ -980,6 +980,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // A blob the laptop pulled is an offer that landed — stop tracking it
         // (and don't toast a failure for a file that plainly arrived).
         lan.onFileServed = { token -> noteFileServed(token) }
+        lan.pendingOffersProvider = { pendingOffersForLan() }
         lanServer = lan
         // Let code with no handle on the stack ship a snapshot immediately —
         // the accessibility service reporting an input-focus change, which the

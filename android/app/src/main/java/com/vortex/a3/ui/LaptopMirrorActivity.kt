@@ -24,6 +24,12 @@ import com.vortex.a3.core.mirror.LaptopMirrorClient
  */
 class LaptopMirrorActivity : Activity() {
     private var client: LaptopMirrorClient? = null
+
+    // Matches `input_proto` in the laptop's mirror.rs — one protocol for both
+    // directions rather than a second one to keep in step.
+    private val INPUT_DOWN = 0
+    private val INPUT_MOVE = 1
+    private val INPUT_UP = 2
     private var worker: Thread? = null
 
     // Zoom/pan transform state, applied to the SurfaceView.
@@ -120,8 +126,67 @@ class LaptopMirrorActivity : Activity() {
         root.setOnTouchListener { _, ev ->
             scaleDetector.onTouchEvent(ev)
             panDetector.onTouchEvent(ev)
+            // ONE finger drives the laptop; TWO keep the pan and zoom above.
+            //
+            // The split matters: on a phone-sized screen showing a laptop
+            // desktop, pan and zoom are what make the thing usable at all, so
+            // they cannot be given up to make it interactive. A second finger
+            // arriving mid-drag also has to LIFT the laptop's button, or the
+            // desktop is left mid-drag while the user is pinching.
+            if (ev.pointerCount == 1) {
+                sendTouch(ev)
+            } else if (laptopButtonDown) {
+                sendInput(INPUT_UP, ev.getX(0), ev.getY(0))
+                laptopButtonDown = false
+            }
             true
         }
+    }
+
+    /** Is the laptop currently holding a button down because of us? */
+    private var laptopButtonDown = false
+
+    private fun sendTouch(ev: MotionEvent) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                sendInput(INPUT_DOWN, ev.x, ev.y)
+                laptopButtonDown = true
+            }
+            MotionEvent.ACTION_MOVE -> if (laptopButtonDown) sendInput(INPUT_MOVE, ev.x, ev.y)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (laptopButtonDown) {
+                    sendInput(INPUT_UP, ev.x, ev.y)
+                    laptopButtonDown = false
+                }
+            }
+        }
+    }
+
+    /**
+     * Turn a point on the VIDEO into a normalised position and send it.
+     *
+     * The surface can be panned and zoomed, so a raw touch coordinate is not a
+     * point on the laptop's screen: the transform has to be undone first, or
+     * every tap lands somewhere else once the user has zoomed in. The result is
+     * normalised to 0..65535 so the phone never needs the monitor's real size.
+     */
+    private fun sendInput(type: Int, rawX: Float, rawY: Float) {
+        val c = client ?: return
+        val w = surface.width.toFloat()
+        val h = surface.height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        // Undo pan, then zoom, about the surface's centre — the same origin the
+        // scale is applied around.
+        val cx = w / 2f
+        val cy = h / 2f
+        val x = (rawX - surface.translationX - cx) / scale + cx
+        val y = (rawY - surface.translationY - cy) / scale + cy
+        // Outside the picture after the transform: a touch on the letterbox is
+        // not a touch on the laptop.
+        if (x < 0f || y < 0f || x > w || y > h) return
+        val nx = ((x / w) * 65535f).toInt().coerceIn(0, 65535)
+        val ny = ((y / h) * 65535f).toInt().coerceIn(0, 65535)
+        c.sendInput(type, nx, ny)
     }
 
     /** Keep the zoomed surface from being dragged past its own edges. */

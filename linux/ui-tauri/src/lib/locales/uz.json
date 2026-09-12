@@ -291,6 +291,7 @@
       "distro": "Tizim",
       "desktop": "Ish stoli",
       "bluetooth": "Bluetooth",
+      "bluetooth_discovery": "Bluetooth qidiruvi",
       "paired": "Bog'langan telefon",
       "adb": "adb (ekran funksiyalari)",
       "injector": "Kursor uzatish",

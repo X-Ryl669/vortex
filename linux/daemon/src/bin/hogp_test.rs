@@ -43,6 +43,58 @@
 //! reads as a failure when it actually succeeded — which is exactly the wrong
 //! conclusion I drew from it the first time.
 //!
+//! 2026-09-12 — WIRED IN, BUT NOT REACHABLE FROM THIS PHONE YET.
+//!
+//! `core/hogp.rs` publishes the same services from the app and the transport
+//! gate accepts it, so the laptop half is done. Getting the phone to attach is
+//! where it stands, and three separate obstacles were identified and cleared
+//! without the last one giving way:
+//!
+//!  1. The phone's Bluetooth list shows the ADAPTER's name ("fedora"), not the
+//!     advertisement's `local_name` ("Vortex Mouse"), so the entry the user
+//!     naturally taps is not this one.
+//!  2. Worse, that entry is the CLASSIC one. `dumpsys bluetooth_manager` on the
+//!     phone showed `50:84:92:2E:D2:12 [BR/EDR] fedora` — bonded over BR/EDR
+//!     while HOGP lives on LE, which is why `HidHostService` listed
+//!     `mInputDevices:` empty every time. Turning the adapter's Classic
+//!     discoverability off removes the decoy and leaves LE advertising up
+//!     (`ActiveInstances` stays 1).
+//!  3. BlueZ then refuses the bond with no pairing agent registered; the app
+//!     registers none, and the spike only ever worked with `bluetoothctl` open
+//!     supplying one. With `agent NoInputNoOutput` held open the phone STILL
+//!     reported "couldn't connect", and the agent log shows no request ever
+//!     arrived — so the LE connection fails before BlueZ asks anyone.
+//!
+//! 2026-09-12, later — WHY the Classic entry cannot simply be hidden.
+//!
+//! Turning the adapter's Classic discoverability off works only while nothing
+//! is advertising: with our advertisement registered BlueZ refuses the change
+//! (`org.bluez.Error.Failed`), because `LEAdvertisement1.Discoverable = true`
+//! overrides and pins the adapter's property.
+//!
+//! And hiding it would not be enough anyway. This laptop's BR/EDR and LE
+//! identities are the SAME address (50:84:92:2E:D2:12, public), so Android
+//! merges them into one list entry and shows the Classic name. A real BLE
+//! mouse has an LE-only identity and no Classic presence at all, which is why
+//! it appears as its own device. Ours cannot, while it shares an address with
+//! the laptop the phone is already talking to.
+//!
+//! So a working version likely needs the advertisement on a SEPARATE LE
+//! identity (a resolvable private or static random address), not just a
+//! different name — which is a BlueZ-level question this spike has not
+//! answered.
+//!
+//! That last one is the open question, and it is the risk flagged when this was
+//! first proposed: the laptop is already CENTRAL on a live link to this same
+//! phone (vortex's own), and being peripheral to the same peer at the same time
+//! may be beyond this controller. `btmon` during an attempt would say plainly —
+//! it needs root, which is why it has not been run.
+//!
+//! What a working version still needs beyond that answer: the app must register
+//! its own pairing agent rather than rely on bluetoothctl, and must manage
+//! Classic discoverability around its advertisement and RESTORE it afterwards,
+//! since that is the user's setting and not ours.
+//!
 //! Run:  cargo run --features dev-tools --bin vortex-hogp-test
 //! Then: pair from the phone's Bluetooth settings.
 //! Pass:  a cursor appears on the phone and moves on its own.

@@ -62,15 +62,22 @@ impl ClipboardImageOffer {
         self.subdir().is_some()
     }
 
-    /// The subfolder under the download folder a capture lands in, by kind.
+    /// The subfolder a capture lands in under the picture folder, by kind.
+    ///
+    /// Under a `Phone/` tree of its own, because the desktop already owns
+    /// `Pictures/Screenshots` — GNOME files its own screenshots there, and
+    /// dropping the phone's in beside them mixes two sets of pictures that
+    /// nobody wants mixed. The kind split is kept inside it, since the two
+    /// toggles that produce these are separate decisions.
+    ///
     /// A fixed table on purpose: the wire value is untrusted, and only these
-    /// two names ever become part of a path. Anything else — an ordinary
+    /// two paths ever become part of a real path. Anything else — an ordinary
     /// share, or a kind this build does not know — lands in the root as
     /// shares always have.
     pub fn subdir(&self) -> Option<&'static str> {
         match self.kind.as_str() {
-            "screenshot" => Some("Screenshots"),
-            "photo" => Some("Photos"),
+            "screenshot" => Some("Phone/Screenshots"),
+            "photo" => Some("Phone/Photos"),
             _ => None,
         }
     }
@@ -268,8 +275,8 @@ mod offer_tests {
 
     #[test]
     fn known_kinds_map_to_fixed_folders() {
-        assert_eq!(offer("screenshot").subdir(), Some("Screenshots"));
-        assert_eq!(offer("photo").subdir(), Some("Photos"));
+        assert_eq!(offer("screenshot").subdir(), Some("Phone/Screenshots"));
+        assert_eq!(offer("photo").subdir(), Some("Phone/Photos"));
         assert!(offer("photo").is_capture());
     }
 

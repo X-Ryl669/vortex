@@ -108,6 +108,18 @@ class LanServer(
     var onFileServed: (token: String) -> Unit = { }
 
     /**
+     * File offers still waiting for the laptop, as their OFFER JSON bytes.
+     *
+     * Announced on the bulk-sync done frame so the offer reaches the laptop
+     * over whichever link is actually up. An offer is a BLE notify first, and
+     * with BLE down it is retried for a minute and then dropped — while this
+     * exchange has been completing cleanly every twelve seconds the whole
+     * time. Called once per bulk-sync round; the provider marks what it
+     * returns as announced.
+     */
+    var pendingOffersProvider: () -> List<ByteArray> = { emptyList() }
+
+    /**
      * Watermark-dataset provider for bulk-sync (currently `sms_history`):
      * called with the peer's "I have everything up to [sinceMs]" watermark,
      * returns the JSON of everything NEWER (oldest-first, provider-capped)
@@ -176,10 +188,78 @@ class LanServer(
             Log.w(TAG, "NSD re-register threw: ${e.message}")
         }
     }
+
+    /**
+     * Re-announce the service on every rotation-bucket boundary, so the
+     * published instance name stays the CURRENT presence token.
+     *
+     * [derivePrivateInstanceName] mints a name from
+     * `PRS × (now / NSD_ROTATION_SEC)`, and the laptop recognises us by
+     * re-deriving that token and comparing (see `instance_matches_a_trusted_peer`
+     * on the Linux side). Both halves of that were right; what was missing is
+     * that the name was minted exactly ONCE, when the server started, and then
+     * published unchanged for the life of the process.
+     *
+     * The laptop allows a few buckets of clock slack either way, so for the
+     * first minutes the stale name still matched and discovery worked.
+     * After that every browse resolved us and then threw the record away as
+     * "a vortex instance that is not our peer" — permanently, until the
+     * service restarted. Vortex kept connecting only because of the
+     * last-known-IP fallback, which is exactly why this stayed invisible:
+     * it looks like a working system until the phone's address changes.
+     *
+     * Not a timer every [NSD_ROTATION_SEC]: we sleep to the next boundary, so
+     * the re-announce lands just after the bucket turns rather than drifting
+     * into the middle of one.
+     *
+     * Skipped while BLE holds the link. mDNS only matters for discovery, and
+     * while BLE is up the laptop reaches us without it — the same reason
+     * [setBleLinked] drops the multicast lock. The name is refreshed there
+     * when the link goes away and discovery starts mattering again.
+     */
+    private fun startInstanceRotation() {
+        rotationJob?.cancel()
+        rotationJob = scope.launch {
+            while (isActive) {
+                val nowMs = System.currentTimeMillis()
+                val nextBoundaryMs =
+                    (nowMs / 1000L / NSD_ROTATION_SEC + 1L) * NSD_ROTATION_SEC * 1000L
+                kotlinx.coroutines.delay((nextBoundaryMs - nowMs).coerceAtLeast(1_000L))
+                if (!isActive) return@launch
+                if (bleLinked) continue
+                refreshInstanceName()
+            }
+        }
+    }
+
+    /**
+     * Drop the current registration and publish again under a freshly derived
+     * name. Unregister first: NSD keeps one record per listener, so
+     * registering a second one would leave the stale name being answered
+     * alongside the new one.
+     */
+    private suspend fun refreshInstanceName() {
+        val nsd = context.getSystemService(NsdManager::class.java) ?: return
+        registrationListener?.let {
+            try {
+                nsd.unregisterService(it)
+            } catch (_: Exception) { /* already torn down — fine */ }
+        }
+        registrationListener = null
+        // The same settle delay `nudge` uses; unregister is asynchronous and
+        // re-registering underneath it can fail with ALREADY_ACTIVE.
+        kotlinx.coroutines.delay(150)
+        reannounce()
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var serverSocket: ServerSocket? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
     private var acceptJob: Job? = null
+
+    /** Rolls the published mDNS instance name onto the current rotation
+     *  bucket. See [startInstanceRotation]. */
+    private var rotationJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
     /** High-throughput Wi-Fi lock held ONLY while serving a file/image blob.
@@ -333,6 +413,8 @@ class LanServer(
         try {
             nsd.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, listener)
             registrationListener = listener
+            // The name above is only valid for the bucket it was minted in.
+            startInstanceRotation()
         } catch (e: Exception) {
             Log.e(TAG, "NSD registerService threw", e)
         }
@@ -383,12 +465,17 @@ class LanServer(
             if (lanHotJob?.isActive != true) releaseMulticast()
         } else if (acceptJob != null) {
             acquireMulticast()
+            // Rotation is skipped while BLE is up, so the published name is
+            // as stale as the link was long. Discovery matters again now.
+            scope.launch { refreshInstanceName() }
         }
     }
 
     fun stop() {
         acceptJob?.cancel()
         acceptJob = null
+        rotationJob?.cancel()
+        rotationJob = null
         registrationListener?.let {
             try {
                 context.getSystemService(NsdManager::class.java).unregisterService(it)
@@ -829,6 +916,29 @@ class LanServer(
                                     Log.i(TAG, "bulk-sync: $key sent (${json.size} bytes)")
                                     status.put(key, "sent")
                                     onBulkDelivered(key, hash)
+                                }
+                            }
+                            // Ride the done frame with anything still waiting
+                            // to be collected. The laptop dedups by token
+                            // (the content hash), so an offer BLE already
+                            // delivered costs nothing here.
+                            val offers = runCatching { pendingOffersProvider() }
+                                .getOrElse {
+                                    Log.w(TAG, "pending-offers provider threw: ${it.message}")
+                                    emptyList()
+                                }
+                            if (offers.isNotEmpty()) {
+                                val arr = org.json.JSONArray()
+                                for (o in offers) {
+                                    runCatching {
+                                        arr.put(org.json.JSONObject(String(o, Charsets.UTF_8)))
+                                    }.onFailure {
+                                        Log.w(TAG, "pending offer is not JSON; skipped")
+                                    }
+                                }
+                                if (arr.length() > 0) {
+                                    status.put("offers", arr)
+                                    Log.i(TAG, "bulk-sync: announced ${arr.length()} pending offer(s)")
                                 }
                             }
                             lockedSealAndWrite(

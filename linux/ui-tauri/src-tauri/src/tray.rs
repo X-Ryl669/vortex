@@ -124,26 +124,6 @@ impl Tray for VortexTray {
             }
             .into(),
             StandardItem {
-                label: "Send clipboard to phone".into(),
-                // The clipboard is where a link already is when you decide you
-                // want it on the phone — copy, then this, rather than opening a
-                // window to paste into. Must not block: the menu stays frozen
-                // until the callback returns, so the read is the only work and
-                // the send is a queue write.
-                activate: Box::new(|_t: &mut Self| {
-                    match crate::clipboard::latest_text() {
-                        Some(text) => {
-                            if let Err(e) = crate::send_to_phone::send(&text) {
-                                tracing::warn!("send-to-phone: {e}");
-                            }
-                        }
-                        None => tracing::info!("send-to-phone: clipboard has no text"),
-                    }
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
                 label: "Show".into(),
                 activate: Box::new(|t: &mut Self| crate::window::present_main(&t.app)),
                 ..Default::default()

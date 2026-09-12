@@ -234,6 +234,36 @@ pub(crate) fn expected_presence_tokens(
         .collect()
 }
 
+/// Consecutive scan rounds that asked for discovery and got an adapter which
+/// said it was not discovering. Zero means the radio is answering.
+static NOT_DISCOVERING_ROUNDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How many rounds in a row the adapter has refused to discover — read by the
+/// diagnostics panel, which is what turns this into something the user can act
+/// on rather than a silence that looks like an absent phone.
+pub(crate) fn not_discovering_rounds() -> u32 {
+    NOT_DISCOVERING_ROUNDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record one round's verdict. Warns on the way in, not on every round after:
+/// a wedged adapter would otherwise fill the log with the same line for hours.
+fn note_discovery_health(discovering: bool) {
+    use std::sync::atomic::Ordering;
+    if discovering {
+        if NOT_DISCOVERING_ROUNDS.swap(0, Ordering::Relaxed) > 0 {
+            tracing::info!("BLE adapter is discovering again");
+        }
+        return;
+    }
+    let n = NOT_DISCOVERING_ROUNDS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        tracing::warn!(
+            "BLE adapter accepted the scan but reports Discovering=false — \
+             the controller is wedged; turning Bluetooth off and on clears it"
+        );
+    }
+}
+
 pub(crate) async fn find_trusted_presence_peer(
     adapter: &bluer::Adapter,
     peer_store: &Arc<dyn PeerStore>,
@@ -275,7 +305,30 @@ pub(crate) async fn find_trusted_presence_peer(
             .await;
         })
     };
+    // Watch for a wedged controller while the round runs.
+    //
+    // BlueZ can accept StartDiscovery — other clients even get
+    // `org.bluez.Error.InProgress` — and then never discover: the adapter's
+    // `Discovering` property stays false and not one advertising report
+    // arrives. Observed live, with the radio dead for over an hour while this
+    // loop scanned into it every 45 s and found nothing, which is
+    // indistinguishable from "the phone is away" without this check.
+    //
+    // Only powering the adapter off and on cleared it, and that is NOT done
+    // here: it drops every connection the adapter holds, the user's audio
+    // included. The stuck state is reported instead (see `diagnostics`), and
+    // acting on it stays the user's call.
+    let stuck_probe = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            // BlueZ flips `Discovering` well inside a second of accepting the
+            // call; two is slack, not a guess.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            adapter.is_discovering().await.unwrap_or(true)
+        })
+    };
     let res = tokio::time::timeout(wait, rx.recv()).await.ok().flatten();
+    note_discovery_health(stuck_probe.await.unwrap_or(true));
     // Abort AND join. `abort()` only *requests* cancellation; the spawned
     // task still owns the `discover_devices()` stream until its future is
     // actually dropped, and bluer only issues StopDiscovery on that drop.

@@ -160,6 +160,37 @@ private fun VortexStack.scheduleLanWarm() {
     }
 }
 
+/**
+ * Everything still waiting for the laptop, as OFFER JSON, marked as announced.
+ *
+ * Wired to `LanServer.pendingOffersProvider` so the bulk-sync done frame
+ * carries the same announcement BLE carries. That matters because the two
+ * links fail independently: a capture offered while BLE is down is retried for
+ * a minute and then given up on, and on every one of those rounds the LAN
+ * exchange was completing without a hitch.
+ *
+ * Marking them here is the same bookkeeping [tryDeliverOffer] does on a
+ * successful notify, and carries the same caveat: it means the announcement
+ * went out, not that the laptop has it. An offer that stays unfetched is still
+ * re-announced by the watchdog, and still eventually given up on — this only
+ * stops it being given up on for never having been ANNOUNCED while a working
+ * link sat there unused.
+ */
+internal fun VortexStack.pendingOffersForLan(): List<ByteArray> {
+    val now = android.os.SystemClock.elapsedRealtime()
+    val out = ArrayList<ByteArray>()
+    for (pending in pendingOffers.values.toList()) {
+        pending.lastSentAtMs = now
+        if (pending.deadlineFromMs == 0L) pending.deadlineFromMs = now
+        out += pending.offer
+    }
+    if (out.isNotEmpty()) {
+        // The link is working — arm the "unreachable" notice for the next outage.
+        offerUnreachableToasted = false
+    }
+    return out
+}
+
 /** The laptop served itself the blob for [token] over LAN — the offer did its
  *  job. Wired to `LanServer.onFileServed`. */
 internal fun VortexStack.noteFileServed(token: String) {

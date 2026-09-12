@@ -507,7 +507,22 @@ fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
     // acquire it). Started lazily here, lives for the app's lifetime.
     ensure_cursor_publisher();
     ensure_bt_hid();
-    ensure_hogp();
+    // HOGP is NOT advertised. The laptop half works — BlueZ accepts the
+    // services and a phone did once bond and drive the cursor — but no phone
+    // has attached the HID profile since, for reasons recorded in
+    // `hogp_test.rs`, and an advertisement that does nothing is not free:
+    //
+    //   * `LEAdvertisement1.Discoverable = true` PINS the adapter's
+    //     Discoverable property — BlueZ refuses to change it while we
+    //     advertise, so we are altering a system setting of the user's;
+    //   * it puts the laptop on every nearby scanner's list as a mouse;
+    //   * and because our BR/EDR and LE identities share one address, it
+    //     shadows nothing and instead makes the phone's own Bluetooth list
+    //     ambiguous — three pairings in a row landed on the wrong transport.
+    //
+    // The code stays: it is proven on this side, the transport gate already
+    // accepts it, and the remaining question is narrow and written down. Only
+    // the advertisement is withheld until that question is answered.
     ensure_injector_health();
 
     // Wireless adb, bootstrapped from a cable that is plugged in RIGHT NOW.

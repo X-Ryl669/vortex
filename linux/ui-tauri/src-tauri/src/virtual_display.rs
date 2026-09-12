@@ -27,6 +27,21 @@ use zbus::zvariant::{OwnedObjectPath, Value};
 const BUS: &str = "org.gnome.Mutter.ScreenCast";
 const PATH: &str = "/org/gnome/Mutter/ScreenCast";
 
+/// Mutter's remote-input API — the same one gnome-remote-desktop drives.
+///
+/// Pairing it with the ScreenCast session is what makes the virtual monitor
+/// *interactive* rather than a picture: input notified through this session is
+/// delivered to the compositor, and `NotifyPointerMotionAbsolute` takes the
+/// STREAM as its first argument, so coordinates are in that monitor's own
+/// space. Without the pairing there is no stream to address and absolute
+/// positioning has no frame of reference.
+///
+/// GNOME-only, exactly as the ScreenCast half already is. Verified present on
+/// this machine (mutter-18 / GNOME 50): NotifyPointerMotionAbsolute,
+/// NotifyPointerButton, NotifyPointerAxis(Discrete), NotifyTouchDown/Motion/Up.
+const RD_BUS: &str = "org.gnome.Mutter.RemoteDesktop";
+const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
+
 /// Pointer artwork drawn into the extend stream. Small enough to embed.
 const CURSOR_PNG: &[u8] = include_bytes!("../assets/cursor.png");
 
@@ -108,6 +123,11 @@ pub(crate) fn spawn_cursor_overlay(
 pub(crate) struct VirtualMonitor {
     conn: zbus::Connection,
     session: OwnedObjectPath,
+    /// The RemoteDesktop session the ScreenCast session is bound to, and the
+    /// stream path to address input at. Both are needed for every notify, and
+    /// both die with the session, so they live together here.
+    rd_session: OwnedObjectPath,
+    stream: OwnedObjectPath,
     /// The PipeWire node carrying this monitor's contents.
     pub(crate) node_id: u32,
 }
@@ -124,9 +144,39 @@ pub(crate) async fn create() -> Result<VirtualMonitor, String> {
     let screencast = zbus::Proxy::new(&conn, BUS, PATH, BUS)
         .await
         .map_err(|e| format!("mutter screencast unavailable (not GNOME?): {e}"))?;
-    let empty: HashMap<&str, Value> = HashMap::new();
+    // The RemoteDesktop session comes FIRST, because the ScreenCast session is
+    // created already knowing which one it belongs to — the binding is a
+    // property passed at creation, not something that can be attached after.
+    //
+    // Mutter ties the session's lifetime to the D-Bus CONNECTION that created
+    // it: the session is destroyed the moment that connection goes away.
+    // Measured while working this out — creating one from `busctl` left an
+    // object path that introspected to nothing, because busctl had already
+    // exited. So it must be made on `conn`, which the VirtualMonitor holds.
+    let remote_desktop = zbus::Proxy::new(&conn, RD_BUS, RD_PATH, RD_BUS)
+        .await
+        .map_err(|e| format!("mutter remote-desktop unavailable (not GNOME?): {e}"))?;
+    let rd_session: OwnedObjectPath = remote_desktop
+        .call("CreateSession", &())
+        .await
+        .map_err(|e| format!("RemoteDesktop CreateSession: {e}"))?;
+    let rd_session_proxy = zbus::Proxy::new(
+        &conn,
+        RD_BUS,
+        rd_session.clone(),
+        format!("{RD_BUS}.Session"),
+    )
+    .await
+    .map_err(|e| format!("remote-desktop session proxy: {e}"))?;
+    let rd_id: String = rd_session_proxy
+        .get_property("SessionId")
+        .await
+        .map_err(|e| format!("remote-desktop SessionId: {e}"))?;
+
+    let mut session_props: HashMap<&str, Value> = HashMap::new();
+    session_props.insert("remote-desktop-session-id", Value::from(rd_id.clone()));
     let session: OwnedObjectPath = screencast
-        .call("CreateSession", &(empty,))
+        .call("CreateSession", &(session_props,))
         .await
         .map_err(|e| format!("CreateSession: {e}"))?;
 
@@ -151,7 +201,7 @@ pub(crate) async fn create() -> Result<VirtualMonitor, String> {
         .await
         .map_err(|e| format!("RecordVirtual: {e}"))?;
 
-    let stream_proxy = zbus::Proxy::new(&conn, BUS, stream, format!("{BUS}.Stream"))
+    let stream_proxy = zbus::Proxy::new(&conn, BUS, stream.clone(), format!("{BUS}.Stream"))
         .await
         .map_err(|e| format!("stream proxy: {e}"))?;
     // Subscribe BEFORE Start, or the node id can be announced before we listen.
@@ -160,10 +210,14 @@ pub(crate) async fn create() -> Result<VirtualMonitor, String> {
         .await
         .map_err(|e| format!("subscribe: {e}"))?;
 
-    session_proxy
+    // ONLY the RemoteDesktop session is started, and the ScreenCast stream
+    // comes up with it. Starting the ScreenCast session directly fails once
+    // the two are paired — Mutter answers "Must be started from remote desktop
+    // session", because the pairing makes the remote-desktop session the owner.
+    rd_session_proxy
         .call::<_, _, ()>("Start", &())
         .await
-        .map_err(|e| format!("Start: {e}"))?;
+        .map_err(|e| format!("RemoteDesktop Start: {e}"))?;
 
     let msg = tokio::time::timeout(Duration::from_secs(5), added.next())
         .await
@@ -190,11 +244,82 @@ pub(crate) async fn create() -> Result<VirtualMonitor, String> {
     Ok(VirtualMonitor {
         conn,
         session,
+        rd_session,
+        stream,
         node_id,
     })
 }
 
 impl VirtualMonitor {
+    /// A proxy on the paired RemoteDesktop session.
+    ///
+    /// Rebuilt per call rather than stored: a zbus `Proxy` is a thin handle
+    /// over the connection we already hold, and keeping one in the struct
+    /// would make `VirtualMonitor` borrow-bound in ways the cast path does not
+    /// want. Input arrives in bursts of a few events, not thousands a second —
+    /// the gesture stream from a phone is paced by a finger.
+    async fn rd(&self) -> Option<zbus::Proxy<'_>> {
+        zbus::Proxy::new(
+            &self.conn,
+            RD_BUS,
+            self.rd_session.clone(),
+            format!("{RD_BUS}.Session"),
+        )
+        .await
+        .ok()
+    }
+
+    /// Move the pointer to a point ON THIS MONITOR.
+    ///
+    /// `x`/`y` are in the virtual monitor's own pixels, which is the whole
+    /// reason the sessions are paired: the stream argument gives Mutter the
+    /// frame of reference, so the phone can send a position from the picture
+    /// it is showing without knowing anything about the laptop's real display
+    /// layout.
+    pub(crate) async fn pointer_to(&self, x: f64, y: f64) {
+        let Some(rd) = self.rd().await else { return };
+        if let Err(e) = rd
+            .call::<_, _, ()>(
+                "NotifyPointerMotionAbsolute",
+                &(self.stream.as_str(), x, y),
+            )
+            .await
+        {
+            tracing::debug!("virtual-display: pointer move: {e}");
+        }
+    }
+
+    /// Press or release a mouse button. `button` is an evdev code (BTN_LEFT is
+    /// 0x110), which is what Mutter expects here — not an index.
+    pub(crate) async fn pointer_button(&self, button: i32, pressed: bool) {
+        let Some(rd) = self.rd().await else { return };
+        if let Err(e) = rd
+            .call::<_, _, ()>("NotifyPointerButton", &(button, pressed))
+            .await
+        {
+            tracing::debug!("virtual-display: pointer button: {e}");
+        }
+    }
+
+    /// Scroll by whole notches. Discrete rather than smooth: a phone's fling
+    /// arrives as a gesture the sender has already turned into steps, and
+    /// feeding smooth deltas would double up the acceleration.
+    pub(crate) async fn scroll(&self, dx: i32, dy: i32) {
+        let Some(rd) = self.rd().await else { return };
+        if let Err(e) = rd
+            .call::<_, _, ()>("NotifyPointerAxisDiscrete", &(0u32, dx))
+            .await
+        {
+            tracing::debug!("virtual-display: scroll x: {e}");
+        }
+        if let Err(e) = rd
+            .call::<_, _, ()>("NotifyPointerAxisDiscrete", &(1u32, dy))
+            .await
+        {
+            tracing::debug!("virtual-display: scroll y: {e}");
+        }
+    }
+
     /// Take the monitor away. Safe to call more than once.
     pub(crate) async fn stop(&self) {
         let Ok(proxy) = zbus::Proxy::new(

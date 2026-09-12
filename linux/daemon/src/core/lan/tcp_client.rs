@@ -50,6 +50,34 @@ pub struct LanReconnectOutcome {
     /// pull request open (the instant-share file queue) needs this to learn
     /// that what it asked for is never coming.
     pub bulk_status: Option<BulkStatus>,
+    /// File offers the phone announced on this round, from the done frame's
+    /// `offers` array.
+    ///
+    /// The same announcement BLE carries, on the transport that is actually
+    /// up. A capture is offered over BLE the moment it is taken, and with BLE
+    /// down that offer is retried for a minute and then dropped — while this
+    /// exchange completed cleanly every twelve seconds throughout. The phone
+    /// re-announces whatever is still pending here, so the link that works is
+    /// the one that delivers.
+    pub offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer>,
+}
+
+/// Pull the done frame's `offers` array out as real offers.
+///
+/// Separate from [`BulkStatus`], which keeps only string values and would drop
+/// an array without a word. Malformed entries are skipped one by one: a phone
+/// announcing three captures must not lose all three because one of them
+/// carried a field this build cannot read.
+fn parse_offers(json: &[u8]) -> Vec<crate::core::clipboard_mirror::ClipboardImageOffer> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("offers").and_then(|o| o.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|e| serde_json::from_value(e.clone()).ok())
+        .collect()
 }
 
 /// The bulk-sync done frame's per-dataset outcome map.
@@ -322,11 +350,13 @@ pub async fn run_lan_reconnect(
     // exchange already failed (transport unhealthy) or no request was made.
     let mut bulk: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut bulk_status: Option<BulkStatus> = None;
+    let mut offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer> = Vec::new();
     if let (Some(req), Some(_)) = (bulk_request, peer_state.as_ref()) {
         match exchange_bulk(&mut stream, &mut transport, req, wait_per_step).await {
-            Ok((datasets, status)) => {
-                bulk = datasets;
-                bulk_status = status;
+            Ok(ex) => {
+                bulk = ex.datasets;
+                bulk_status = ex.status;
+                offers = ex.offers;
             }
             Err(e) => tracing::warn!("bulk-sync exchange failed: {e}"),
         }
@@ -355,6 +385,7 @@ pub async fn run_lan_reconnect(
         peer_state_age: peer_state_read_at.elapsed(),
         bulk,
         bulk_status,
+        offers,
     })
 }
 
@@ -466,6 +497,16 @@ async fn push_outgoing_batch(
     Ok(())
 }
 
+/// What one bulk-sync round brought back.
+struct BulkExchange {
+    /// Datasets the phone shipped because our cached hash was stale.
+    datasets: Vec<(u8, Vec<u8>)>,
+    /// The done frame's per-dataset outcome map.
+    status: Option<BulkStatus>,
+    /// File offers the phone re-announced on this round.
+    offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer>,
+}
+
 /// Send the bulk-sync request and collect the chunked dataset frames the
 /// phone ships back for stale hashes, until its done frame (sub 0x02) or
 /// the time budget runs out. An old phone build that doesn't know
@@ -475,7 +516,7 @@ async fn exchange_bulk(
     transport: &mut snow::TransportState,
     request_json: &str,
     wait: Duration,
-) -> Result<(Vec<(u8, Vec<u8>)>, Option<BulkStatus>), LanError> {
+) -> Result<BulkExchange, LanError> {
     let plain = request_json.as_bytes();
     let mut ct = vec![0u8; plain.len() + 16];
     let n = transport.write_message(plain, &mut ct)?;
@@ -487,6 +528,7 @@ async fn exchange_bulk(
 
     let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut status: Option<BulkStatus> = None;
+    let mut offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer> = Vec::new();
     let mut contacts = crate::core::contacts::ContactsAssembler::default();
     let mut call_log = crate::core::call_log::CallLogAssembler::default();
     let mut sms = crate::core::sms::SmsAssembler::default();
@@ -531,6 +573,10 @@ async fn exchange_bulk(
                 status = BulkStatus::parse(&pt);
                 if status.is_none() {
                     tracing::warn!("bulk-sync: done frame is not a JSON object; no status");
+                }
+                offers = parse_offers(&pt);
+                if !offers.is_empty() {
+                    info!("← {} file offer(s) announced over LAN", offers.len());
                 }
                 break;
             }
@@ -643,13 +689,43 @@ async fn exchange_bulk(
             }
         }
     }
-    Ok((out, status))
+    Ok(BulkExchange { datasets: out, status, offers })
 }
 
 
 #[cfg(test)]
 mod tests {
-    use super::BulkStatus;
+    use super::{parse_offers, BulkStatus};
+
+    /// The done frame carries offers beside the per-dataset outcomes, and the
+    /// status map must not choke on the array sitting next to its strings.
+    #[test]
+    fn offers_ride_the_done_frame_beside_the_status() {
+        let body = br#"{"contacts":"match","offers":[
+            {"token":"abc123","name":"shot.jpg","bytes":10,"mime":"image/jpeg","kind":"screenshot"}
+        ]}"#;
+        let offers = parse_offers(body);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].token, "abc123");
+        assert_eq!(offers[0].subdir(), Some("Phone/Screenshots"));
+        // The status map still reads its own fields and ignores the array.
+        let s = BulkStatus::parse(body).unwrap();
+        assert_eq!(s.get("contacts"), Some("match"));
+    }
+
+    /// A done frame from a build that doesn't announce offers, and one whose
+    /// array holds something unreadable: neither may cost the caller anything
+    /// it could otherwise have had.
+    #[test]
+    fn missing_or_malformed_offers_are_survivable() {
+        assert!(parse_offers(br#"{"contacts":"match"}"#).is_empty());
+        assert!(parse_offers(b"not json at all").is_empty());
+        // One good entry beside one that cannot be read: keep the good one.
+        let mixed = br#"{"offers":[7,{"token":"t","name":"a.jpg","bytes":1,"mime":"image/jpeg","kind":"photo"}]}"#;
+        let offers = parse_offers(mixed);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].subdir(), Some("Phone/Photos"));
+    }
 
     #[test]
     fn nomatch_is_unservable_and_sent_is_not() {

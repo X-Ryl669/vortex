@@ -63,6 +63,32 @@ pub fn derive_media_key(handshake_hash: &[u8]) -> [u8; 32] {
 
 /// Derive the 32-byte LAPTOP→phone media key (distinct from [`derive_media_key`]
 /// so the two directions never reuse a nonce). Both peers derive it identically.
+/// HKDF info for the phone→laptop INPUT return channel on the laptop-cast
+/// connection — touch and pointer coming back from the second screen.
+///
+/// A third distinct label, for the same reason the second one exists: two
+/// streams must never share a nonce space. The video flows laptop→phone under
+/// `LAPTOP_KEY_INFO` and the input flows back on the SAME socket, so without a
+/// separate key the two directions would be sealing under one key with
+/// independent counters — which is precisely the nonce reuse the whole scheme
+/// is arranged to prevent.
+const LAPTOP_INPUT_KEY_INFO: &[u8] = b"vortex/mirror/laptop-input";
+
+/// Key for the second screen's input return channel, derived from the cast's
+/// own media key rather than from the handshake hash.
+///
+/// The cast key is already 32 secret bytes agreed for this session and
+/// delivered over the authenticated AppState channel, and it is what both ends
+/// have in hand at the point the return channel is set up — the handshake hash
+/// is not plumbed this far. Expanding it under a distinct label gives the
+/// return direction its own key, which is all that is being asked for: two
+/// streams on one socket must not share a nonce space.
+///
+/// MUST match the Android derivation of the same label.
+pub fn derive_laptop_input_key(media_key: &[u8; 32]) -> [u8; 32] {
+    derive_media_key_with_info(media_key, LAPTOP_INPUT_KEY_INFO)
+}
+
 pub fn derive_laptop_media_key(handshake_hash: &[u8]) -> [u8; 32] {
     derive_media_key_with_info(handshake_hash, LAPTOP_KEY_INFO)
 }
