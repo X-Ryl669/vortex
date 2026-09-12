@@ -824,6 +824,15 @@ class GattServer(
 
     fun hasActiveConnection(): Boolean = connectedAddrs.isNotEmpty()
 
+    /** The peers holding a live GATT link right now, by static public key.
+     *
+     *  Only peers that have completed IK appear — an address alone is an RPA
+     *  and proves nothing about identity. Used by the presence loop to decide
+     *  whose token there is no point beaconing at: a live session IS the
+     *  presence proof, so advertising at it is pure radio waste. */
+    fun linkedPeerPubs(): List<ByteArray> =
+        connectedAddrs.mapNotNull { addr -> deviceToPeerPub[addr]?.copyOf() }
+
     /**
      * True when a peer has SUBSCRIBED to AUDIO_SIGNAL, i.e. the notify path is
      * actually deliverable.
