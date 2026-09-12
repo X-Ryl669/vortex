@@ -336,6 +336,9 @@ async fn connect_and_run(
         crate::presence::touch_peer_contact();
         publish_writers(&link, &transport, writers).await;
 
+        // The liveness beat. Runs until the listener below returns.
+        let beat = tokio::spawn(state_beat(link.clone(), transport.clone()));
+
         // Runs until the phone stops notifying — a disconnect, or the cipher
         // desync escalation dropping the session on purpose.
         let r = audio_signal::run_listener(
@@ -361,6 +364,7 @@ async fn connect_and_run(
             Some(sinks.raw.clone()),
         )
         .await;
+        beat.abort();
         let _ = link.disconnect().await;
         return match r {
             Ok(()) => Ok(()),
@@ -420,6 +424,68 @@ async fn publish_writers(
             Box::pin(async move { audio_signal::write_sealed(&*l, t, ty, sub, &payload).await })
         });
         *writers.sealed.lock().await = Some(w);
+    }
+}
+
+/// Push this laptop's AppState to the phone every [`STATE_BEAT`], for as long
+/// as the link lives.
+///
+/// This is the liveness signal, not just a state push. The phone's home screen
+/// greys the laptop out after `LAPTOP_STALE_MS` (30 s) without hearing from it,
+/// and while BLE is up the LAN heartbeat deliberately relaxes to 4 minutes
+/// because "BLE carries liveness" — which was true of the BlueZ loop, which has
+/// always had a 12 s beat, and false here, which had none. Relaxing the cadence
+/// without this left a phone that was perfectly connected showing
+/// "disconnected" between LAN ticks, while file browsing over the same link
+/// carried on working. The two are a pair; neither is correct alone.
+///
+/// A failed write is not fatal on its own — GATT can refuse one transiently
+/// just after a link comes up — so a few in a row are tolerated before giving
+/// up and letting the loop reconnect.
+async fn state_beat(link: Arc<dyn GattLink>, transport: Arc<Mutex<TransportState>>) {
+    /// Matches the BlueZ loop's beat, and sits inside the phone's 30 s
+    /// staleness window with room for a lost one.
+    const STATE_BEAT: std::time::Duration = std::time::Duration::from_secs(12);
+    const MAX_FAILS: u32 = 6;
+
+    // Let the phone register its receive cipher first — it does that on its own
+    // IK callback, and a frame written before it lands is dropped without
+    // advancing the phone's recv nonce, after which every later frame fails to
+    // open. The BlueZ loop learned this the same way.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let mut consecutive_fail = 0u32;
+    loop {
+        let mut state = vortex_l3_daemon::core::appstate::AppState::now_laptop();
+        // Everything below is the portable subset of what the BlueZ beat sends.
+        // Earbuds are absent on purpose: the hand-off is Linux-only, and
+        // `now_laptop()` already leaves the field None.
+        state.locked = vortex_l3_daemon::core::platform::session().is_locked().await;
+        state.laptop_cast = crate::laptop_cast::current_offer();
+        state.laptop_cast_error = crate::laptop_cast::current_error();
+        state.camera_req = crate::camera::camera_wanted();
+        state.camera_facing = crate::camera::camera_facing();
+        state.ring_seq = crate::ring::ring_seq();
+        crate::media_remote::fill_now_playing(&mut state).await;
+
+        match audio_signal::write_state(&*link, transport.clone(), &state).await {
+            Ok(()) => {
+                consecutive_fail = 0;
+                // A successful write proves the phone is in range AND that the
+                // link is genuinely up — both are liveness signals other
+                // subsystems gate on.
+                crate::presence::touch_presence();
+                crate::presence::touch_peer_contact();
+            }
+            Err(e) => {
+                consecutive_fail += 1;
+                tracing::debug!("BLE state beat failed ({consecutive_fail}): {e}");
+                if consecutive_fail >= MAX_FAILS {
+                    tracing::info!("BLE state beat giving up; link looks dead");
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(STATE_BEAT).await;
     }
 }
 
