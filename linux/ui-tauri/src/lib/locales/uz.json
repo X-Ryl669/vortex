@@ -12,6 +12,7 @@
   "device": {
     "this": "Bu qurilma",
     "linux": "Linux noutbuk",
+    "windows": "Windows noutbuki",
     "android": "Android telefon",
     "earbuds": "Quloqchin",
     "paired_badge": "{count} ta ulangan",

@@ -81,6 +81,17 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      * removes one candidate from the list.
      */
     @Volatile internal var activePeerPub: ByteArray? = null
+
+    /**
+     * When the active peer's BLE link dropped, or 0 while it is up.
+     *
+     * Ownership has to outlive a blip. Clearing [activePeerPub] the moment its
+     * link went would hand the session to whichever other laptop reconnected
+     * first — and with a second laptop sitting in range, a two-second flap is
+     * enough. So ownership is kept and only becomes available to someone else
+     * after [OWNERSHIP_GRACE_MS] of real absence, which is the walk-away case.
+     */
+    @Volatile internal var activeLostAtMs: Long = 0L
     internal var gattServer: GattServer? = null
     /** Open read handles held for the current peer's filesystem session, so
      *  they can be dropped when the link goes. Null until [startFsServer]. */
@@ -704,7 +715,19 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // BLE session gone → mDNS discovery matters again; re-hold the
         // multicast lock so the laptop can find us over LAN. Also drop any
         // pending mirror burst — a flapping session must not queue storms.
-        server.onPeerDisconnected = { _ ->
+        server.onPeerDisconnected = { device ->
+            // If the laptop that owned the session is the one that just went,
+            // ownership is vacant again — otherwise the phone would stay bound
+            // to a laptop that has left the room, and no other could ever take
+            // over now that connecting alone no longer confers ownership.
+            // These two rules are a pair: the walk-away case is exactly what
+            // used to be served by promoting whoever connected next.
+            server.peerPubFor(device)?.let { gone ->
+                if (activePeerPub?.contentEquals(gone) == true && activeLostAtMs == 0L) {
+                    Log.i(TAG, "active laptop disconnected — ownership held for now")
+                    activeLostAtMs = android.os.SystemClock.elapsedRealtime()
+                }
+            }
             mirrorRefreshJob?.cancel()
             lanServer?.setBleLinked(false)
             // Handles belong to the session that opened them: the ids mean
@@ -792,14 +815,47 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             )
             val peerPub = outcome.peerStaticPub.copyOf()
             val previousPeer = activePeerPub
-            activePeerPub = peerPub
+            val seeking = advertiser?.seeking == true
+            val sameAsActive = previousPeer?.contentEquals(peerPub) == true
+            // CONNECTED IS NOT ACTIVE (design doc §D4). The laptop side has
+            // always kept those apart; this side did not, and simply promoted
+            // whichever laptop completed IK last.
+            //
+            // That is worse than it sounds, because the presence provider below
+            // deliberately advertises every peer EXCEPT the active one — so a
+            // second remembered laptop in range is actively invited to connect,
+            // and on arrival it took ownership. With two laptops up, ownership
+            // ping-ponged: pick one in the UI, and the other reconnected
+            // seconds later and took it straight back.
+            //
+            // Ownership now moves only when there is nothing to displace, when
+            // it is the same laptop reconnecting, or when the user asked for
+            // this one by tapping it (a targeted seek). Everything else may
+            // hold a link and get no ownership with it.
+            val chosen = seekTarget?.contentEquals(peerPub) == true
+            // The owner has been gone long enough to have really left, rather
+            // than flapped — see [activeLostAtMs].
+            val ownerGone = activeLostAtMs != 0L &&
+                android.os.SystemClock.elapsedRealtime() - activeLostAtMs > OWNERSHIP_GRACE_MS
+            val takeOver = previousPeer == null || sameAsActive || chosen || ownerGone ||
+                // An untargeted seek ("switch to any other laptop") has no
+                // named destination, so the first to answer IS the choice.
+                (seeking && seekTarget == null)
+            if (takeOver) {
+                activePeerPub = peerPub
+                activeLostAtMs = 0L
+            } else {
+                Log.i(
+                    TAG,
+                    "peer ${peerPub.take(4).joinToString("") { "%02x".format(it) }}… " +
+                        "linked but NOT active — another laptop owns the session",
+                )
+            }
             // A DIFFERENT laptop just completed IK while we were seeking —
             // that is the switch succeeding, so close the window. Ownership
             // has effectively moved; the old link drops on its own (the
             // laptop side stops being active the moment it hands over).
-            if (advertiser?.seeking == true &&
-                (previousPeer == null || !previousPeer.contentEquals(peerPub))
-            ) {
+            if (seeking && takeOver && !sameAsActive) {
                 Log.i(TAG, "seek satisfied — another laptop connected")
                 // Tell the laptop we just left, while its link is still up.
                 // Ordering matters: this runs BEFORE stopSeeking() teardown so
@@ -859,7 +915,10 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             if (kind == FrameSub.HANDOFF_RELEASE) {
                 val who = if (successorName.isBlank()) "another phone" else successorName
                 Log.i(TAG, "peer released us (now with $who) — resuming presence")
-                if (activePeerPub?.contentEquals(peerPub) == true) activePeerPub = null
+                if (activePeerPub?.contentEquals(peerPub) == true) {
+                    activePeerPub = null
+                    activeLostAtMs = 0L
+                }
                 // A seek in flight is moot: the laptop already chose someone.
                 stopSeeking()
                 // Presence resumes on the next phase evaluation; kick it so we
@@ -907,7 +966,11 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 return@provider all.filter { it.peerStaticPub.contentEquals(target) }
                     .map { it.prs }
             }
-            val linkedPub = activePeerPub
+            // Suppress the owner's token only while it is actually LINKED —
+            // the live session is the presence proof, so beaconing at it is
+            // waste. Once its link drops we must advertise it again or the
+            // laptop we still consider the owner could never find us back.
+            val linkedPub = activePeerPub?.takeIf { activeLostAtMs == 0L }
             all.filter { linkedPub == null || !it.peerStaticPub.contentEquals(linkedPub) }
                 .map { it.prs }
         }
@@ -1270,6 +1333,18 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
 
     companion object {
         internal const val TAG = "VortexStack"
+
+        /**
+         * How long a disconnected owner keeps the session before another
+         * laptop may take it.
+         *
+         * Long enough to ride out a BLE flap — which is the difference between
+         * "my laptop blinked" and "I walked away" — and short enough that
+         * arriving at the other desk does not feel stuck. Tapping the device
+         * in the UI bypasses the wait entirely, because an explicit choice
+         * should never queue behind a timer.
+         */
+        internal const val OWNERSHIP_GRACE_MS = 20_000L
         /** How long after losing the laptop link the phone keeps
          *  advertising in LOW_LATENCY (reconnect-seeking) mode. */
         internal const val FAST_ADV_WINDOW_MS = 10 * 60_000L

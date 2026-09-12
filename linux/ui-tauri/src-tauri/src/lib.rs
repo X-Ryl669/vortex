@@ -603,6 +603,7 @@ pub fn run() {
             worker::start_scan,
             worker::refresh_state,
             ipc::get_peer_states,
+            ipc::host_platform,
             worker::start_screen_mirror,
             worker::stop_screen_mirror,
             pairing::start_pair,

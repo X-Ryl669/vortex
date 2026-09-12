@@ -459,6 +459,15 @@ class GattServer(
         Log.i(TAG, "registered audio session for peer=${peerHex.take(8)}… device=${device.address}")
     }
 
+    /** Which peer a connected device authenticated as, or null if IK has not
+     *  completed on it.
+     *
+     *  The disconnect hook hands back a [BluetoothDevice], and the caller
+     *  usually needs the identity behind it — an address is an RPA and means
+     *  nothing on its own. */
+    fun peerPubFor(device: BluetoothDevice): ByteArray? =
+        deviceToPeerPub[device.address]?.copyOf()
+
     /** Drop the audio session for a peer (call on un-trust). Safe to
      *  call repeatedly — the maps tolerate missing keys. */
     fun forgetAudioSession(peerStaticPub: ByteArray) {

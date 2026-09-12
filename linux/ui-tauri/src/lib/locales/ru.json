@@ -12,6 +12,7 @@
   "device": {
     "this": "Это устройство",
     "linux": "Linux ноутбук",
+    "windows": "Ноутбук Windows",
     "android": "Android телефон",
     "earbuds": "Наушники",
     "paired_badge": "{count} сопряжено",

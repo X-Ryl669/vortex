@@ -175,6 +175,16 @@ fn peer_state_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Str
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Which desktop this build is running on: `"linux"`, `"windows"`, ….
+///
+/// The frontend is ONE bundle on every platform — the same HTML and the same
+/// `invoke()` calls ship everywhere — so it cannot know this at build time. Ask
+/// it, and a Windows machine stops labelling its own card "Linux laptop".
+#[tauri::command]
+pub(crate) fn host_platform() -> &'static str {
+    std::env::consts::OS
+}
+
 /// Tauri command: pull the latest per-peer state over the invoke-response
 /// channel. The UI polls this every ~15s as a backstop to the pushed
 /// `vortex:peer_state` events — if those stop arriving, the poll keeps the

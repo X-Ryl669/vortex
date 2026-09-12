@@ -3,7 +3,7 @@
 // laptop, the phone, the earbuds), translated from the Vortex design system.
 // Phone + earbuds are wired to live daemon state; the laptop card's battery and
 // mirror-to-phone action are follow-ups (no UI accessor yet).
-import { ref, computed } from "vue";
+import { ref, computed, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -45,6 +45,21 @@ import {
 import { peers } from "@/lib/connectionStore";
 
 const { t } = useI18n();
+
+// This laptop's own OS, for its card's subtitle. One frontend bundle ships to
+// every platform, so it has to be asked rather than known at build time —
+// without it a Windows machine calls itself a Linux laptop.
+const hostOs = ref("linux");
+onMounted(async () => {
+  try {
+    hostOs.value = await invoke<string>("host_platform");
+  } catch {
+    /* keep the default; a wrong label beats an empty card */
+  }
+});
+const thisDeviceKind = computed(() =>
+  hostOs.value === "windows" ? t("device.windows") : t("device.linux"),
+);
 
 const connectedCount = computed(
   () => 1 + (phoneOnline.value ? 1 : 0) + (activeEarbuds.value?.connected ? 1 : 0),
@@ -145,7 +160,7 @@ const earbudsStatus = computed(() => {
           </div>
           <div class="mt-1.5 flex items-center gap-2">
             <span class="vx-dot bg-primary shadow-[0_0_8px_hsl(var(--primary)/0.6)]" />
-            <span class="text-[12.5px] text-muted-foreground">{{ t("device.linux") }}</span>
+            <span class="text-[12.5px] text-muted-foreground">{{ thisDeviceKind }}</span>
           </div>
         </div>
       </div>

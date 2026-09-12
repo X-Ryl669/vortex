@@ -12,6 +12,7 @@
   "device": {
     "this": "This device",
     "linux": "Linux laptop",
+    "windows": "Windows laptop",
     "android": "Android phone",
     "earbuds": "Earbuds",
     "paired_badge": "{count} paired",
