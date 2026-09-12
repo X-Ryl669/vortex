@@ -77,9 +77,11 @@ pub const AUMID: &str = "com.vortex.desktop";
 pub fn register_aumid_shortcut() {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::{Interface, GUID, PCWSTR, PWSTR};
-    use windows::Win32::Foundation::PROPERTYKEY;
-    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
+    use windows::Win32::Foundation::{E_OUTOFMEMORY, PROPERTYKEY};
+    use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PROPVARIANT};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoTaskMemAlloc, IPersistFile, CLSCTX_INPROC_SERVER,
+    };
     use windows::Win32::System::Variant::VT_LPWSTR;
     use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink, FOLDERID_Programs};
@@ -112,7 +114,7 @@ pub fn register_aumid_shortcut() {
     let exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let link_w: Vec<u16> =
         link_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let mut aumid_w: Vec<u16> = AUMID.encode_utf16().chain(std::iter::once(0)).collect();
+    let aumid_w: Vec<u16> = AUMID.encode_utf16().chain(std::iter::once(0)).collect();
 
     let result = (|| -> windows::core::Result<()> {
         // SAFETY: a straight-line COM sequence — create the shell-link object,
@@ -126,19 +128,43 @@ pub fn register_aumid_shortcut() {
             link.SetDescription(&HSTRING::from("Vortex"))?;
 
             // PROPVARIANT has no safe constructor in this crate version, so it
-            // is assembled by hand: a VT_LPWSTR tag plus a borrowed pointer to
-            // the string. `SetValue` copies the value into the store, so the
-            // buffer only has to survive the call — and because the struct has
-            // no `Drop`, letting it fall out of scope cannot free a pointer we
-            // still own.
+            // is assembled by hand — but the string it points at MUST come from
+            // the COM allocator.
+            //
+            // A PROPVARIANT is an OWNING value by COM convention: whoever holds
+            // one may call `PropVariantClear`, and for a `VT_LPWSTR` that means
+            // `CoTaskMemFree(pwszVal)`. Pointing it at a Rust `Vec<u16>`, as
+            // this did, hands a Rust heap block to the COM allocator — and then
+            // the `Vec` frees the same block again on the way out. That is
+            // heap corruption, and it is what killed the first Windows run
+            // (`STATUS_HEAP_CORRUPTION`, 0xc0000374, faulting in ntdll)
+            // milliseconds after this function first created the shortcut. It
+            // could only ever happen once per machine, because the existence
+            // check above skips all of this on every later run — which is
+            // exactly the "crashed once, fine afterwards" shape it had.
+            //
+            // So: allocate with `CoTaskMemAlloc`, and clear the variant
+            // ourselves when we are done. One allocator throughout, one free.
+            let bytes = std::mem::size_of_val(&aumid_w[..]);
+            let com_str = CoTaskMemAlloc(bytes) as *mut u16;
+            if com_str.is_null() {
+                return Err(windows::core::Error::from(E_OUTOFMEMORY));
+            }
+            std::ptr::copy_nonoverlapping(aumid_w.as_ptr(), com_str, aumid_w.len());
+
             let mut pv = PROPVARIANT::default();
             {
                 let inner = &mut *pv.Anonymous.Anonymous;
                 inner.vt = VT_LPWSTR;
-                inner.Anonymous.pwszVal = PWSTR(aumid_w.as_mut_ptr());
+                inner.Anonymous.pwszVal = PWSTR(com_str);
             }
             let store: IPropertyStore = link.cast()?;
-            store.SetValue(&PKEY_APPUSERMODEL_ID, &pv)?;
+            // Clear on BOTH paths: `SetValue` copies the value, so the buffer is
+            // ours to release whether it succeeded or not. `PropVariantClear`
+            // zeroes the variant too, so the later drop cannot double-free.
+            let set = store.SetValue(&PKEY_APPUSERMODEL_ID, &pv);
+            let _ = PropVariantClear(&mut pv);
+            set?;
             store.Commit()?;
 
             let file: IPersistFile = link.cast()?;
