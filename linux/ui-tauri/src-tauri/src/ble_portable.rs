@@ -95,6 +95,23 @@ const BACKOFF_SECS: [u64; 5] = [2, 5, 15, 30, 60];
 /// catch the phone's advertising interval a few times over.
 const SCAN_MS: u64 = 8_000;
 
+/// Whether this loop currently holds a GATT link to the phone.
+///
+/// The LAN heartbeat's cadence keys off it: with BLE up, BLE already carries
+/// liveness, state pushes and the call signal, so the LAN tick only has to keep
+/// the cached-IP fast path warm and can drop from 12 s to 4 minutes.
+///
+/// The Linux loop answers the same question from its BLE-audio session map,
+/// which does not exist here — earbuds hand-off is Linux-only. That map being
+/// the only implementation is why this side was hard-coded to "BLE is down" and
+/// paid a full TCP + Noise IK every twelve seconds forever.
+static LINK_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the portable BLE loop currently holds a link. See [`LINK_UP`].
+pub(crate) fn link_is_up() -> bool {
+    LINK_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Keep a BLE link to the trusted peer up, forever.
 ///
 /// Returns only if there is no way to proceed at all; every transient failure
@@ -154,7 +171,16 @@ pub(crate) async fn run_portable_ble_loop(
             continue;
         }
 
-        match connect_and_run(&central, &identity, &peer_store, &peer, &sinks, &writers).await {
+        let outcome = connect_and_run(&central, &identity, &peer_store, &peer, &sinks, &writers).await;
+        // Down before anything else looks: every exit from `connect_and_run` —
+        // clean drop, listener error, a failure before the link was ever up —
+        // means we hold no link now. Clearing it here rather than at each
+        // return site is what stops a new escape route leaving the flag stuck
+        // on, which would park the LAN heartbeat at 4 minutes with no BLE to
+        // cover the gap.
+        LINK_UP.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::arbiter::note_disconnected(&peer.peer_static_pub);
+        match outcome {
             Ok(()) => {
                 // A clean return means the link dropped, which is normal — the
                 // phone moved, slept, or restarted. Reconnect promptly.
@@ -170,6 +196,17 @@ pub(crate) async fn run_portable_ble_loop(
         // Clear the writers before waiting: a feature firing during the gap
         // must see "no link" rather than push into a torn-down one.
         clear_writers(&writers).await;
+
+        // Wake the LAN heartbeat NOW. With BLE down it is the only liveness and
+        // hand-off path again, and it is now allowed to sleep 4 minutes while
+        // BLE is up — so without this nudge a dropped link would leave the
+        // phone looking offline for minutes. The two changes are a pair: the
+        // relaxed cadence is only safe because this fires. (The BlueZ loop has
+        // always done it; this one had nothing to wake, because its cadence
+        // never relaxed.)
+        if let Some(n) = crate::SYNC_NUDGE.get() {
+            n.notify_one();
+        }
 
         let wait = BACKOFF_SECS[consec_fail.min(BACKOFF_SECS.len() - 1)];
         tokio::select! {
@@ -294,6 +331,7 @@ async fn connect_and_run(
             );
         }
         tracing::info!(addr = %addr, "BLE link established");
+        LINK_UP.store(true, std::sync::atomic::Ordering::Relaxed);
         crate::presence::touch_presence();
         crate::presence::touch_peer_contact();
         publish_writers(&link, &transport, writers).await;

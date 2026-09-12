@@ -1455,10 +1455,21 @@ pub(crate) fn spawn_heartbeat(
                             Duration::from_secs(12)
                         }
                     } else if {
+                        // "Is the BLE link down?" — asked of whichever loop is
+                        // running. Linux reads its BLE-audio session map;
+                        // elsewhere the portable loop keeps its own flag,
+                        // because that map is Linux-only (earbuds hand-off is).
+                        //
+                        // This used to be a bare `true` off Linux, i.e. "BLE is
+                        // always down", so a Windows laptop never reached the
+                        // 240 s branch and paid a fresh TCP connect + full
+                        // Noise IK every twelve seconds — measured at nine
+                        // handshakes in 95 s against the Linux machine's two,
+                        // with the phone's Wi-Fi woken for each one.
                         #[cfg(target_os = "linux")]
                         { auto_ble_writers.lock().await.is_empty() }
                         #[cfg(not(target_os = "linux"))]
-                        { true }
+                        { !crate::ble_portable::link_is_up() }
                     } {
                         Duration::from_secs(12)
                     } else {
