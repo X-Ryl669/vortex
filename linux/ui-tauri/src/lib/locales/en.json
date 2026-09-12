@@ -172,6 +172,7 @@
     "recents": "Recents",
     "messages": "Messages",
     "notes": "Notes",
+    "phoneFiles": "Phone files",
     "settings": "Settings"
   },
   "notes": {
@@ -299,5 +300,20 @@
       "keyring": "Keyring",
       "gstreamer": "Screen mirroring codec"
     }
+  },
+  "phoneFiles": {
+    "title": "Phone files",
+    "roots": "Phone",
+    "refresh": "Refresh",
+    "loading": "Reading the folder…",
+    "empty": "This folder is empty.",
+    "noFolders": "No folder shared yet. On the phone: Settings → Folders the laptop can see.",
+    "truncated": "Only the first 500 entries are shown.",
+    "open": "Download",
+    "colName": "Name",
+    "colDate": "Modified",
+    "colSize": "Size",
+    "showHidden": "Show hidden items",
+    "hideHidden": "Hide hidden items"
   }
 }

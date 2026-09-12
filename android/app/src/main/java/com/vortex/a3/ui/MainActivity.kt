@@ -240,12 +240,36 @@ class MainActivity : ComponentActivity() {
      *  result: the watcher re-checks the grant on every scan, and the
      *  Settings hint re-reads it when the toggle moves. */
     internal val mediaPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
+        ActivityResultContracts.RequestMultiplePermissions(),
     ) { _ -> }
 
+    /** Ask for whatever the media toggles still need. From Android 13 images
+     *  and video are separate grants, so this is a set, not one string; below
+     *  it they are the same legacy grant and the set has one member. */
+    /** The folder picker behind "let the laptop browse a folder". The grant is
+     *  persisted on the way back so it survives a restart; a cancelled pick
+     *  returns null and simply changes nothing. */
+    private val folderPickLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri != null) com.vortex.a3.core.files.PhoneFiles.persistGrant(this, uri)
+    }
+
+    internal fun pickSharedFolder() {
+        try {
+            folderPickLauncher.launch(null)
+        } catch (e: Exception) {
+            android.util.Log.w("PhoneFiles", "no folder picker available: ${e.message}")
+        }
+    }
+
     internal fun requestMediaPermission() {
-        if (hasMediaReadPermission()) return
-        mediaPermissionLauncher.launch(com.vortex.a3.core.media.mediaReadPermission())
+        val missing = com.vortex.a3.core.media.mediaReadPermissions().filter {
+            androidx.core.content.ContextCompat.checkSelfPermission(this, it) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) return
+        mediaPermissionLauncher.launch(missing.toTypedArray())
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -411,6 +435,7 @@ class MainActivity : ComponentActivity() {
         onOpenNotificationAccess = ::onOpenNotificationAccess,
         onOpenScreenControl = ::onOpenAccessibilitySettings,
         onRequestMediaPermission = ::requestMediaPermission,
+        onPickSharedFolder = ::pickSharedFolder,
         onEnableBluetooth = ::onEnableBluetooth,
         isAggressiveOem = isAggressiveOemRom(),
         isIgnoringBatteryOptimizations = ::isIgnoringBatteryOptimizations,

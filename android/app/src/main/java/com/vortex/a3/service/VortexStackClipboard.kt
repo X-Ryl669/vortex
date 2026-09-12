@@ -148,6 +148,10 @@ internal fun VortexStack.offerCapturedMedia(media: com.vortex.a3.core.media.Capt
         // this was not a share. The phone names a KIND, never a path.
         o.put("kind", media.kind.wire)
         val offer = o.toString().toByteArray(Charsets.UTF_8)
+        // Track the row behind this token, so its deletion on the phone can be
+        // passed on (see CaptureLedger). Recorded at the offer, not at the
+        // fetch: the laptop files its copy under the same token either way.
+        com.vortex.a3.core.media.CaptureLedger.record(token, media.collection, media.uri)
         Log.i(VortexStack.TAG, "${media.kind.name.lowercase()} offered to laptop ('$name', ${file.bytes.size} bytes, token=$token)")
         offerFileToLaptop(token, name, offer, quiet = true)
     }

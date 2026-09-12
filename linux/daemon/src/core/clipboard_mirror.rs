@@ -78,6 +78,8 @@ impl ClipboardImageOffer {
         match self.kind.as_str() {
             "screenshot" => Some("Phone/Screenshots"),
             "photo" => Some("Phone/Photos"),
+            "screen_recording" => Some("Phone/Screen recordings"),
+            "video" => Some("Phone/Videos"),
             _ => None,
         }
     }
@@ -277,6 +279,8 @@ mod offer_tests {
     fn known_kinds_map_to_fixed_folders() {
         assert_eq!(offer("screenshot").subdir(), Some("Phone/Screenshots"));
         assert_eq!(offer("photo").subdir(), Some("Phone/Photos"));
+        assert_eq!(offer("screen_recording").subdir(), Some("Phone/Screen recordings"));
+        assert_eq!(offer("video").subdir(), Some("Phone/Videos"));
         assert!(offer("photo").is_capture());
     }
 
@@ -284,7 +288,10 @@ mod offer_tests {
     /// path, and a share (empty kind) stays in the root.
     #[test]
     fn unknown_or_hostile_kinds_land_in_the_root() {
-        for k in ["", "../../etc", "/abs", "Screenshots", "video", "photo/../x"] {
+        // "audio" and "document" are here as kinds a LATER build might add:
+        // until it does they must behave like any other unknown value, and a
+        // build that adds one has to move it out of this list deliberately.
+        for k in ["", "../../etc", "/abs", "Screenshots", "audio", "document", "photo/../x"] {
             assert_eq!(offer(k).subdir(), None, "kind {k:?}");
             assert!(!offer(k).is_capture());
         }

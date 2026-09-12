@@ -27,5 +27,10 @@ export const router = createRouter({
     },
     // Standalone popup window (no AppShell rail) — see App.vue.
     { path: "/clipboard", name: "clipboard", component: () => import("@/pages/clipboard/ClipboardPage.vue") },
+    {
+      path: "/phone-files",
+      name: "phone-files",
+      component: () => import("@/pages/phonefiles/PhoneFilesPage.vue"),
+    },
   ],
 });

@@ -107,7 +107,58 @@ fn send(la: LiveActivity) {
     }
 }
 
-fn pill(title: String, text: String, progress: i32, ended: bool) -> LiveActivity {
+/// The pill's own action verbs, arriving from the GNOME extension's buttons
+/// on the same channel the call pill uses. Returns true when the verb was
+/// ours, so the caller knows not to pass it on to the phone.
+pub(crate) fn handle_pill_action(verb: &str) -> bool {
+    match verb {
+        "xfer:cancel" => {
+            cancel_all();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Stop the batch: drop whatever is still queued, cut the pull in flight, and
+/// let the pill resolve as failed.
+///
+/// Everything, not one file: the pill shows the batch as one thing, so its one
+/// button has to mean what the thing it sits on says. A partly-written file is
+/// left to the receive path, which already writes to a temporary name and only
+/// renames a whole file into place — so a cancelled pull leaves nothing behind
+/// that looks complete.
+fn cancel_all() {
+    let dropped = crate::PENDING_FILE_OFFERS
+        .get()
+        .and_then(|q| q.lock().ok().map(|mut g| g.drain(..).count()))
+        .unwrap_or(0);
+    vortex_l3_daemon::core::file_progress::request_cancel();
+    let mut cancelled = 0usize;
+    if let Ok(mut g) = ITEMS.lock() {
+        for it in g.iter_mut().filter(|i| !i.done && !i.failed) {
+            it.failed = true;
+            cancelled += 1;
+        }
+    }
+    tracing::info!(queued = dropped, in_flight = cancelled, "file transfer cancelled by the user");
+    emit();
+}
+
+/// Where the last finished batch saved, as a `file://` URI for the pill's
+/// click. Kept across the batch reset because the pill outlives it by a few
+/// seconds — which is exactly the window someone looks up and wants the file.
+static LAST_DIR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Note where a received file landed, for the finished pill to open.
+pub(crate) fn note_saved(path: &std::path::Path) {
+    let Some(dir) = path.parent() else { return };
+    if let Ok(mut g) = LAST_DIR.lock() {
+        *g = Some(format!("file://{}", dir.display()));
+    }
+}
+
+fn pill(title: String, text: String, progress: i32, ended: bool, open: String) -> LiveActivity {
     LiveActivity {
         key: PILL_KEY.to_string(),
         app: "Vortex".to_string(),
@@ -117,6 +168,7 @@ fn pill(title: String, text: String, progress: i32, ended: bool) -> LiveActivity
         title,
         text,
         sub: String::new(),
+        open,
         progress,
         started_at: 0,
         muted: false,
@@ -194,7 +246,14 @@ fn emit() {
         }
     };
 
-    send(pill(title, text, progress, false));
+    // Only the finished pill is worth clicking; mid-transfer there is nothing
+    // in the folder yet to go and look at.
+    let open = if all_done {
+        LAST_DIR.lock().ok().and_then(|g| g.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    send(pill(title, text, progress, false, open));
 
     if all_done {
         // Reset the batch so the next share starts fresh, then remove the pill
@@ -203,10 +262,10 @@ fn emit() {
             g.clear();
         }
         std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(4));
+            std::thread::sleep(std::time::Duration::from_secs(5));
             let idle = ITEMS.lock().map(|g| g.is_empty()).unwrap_or(true);
             if idle {
-                send(pill(String::new(), String::new(), -1, true));
+                send(pill(String::new(), String::new(), -1, true, String::new()));
             }
         });
     }

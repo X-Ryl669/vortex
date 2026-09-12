@@ -93,6 +93,7 @@ class VortexActions(
     val onOpenScreenControl: () -> Unit,
     /** Ask for the storage grant the media-share toggles need (no-op if held). */
     val onRequestMediaPermission: () -> Unit,
+    val onPickSharedFolder: () -> Unit,
     /** Ask the system to turn Bluetooth on (one-tap dialog). */
     val onEnableBluetooth: () -> Unit,
     val isAggressiveOem: Boolean,
@@ -150,6 +151,17 @@ fun VortexRoot(
                     com.vortex.a3.core.media.MediaAutoShareSetting.screenshots.collectAsState().value
                 val sharePhotosOn =
                     com.vortex.a3.core.media.MediaAutoShareSetting.photos.collectAsState().value
+                val shareScreenRecordingsOn =
+                    com.vortex.a3.core.media.MediaAutoShareSetting.screenRecordings
+                        .collectAsState().value
+                val shareVideosOn =
+                    com.vortex.a3.core.media.MediaAutoShareSetting.videos.collectAsState().value
+                // Re-read whenever the settings screen is shown: the picker is
+                // a separate activity, so a grant taken there lands while this
+                // composition is away.
+                val sharedFolderCount = remember(showSettings) {
+                    com.vortex.a3.core.files.PhoneFiles.grantedTrees(activity).size
+                }
                 // Re-checked each time Settings opens AND after either toggle
                 // moves: the flip that turns a row on is what asks for the
                 // grant, and the hint should follow the answer.
@@ -212,7 +224,20 @@ fun VortexRoot(
                             com.vortex.a3.core.media.MediaAutoShareSetting.setPhotos(it)
                             if (it) actions.onRequestMediaPermission()
                         },
+                        shareScreenRecordingsOn = shareScreenRecordingsOn,
+                        onShareScreenRecordingsChange = {
+                            com.vortex.a3.core.media.MediaAutoShareSetting
+                                .setScreenRecordings(it)
+                            if (it) actions.onRequestMediaPermission()
+                        },
+                        shareVideosOn = shareVideosOn,
+                        onShareVideosChange = {
+                            com.vortex.a3.core.media.MediaAutoShareSetting.setVideos(it)
+                            if (it) actions.onRequestMediaPermission()
+                        },
                         mediaReadGranted = mediaReadGranted,
+                        sharedFolderCount = sharedFolderCount,
+                        onPickSharedFolder = actions.onPickSharedFolder,
                         screenControlOn = screenControlOn,
                         onScreenControlClick = actions.onOpenScreenControl,
                         onBack = { showSettings = false },

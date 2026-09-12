@@ -172,6 +172,7 @@
     "recents": "Qo'ng'iroqlar",
     "messages": "Xabarlar",
     "notes": "Eslatmalar",
+    "phoneFiles": "Telefon fayllari",
     "settings": "Sozlamalar"
   },
   "notes": {
@@ -299,5 +300,20 @@
       "keyring": "Kalitlar ombori",
       "gstreamer": "Ekran uzatish kodeki"
     }
+  },
+  "phoneFiles": {
+    "title": "Telefon fayllari",
+    "roots": "Telefon",
+    "refresh": "Yangilash",
+    "loading": "Papka o‘qilyapti…",
+    "empty": "Bu papka bo‘sh.",
+    "noFolders": "Hali papka ochilmagan. Telefonda: Sozlamalar → Laptop ko‘ra oladigan papkalar.",
+    "truncated": "Faqat dastlabki 500 ta element ko‘rsatilyapti.",
+    "open": "Yuklab olish",
+    "colName": "Nomi",
+    "colDate": "O‘zgargan",
+    "colSize": "Hajmi",
+    "showHidden": "Yashirinlarni ko‘rsatish",
+    "hideHidden": "Yashirinlarni berkitish"
   }
 }

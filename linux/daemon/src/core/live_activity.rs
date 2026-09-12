@@ -51,6 +51,15 @@ pub struct LiveActivity {
     pub speaker: bool,
     #[serde(default)]
     pub has_earbuds: bool,
+    /// A URI the pill opens when clicked — the folder a finished transfer
+    /// saved into, say. Empty for a pill that does nothing on click.
+    ///
+    /// The transfer pill fades a few seconds after it finishes, and until now
+    /// that was the only thing that ever said where the file went; by the time
+    /// someone looked up from what they were doing it was gone. Clicking it
+    /// now opens the folder, which is what the pill is for.
+    #[serde(default)]
+    pub open: String,
     /// True = the activity finished / was removed → clear its pill.
     #[serde(default)]
     pub ended: bool,

@@ -102,6 +102,8 @@ pub(crate) async fn notify_received(path: PathBuf, kind: &str) {
     let title = match kind {
         "screenshot" => "Screenshot from your phone",
         "photo" => "Photo from your phone",
+        "screen_recording" => "Screen recording from your phone",
+        "video" => "Video from your phone",
         _ => "File from your phone",
     };
     let name = path
@@ -208,6 +210,10 @@ pub(crate) async fn request(label: &str, count: usize, total: u64, kind: &str) -
         ("screenshot", true) => format!("Phone took {count} screenshots"),
         ("photo", false) => "Phone took a photo".to_string(),
         ("photo", true) => format!("Phone took {count} photos"),
+        ("screen_recording", false) => "Phone made a screen recording".to_string(),
+        ("screen_recording", true) => format!("Phone made {count} screen recordings"),
+        ("video", false) => "Phone recorded a video".to_string(),
+        ("video", true) => format!("Phone recorded {count} videos"),
         (_, true) => format!("Phone wants to send {count} files"),
         (_, false) => "Phone wants to send a file".to_string(),
     };

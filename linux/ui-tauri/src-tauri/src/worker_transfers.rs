@@ -62,4 +62,16 @@ pub(crate) fn wire_transfer_indicators(ble_live_tx: UnboundedSender<LiveActivity
     // Phone→laptop receive consent: route fc:accept/fc:decline banner clicks
     // back to the waiting offer-consumer (instant-share style Accept/Decline).
     tokio::spawn(crate::file_consent::watch());
+
+    // Captures the phone deleted are moved to a trash rather than removed, so
+    // something has to empty it. Once at startup and once a day after: the
+    // window is thirty days, so the exact moment never matters.
+    tokio::spawn(async {
+        loop {
+            tokio::task::spawn_blocking(crate::capture_ledger::purge_trash)
+                .await
+                .ok();
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
 }

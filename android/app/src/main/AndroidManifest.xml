@@ -100,6 +100,10 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <!-- Same feature, same switch-it-on-yourself rule, for screen recordings
+         and camera video. Granular from 13 like the images one; below that the
+         legacy grant above already covers video. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
 
     <!-- Guards the app's OWN broadcasts (a file-consent decision, a Find-My
          ring stop, a laptop-media transport tap). Those receivers are

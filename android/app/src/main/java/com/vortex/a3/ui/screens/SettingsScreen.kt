@@ -27,6 +27,8 @@ import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Headset
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.LightMode
@@ -35,6 +37,7 @@ import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.Screenshot
 import androidx.compose.material.icons.outlined.TouchApp
+import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -84,9 +87,17 @@ fun SettingsScreen(
     onShareScreenshotsChange: (Boolean) -> Unit,
     sharePhotosOn: Boolean,
     onSharePhotosChange: (Boolean) -> Unit,
-    /** Whether the storage grant behind the two rows above is held; without
-     *  it their hint says what to do instead of what they do. */
+    shareScreenRecordingsOn: Boolean,
+    onShareScreenRecordingsChange: (Boolean) -> Unit,
+    shareVideosOn: Boolean,
+    onShareVideosChange: (Boolean) -> Unit,
+    /** Whether the media grants behind the four rows above are held; without
+     *  them their hint says what to do instead of what they do. */
     mediaReadGranted: Boolean,
+    /** How many folders the laptop may browse; 0 hides nothing, it just makes
+     *  the row say there is nothing to browse yet. */
+    sharedFolderCount: Int,
+    onPickSharedFolder: () -> Unit,
     screenControlOn: Boolean,
     onScreenControlClick: () -> Unit,
     onBack: () -> Unit,
@@ -225,6 +236,48 @@ fun SettingsScreen(
                     else str("settings.share_media_needs_permission"),
                     checked = sharePhotosOn,
                     onCheckedChange = onSharePhotosChange,
+                )
+                RowDivider()
+                ToggleRow(
+                    icon = Icons.Outlined.Videocam,
+                    title = str("settings.share_screen_recordings"),
+                    hint = if (mediaReadGranted || !shareScreenRecordingsOn) {
+                        str("settings.share_screen_recordings_hint")
+                    } else {
+                        str("settings.share_media_needs_permission")
+                    },
+                    checked = shareScreenRecordingsOn,
+                    onCheckedChange = onShareScreenRecordingsChange,
+                )
+                RowDivider()
+                ToggleRow(
+                    icon = Icons.Outlined.Movie,
+                    title = str("settings.share_videos"),
+                    hint = if (mediaReadGranted || !shareVideosOn) str("settings.share_videos_hint")
+                    else str("settings.share_media_needs_permission"),
+                    checked = shareVideosOn,
+                    onCheckedChange = onShareVideosChange,
+                )
+            }
+
+            // ── LAPTOP → PHONE, the other way round ──────────────────────
+            // Not a toggle: nothing is copied by this. The laptop gets to LIST
+            // a folder the user hands it and pull a file out on request, which
+            // is what a Download folder actually wants — mostly things nobody
+            // needs a second copy of, and only the person looking knows which
+            // few are the exception.
+            SectionLabel(str("settings.sec_browse"))
+            SectionCard {
+                ActionRow(
+                    icon = Icons.Outlined.FolderOpen,
+                    title = str("settings.shared_folders"),
+                    hint = if (sharedFolderCount > 0) {
+                        str("settings.shared_folders_some").replace("%d", "$sharedFolderCount")
+                    } else {
+                        str("settings.shared_folders_none")
+                    },
+                    status = if (sharedFolderCount > 0) "$sharedFolderCount" else "",
+                    onClick = onPickSharedFolder,
                 )
             }
             // When sync is on but background reads aren't granted, phone→laptop

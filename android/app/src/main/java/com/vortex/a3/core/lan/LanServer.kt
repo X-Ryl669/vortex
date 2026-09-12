@@ -120,6 +120,16 @@ class LanServer(
     var pendingOffersProvider: () -> List<ByteArray> = { emptyList() }
 
     /**
+     * Capture tokens whose gallery rows this phone no longer has.
+     *
+     * Rides the same done frame as the offers, in the opposite direction: the
+     * laptop moves its automatic copy to the trash. Only this way round — the
+     * laptop deleting its copy cannot delete our original without a system
+     * consent dialog per file.
+     */
+    var deletedCapturesProvider: () -> List<String> = { emptyList() }
+
+    /**
      * Watermark-dataset provider for bulk-sync (currently `sms_history`):
      * called with the peer's "I have everything up to [sinceMs]" watermark,
      * returns the JSON of everything NEWER (oldest-first, provider-capped)
@@ -831,8 +841,17 @@ class LanServer(
                                 // reliably over TCP as CLIPBOARD_FILE chunks.
                                 if (key == "clipboard_file") {
                                     val token = req.optString(key, "")
+                                    // A stashed blob, or — when the token is a
+                                    // document URI — a file the laptop picked
+                                    // out of a browsed folder. One pull path
+                                    // for both: the transfer, the chunking and
+                                    // the laptop's save are already proven, and
+                                    // a browsed file is not a different kind of
+                                    // file just because it was asked for.
                                     val blob = com.vortex.a3.core.clipboard.ClipboardBlobStore
                                         .getByToken(token)
+                                        ?: com.vortex.a3.core.files.PhoneFiles
+                                            .read(context, token)?.bytes
                                     if (blob == null) {
                                         Log.i(TAG, "bulk-sync: clipboard_file token=$token not found")
                                         status.put(key, "nomatch")
@@ -848,6 +867,18 @@ class LanServer(
                                             Log.w(TAG, "onFileServed listener threw: ${e.message}")
                                         }
                                     }
+                                    continue
+                                }
+                                // Folder listing: the value is the document
+                                // URI to look inside, or "" for the roots the
+                                // user has granted.
+                                if (key == "browse") {
+                                    val at = req.optString(key, "")
+                                    val json = com.vortex.a3.core.files.PhoneFiles.list(context, at)
+                                    keepLanHot()
+                                    sendChunked(FrameType.PHONE_FILES, json)
+                                    Log.i(TAG, "bulk-sync: listing sent (${json.size} bytes)")
+                                    status.put(key, "sent")
                                     continue
                                 }
                                 // Watermark datasets: the value is "everything
@@ -940,6 +971,15 @@ class LanServer(
                                     status.put("offers", arr)
                                     Log.i(TAG, "bulk-sync: announced ${arr.length()} pending offer(s)")
                                 }
+                            }
+                            val deleted = runCatching { deletedCapturesProvider() }
+                                .getOrElse {
+                                    Log.w(TAG, "deleted-captures provider threw: ${it.message}")
+                                    emptyList()
+                                }
+                            if (deleted.isNotEmpty()) {
+                                status.put("deleted", org.json.JSONArray(deleted))
+                                Log.i(TAG, "bulk-sync: reported ${deleted.size} deleted capture(s)")
                             }
                             lockedSealAndWrite(
                                 FrameType.BULK_SYNC, 0x02,

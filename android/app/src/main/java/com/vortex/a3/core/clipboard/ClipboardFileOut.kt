@@ -20,22 +20,50 @@ object ClipboardFileReader {
 
     private const val TAG = "ClipboardFileOut"
 
-    fun read(context: Context, uri: Uri): ClipboardOutgoingFile? = try {
+    fun read(context: Context, uri: Uri): ClipboardOutgoingFile? {
+        return try {
+            readInner(context, uri)
+        } catch (e: Exception) {
+            Log.w(TAG, "file read failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun readInner(context: Context, uri: Uri): ClipboardOutgoingFile? {
         val cr = context.contentResolver
         val mime = cr.getType(uri) ?: "application/octet-stream"
         val name = displayName(context, uri) ?: "file"
+        // Ask how big it is BEFORE reading it. `readBytes()` pulls the whole
+        // file into the service's heap, so checking the cap afterwards means
+        // the one thing the cap exists to prevent — a file far too large to
+        // hold — has already happened. Harmless while this only ever saw
+        // screenshots; a phone video is hundreds of megabytes.
+        val declared = declaredSize(context, uri)
+        if (declared != null && declared > MAX_FILE_BYTES) {
+            Log.i(TAG, "file too large ($declared bytes) — not sent")
+            return null
+        }
         val bytes = cr.openInputStream(uri)?.use { it.readBytes() }
-        when {
+        return when {
             bytes == null -> null
             bytes.isEmpty() -> null
+            // Backstop: SIZE is provider-supplied and may be absent or wrong.
             bytes.size > MAX_FILE_BYTES -> {
                 Log.i(TAG, "file too large (${bytes.size} bytes) — not sent")
                 null
             }
             else -> ClipboardOutgoingFile(bytes, name, mime)
         }
-    } catch (e: Exception) {
-        Log.w(TAG, "file read failed: ${e.message}")
+    }
+
+    /** The provider's own SIZE for [uri], or null when it doesn't report one. */
+    private fun declaredSize(context: Context, uri: Uri): Long? = try {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+            ?.use { c ->
+                val idx = c.getColumnIndex(OpenableColumns.SIZE)
+                if (c.moveToFirst() && idx >= 0 && !c.isNull(idx)) c.getLong(idx) else null
+            }
+    } catch (_: Exception) {
         null
     }
 

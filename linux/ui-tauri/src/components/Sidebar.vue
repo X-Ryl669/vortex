@@ -7,13 +7,14 @@ import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import {
-  MonitorSmartphone,
-  Users,
-  Phone,
-  MessageSquare,
-  NotebookText,
-  Settings,
   ChevronsLeft,
+  FolderOpen,
+  MessageSquare,
+  MonitorSmartphone,
+  NotebookText,
+  Phone,
+  Settings,
+  Users,
 } from "lucide-vue-next";
 import logo from "@/assets/vortex_logo.png";
 import { unreadConversations } from "@/composables/useMessages";
@@ -33,6 +34,7 @@ const items = computed(() => [
   { key: "recents", icon: Phone, to: "/recents", label: t("nav.recents") },
   { key: "messages", icon: MessageSquare, to: "/messages", label: t("nav.messages") },
   { key: "notes", icon: NotebookText, to: "/notes", label: t("nav.notes") },
+  { key: "phone-files", icon: FolderOpen, to: "/phone-files", label: t("nav.phoneFiles") },
   { key: "settings", icon: Settings, to: "/settings", label: t("nav.settings") },
 ]);
 

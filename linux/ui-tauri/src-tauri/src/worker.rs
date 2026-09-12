@@ -363,7 +363,24 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // interface → this channel → the call consumer → the phone.
         let (call_action_tx, call_action_rx) =
             tokio::sync::mpsc::unbounded_channel::<String>();
-        let ble_live_tx = spawn_live_consumer(app.clone(), call_action_tx).await;
+        // The extension's pill buttons all arrive on one channel, and not all
+        // of them are about a call: the transfer pill's Cancel is handled here
+        // and never reaches the phone. Interposed rather than handled further
+        // down so the call path keeps seeing only call verbs.
+        let (pill_action_tx, mut pill_action_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+        {
+            let call_action_tx = call_action_tx.clone();
+            tokio::spawn(async move {
+                while let Some(verb) = pill_action_rx.recv().await {
+                    if crate::transfers::handle_pill_action(&verb) {
+                        continue;
+                    }
+                    let _ = call_action_tx.send(verb);
+                }
+            });
+        }
+        let ble_live_tx = spawn_live_consumer(app.clone(), pill_action_tx).await;
 
         // BLE call-mirror channel: the listener forwards CALL frames here; the
         // consumer drives the laptop's call banner (ringing → Accept/Decline)

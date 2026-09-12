@@ -981,6 +981,9 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // (and don't toast a failure for a file that plainly arrived).
         lan.onFileServed = { token -> noteFileServed(token) }
         lan.pendingOffersProvider = { pendingOffersForLan() }
+        lan.deletedCapturesProvider = {
+            com.vortex.a3.core.media.CaptureLedger.deletedTokens(ctx)
+        }
         lanServer = lan
         // Let code with no handle on the stack ship a snapshot immediately —
         // the accessibility service reporting an input-focus change, which the

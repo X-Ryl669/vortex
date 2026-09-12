@@ -24,10 +24,12 @@ mod ble;
 mod call;
 mod call_log;
 mod camera;
+mod capture_ledger;
 mod clipboard;
 mod clipboard_hotkey;
 mod clipboard_window;
 mod clipboard_sync;
+mod phone_files;
 mod transfers;
 mod transfers_out;
 mod worker_transfers;
@@ -349,6 +351,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             diagnostics::diagnostics,
+            phone_files::browse_phone,
+            phone_files::stop_browsing_phone,
+            phone_files::fetch_phone_file,
             send_to_phone::send_to_phone,
             diagnostics::diagnostics_report,
             worker::start_scan,

@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod earbuds;
 pub mod fs_private;
 pub mod earbuds_store;
+pub mod phone_files;
 pub mod smart_switch_store;
 pub mod clipboard_mirror;
 pub mod file_progress;

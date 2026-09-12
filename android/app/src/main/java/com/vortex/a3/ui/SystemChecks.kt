@@ -74,16 +74,18 @@ internal fun requiredPermissions(): List<String> = buildList {
     // by themselves. Optional twice over: the feature is off until the user
     // turns it on in Settings, and refused here it simply stays on the phone
     // (the watcher logs once and does nothing).
-    add(com.vortex.a3.core.media.mediaReadPermission())
+    addAll(com.vortex.a3.core.media.mediaReadPermissions())
 }
 
-/** Whether the gallery watcher may read other apps' pictures — the grant the
- *  two media-share toggles need to do anything. */
+/** Whether the gallery watcher has every media grant the auto-share toggles
+ *  need. All of them, not any: from Android 13 images and video are separate,
+ *  and a hint saying the feature is ready while video is still refused would
+ *  be wrong for half the switches. */
 internal fun Context.hasMediaReadPermission(): Boolean =
-    androidx.core.content.ContextCompat.checkSelfPermission(
-        this,
-        com.vortex.a3.core.media.mediaReadPermission(),
-    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    com.vortex.a3.core.media.mediaReadPermissions().all {
+        androidx.core.content.ContextCompat.checkSelfPermission(this, it) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
 
 /**
  * Connectivity + notification permissions the app needs to advertise, pair and

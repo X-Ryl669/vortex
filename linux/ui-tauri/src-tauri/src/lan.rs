@@ -664,6 +664,11 @@ pub(crate) async fn try_lan_reconnect(
         if let Some(token) = &requested_file_token {
             bulk_obj["clipboard_file"] = serde_json::Value::String(token.clone());
         }
+        // A folder the UI is waiting to see. Rides the round that is happening
+        // anyway rather than opening a session of its own.
+        if let Some(at) = crate::phone_files::browse_request() {
+            bulk_obj["browse"] = serde_json::Value::String(at);
+        }
         let bulk_request = bulk_obj.to_string();
         match run_lan_reconnect(
             socket_addr,
@@ -693,6 +698,14 @@ pub(crate) async fn try_lan_reconnect(
                 // the BLE path uses, so one consumer sees every offer and its
                 // token dedup covers both links — which matters precisely
                 // because an offer can now arrive twice.
+                // Captures the phone no longer has. Our copy follows it into
+                // the trash — recoverable for a month, because a removal that
+                // crossed a network on the strength of a hash should be.
+                for token in &outcome.deleted {
+                    if let Some(to) = crate::capture_ledger::trash_for_token(token) {
+                        tracing::info!(trashed = %to.display(), "capture deleted on the phone");
+                    }
+                }
                 for offer in &outcome.offers {
                     tracing::info!(
                         name = %offer.name,
@@ -715,6 +728,9 @@ pub(crate) async fn try_lan_reconnect(
                 // chunk consumer.
                 for (ty_byte, json) in &outcome.bulk {
                     match *ty_byte {
+                        vortex_l3_daemon::core::ble::frame::ty::PHONE_FILES => {
+                            crate::phone_files::deliver(app, json);
+                        }
                         vortex_l3_daemon::core::ble::frame::ty::CONTACTS => {
                             crate::contacts::deliver(app, json, "LAN bulk-sync");
                         }
@@ -750,7 +766,7 @@ pub(crate) async fn try_lan_reconnect(
                             let meta = crate::PENDING_FILE_OFFERS
                                 .get()
                                 .and_then(|m| m.lock().ok().and_then(|mut g| g.pop_front()));
-                            if let Some((_, name, mime, id, kind)) = meta {
+                            if let Some((token, name, mime, id, kind)) = meta {
                                 note_queue_progress();
                                 let offer = crate::clipboard_sync::Offer {
                                     kind,
@@ -766,14 +782,27 @@ pub(crate) async fn try_lan_reconnect(
                                 .await
                                 {
                                     Some(path) => {
+                                        // The pill outlives the batch by a few
+                                        // seconds; tell it where to go when
+                                        // someone clicks it.
+                                        crate::transfers::note_saved(&path);
                                         crate::transfers::complete(id);
+                                        // Remember where a CAPTURE landed, so
+                                        // the phone deleting its original can
+                                        // be mirrored. Shares are not tracked:
+                                        // the phone has no original to lose.
+                                        if offer.is_capture() {
+                                            crate::capture_ledger::record(&token, &path);
+                                        }
                                         // A capture arrives unannounced, so it
                                         // gets a notification the user can act
                                         // on; a share the user just made does
                                         // not (the pill already says where it
                                         // went, and ten files would be ten
                                         // notifications).
-                                        if offer.is_capture() {
+                                        if offer.is_capture()
+                                            || offer.kind == crate::phone_files::FETCHED_KIND
+                                        {
                                             crate::file_consent::notify_received(path, &offer.kind)
                                                 .await;
                                         }

@@ -213,6 +213,7 @@ fn handoff_pill(ev: &HandoffEvent, domain: &str, favicon_id: Option<String>) -> 
         muted: false,
         speaker: false,
         has_earbuds: false,
+        open: String::new(),
         ended: false,
         playing: None,
     }
@@ -231,6 +232,7 @@ fn clear_pill() -> LiveActivity {
         muted: false,
         speaker: false,
         has_earbuds: false,
+        open: String::new(),
         ended: true,
         playing: None,
     }

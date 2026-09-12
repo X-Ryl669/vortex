@@ -597,6 +597,7 @@ pub(crate) async fn spawn_consumer(
                                 muted: ev.muted,
                                 speaker: ev.speaker,
                                 has_earbuds: ev.has_earbuds,
+                                open: String::new(),
                                 ended: false,
                                 playing: None,
                             };
@@ -760,6 +761,7 @@ pub(crate) async fn spawn_consumer(
                             muted,
                             speaker,
                             has_earbuds,
+                            open: String::new(),
                             ended: false,
                             playing: None,
                         };
@@ -816,6 +818,7 @@ pub(crate) async fn spawn_consumer(
                                         muted: s.pill_muted,
                                         speaker: s.pill_speaker,
                                         has_earbuds: s.pill_earbuds,
+                                        open: String::new(),
                                         ended: false,
                                         playing: None,
                                     }
@@ -877,6 +880,7 @@ pub(crate) async fn spawn_consumer(
                             muted: false,
                             speaker: false,
                             has_earbuds: false,
+                            open: String::new(),
                             ended: true,
                             playing: None,
                         });

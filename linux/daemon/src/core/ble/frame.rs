@@ -172,6 +172,17 @@ pub mod ty {
     /// bytes and processes them as if they had arrived as one notify. FRAG
     /// itself is NOT sealed — the inner frame already is (one nonce per
     /// logical frame). Mirrors Kotlin `FrameType.FRAG`.
+    /// A listing of one folder on the phone: `[total][idx][json]` chunks over
+    /// the LAN session, answering a `browse` key in the bulk-sync request.
+    ///
+    /// Browsing, not syncing. The laptop asks for a folder and gets its
+    /// entries; nothing is copied until the user picks a file, and then it
+    /// comes back over [`CLIPBOARD_FILE`] like any other pull. The phone's
+    /// storage is the one that stays authoritative — mirroring it would put a
+    /// second copy of everything on a machine that did not ask for it.
+    /// Mirrors Kotlin `FrameType.PHONE_FILES`.
+    pub const PHONE_FILES: u8 = 0x4F;
+
     pub const FRAG: u8 = 0x4E;
     pub const ERROR: u8 = 0x7F;
 }

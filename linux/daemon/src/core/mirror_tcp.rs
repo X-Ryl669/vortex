@@ -442,6 +442,73 @@ pub async fn run_tcp_video_client(
 
 #[cfg(test)]
 mod tests {
+
+    /// The second screen's touch frames, built the way the PHONE builds them
+    /// rather than with our own sealer.
+    ///
+    /// A round-trip through `MirrorTcpSealer` would pass whatever the two
+    /// halves agreed on and tell us nothing about the Kotlin on the other end.
+    /// This lays the bytes out by hand — `[counter BE][ChaCha20-Poly1305 over
+    /// the packet, nonce 0u32||counter, AAD the counter]` — so the test fails
+    /// if either side's framing drifts from what the other actually sends.
+    #[test]
+    fn a_frame_sealed_the_way_the_phone_seals_it_opens() {
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+        let key = [7u8; 32];
+        let counter: u64 = 0;
+        let counter_be = counter.to_be_bytes();
+        // Nonce: four zero bytes then the counter, exactly as the phone lays
+        // it out into a 12-byte IV.
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&counter_be);
+        // The five-byte touch packet: [type][x u16 BE][y u16 BE].
+        let pkt = [1u8, 0x12, 0x34, 0xAB, 0xCD];
+        let ct = ChaCha20Poly1305::new(Key::from_slice(&key))
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &pkt, aad: &counter_be })
+            .expect("seal");
+        let mut body = counter_be.to_vec();
+        body.extend_from_slice(&ct);
+
+        let opened = MirrorTcpOpener::new(&key).open(&body).expect("opens");
+        assert_eq!(opened, pkt);
+
+        // And the frame it sits in has to pass the reader's length guard: five
+        // bytes of packet plus a tag plus the counter is 29, comfortably inside
+        // the 8..=4096 the reader accepts before it will allocate.
+        assert_eq!(body.len(), 8 + pkt.len() + 16);
+        assert!((8..=4096).contains(&body.len()));
+    }
+
+    /// The counter is authenticated, not just carried: a frame replayed under a
+    /// different counter must not open. Otherwise anyone who could see one
+    /// touch could resend it for ever.
+    #[test]
+    fn a_frame_with_a_swapped_counter_does_not_open() {
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+        let key = [9u8; 32];
+        let counter_be = 5u64.to_be_bytes();
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&counter_be);
+        let ct = ChaCha20Poly1305::new(Key::from_slice(&key))
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &[2u8, 0, 0, 0, 0], aad: &counter_be })
+            .expect("seal");
+
+        let mut tampered = 6u64.to_be_bytes().to_vec();
+        tampered.extend_from_slice(&ct);
+        assert!(MirrorTcpOpener::new(&key).open(&tampered).is_none());
+    }
+
+    /// A body too short to hold a counter must be refused rather than indexed.
+    #[test]
+    fn a_runt_body_is_refused() {
+        assert!(MirrorTcpOpener::new(&[0u8; 32]).open(&[1, 2, 3]).is_none());
+        assert!(MirrorTcpOpener::new(&[0u8; 32]).open(&[]).is_none());
+    }
+
     use super::*;
     use crate::core::mirror_udp::derive_laptop_media_key;
 

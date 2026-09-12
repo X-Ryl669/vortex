@@ -422,6 +422,23 @@ export default class VortexLiveExtension extends Extension {
             btn._callRow.add_child(btn._endBtn);
             card.add_child(btn._callRow);
 
+            // Transfer pill: one Cancel button while bytes are still arriving.
+            // A file picked by mistake used to have to finish — forty seconds
+            // of a video nobody wanted, with the pill counting it out. Rides
+            // the same CallAction channel; the verb is handled on the laptop
+            // and never reaches the phone.
+            btn._xferRow = new St.BoxLayout({style_class: 'vortex-call-actions'});
+            btn._cancelBtn = new St.Button({
+                style_class: 'vortex-call-btn', x_expand: true, can_focus: true,
+                label: 'Cancel',
+            });
+            btn._cancelBtn.connect('clicked', () => {
+                this._callAction('xfer:cancel');
+                btn.menu.close();
+            });
+            btn._xferRow.add_child(btn._cancelBtn);
+            card.add_child(btn._xferRow);
+
             // Now-playing transport buttons — shown only for a media pill
             // (activity carries a `playing` flag). Rides the same CallAction
             // channel; the verb carries the player's package name so the
@@ -466,8 +483,16 @@ export default class VortexLiveExtension extends Extension {
         btn._progress = (typeof a.progress === 'number') ? a.progress : -1;
         btn._bar.visible = btn._progress >= 0;
         btn._title.visible = !!(a.title && a.title.length);
-        // Handoff pill: clicking it opens the page (URL carried in `sub`).
-        btn._url = (a.key === 'vortex-handoff' && a.sub) ? a.sub : null;
+        // Clicking the pill opens something, when the activity names one: the
+        // page for a handoff (carried in `sub`, which it also displays), the
+        // folder for a finished transfer (`open`, which is not displayed —
+        // a file:// path is not something anyone wants to read).
+        btn._url = a.open || ((a.key === 'vortex-handoff' && a.sub) ? a.sub : null);
+        // Cancel is offered only while a transfer is actually running: once it
+        // has finished there is nothing to stop, and the pill's own click
+        // (which opens the folder) is what the moment calls for.
+        btn._xferRow.visible = (a.key === 'vortex-file-transfer' && btn._progress >= 0
+            && btn._progress < 100);
         // In-call pill action buttons: dynamic from the call audio state.
         btn._callRow.visible = (a.key === 'vortex-call');
         if (a.key === 'vortex-call') {

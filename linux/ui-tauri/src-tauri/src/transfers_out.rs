@@ -129,6 +129,7 @@ fn pill(title: String, text: String, progress: i32, ended: bool) -> LiveActivity
         muted: false,
         speaker: false,
         has_earbuds: false,
+        open: String::new(),
         ended,
         playing: None,
     }

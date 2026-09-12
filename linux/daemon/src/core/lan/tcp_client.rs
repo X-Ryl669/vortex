@@ -60,6 +60,14 @@ pub struct LanReconnectOutcome {
     /// re-announces whatever is still pending here, so the link that works is
     /// the one that delivers.
     pub offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer>,
+    /// Capture tokens the phone no longer has the original of, from the done
+    /// frame's `deleted` array.
+    ///
+    /// A picture deleted on the phone should not leave its automatic copy on
+    /// the laptop for ever. Only the phone reports this direction: our copy is
+    /// ours to remove, while deleting the phone's own original would need a
+    /// system consent dialog there for every file.
+    pub deleted: Vec<String>,
 }
 
 /// Pull the done frame's `offers` array out as real offers.
@@ -78,6 +86,21 @@ fn parse_offers(json: &[u8]) -> Vec<crate::core::clipboard_mirror::ClipboardImag
     arr.iter()
         .filter_map(|e| serde_json::from_value(e.clone()).ok())
         .collect()
+}
+
+/// Pull the done frame's `deleted` array out as capture tokens.
+///
+/// Same shape and same forgiveness as [`parse_offers`]: a non-string entry is
+/// skipped rather than costing the rest, because one unreadable token must not
+/// strand every other deletion on the laptop.
+fn parse_deleted(json: &[u8]) -> Vec<String> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("deleted").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect()
 }
 
 /// The bulk-sync done frame's per-dataset outcome map.
@@ -351,12 +374,14 @@ pub async fn run_lan_reconnect(
     let mut bulk: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut bulk_status: Option<BulkStatus> = None;
     let mut offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer> = Vec::new();
+    let mut deleted: Vec<String> = Vec::new();
     if let (Some(req), Some(_)) = (bulk_request, peer_state.as_ref()) {
         match exchange_bulk(&mut stream, &mut transport, req, wait_per_step).await {
             Ok(ex) => {
                 bulk = ex.datasets;
                 bulk_status = ex.status;
                 offers = ex.offers;
+                deleted = ex.deleted;
             }
             Err(e) => tracing::warn!("bulk-sync exchange failed: {e}"),
         }
@@ -386,6 +411,7 @@ pub async fn run_lan_reconnect(
         bulk,
         bulk_status,
         offers,
+        deleted,
     })
 }
 
@@ -505,6 +531,8 @@ struct BulkExchange {
     status: Option<BulkStatus>,
     /// File offers the phone re-announced on this round.
     offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer>,
+    /// Capture tokens whose originals are gone from the phone.
+    deleted: Vec<String>,
 }
 
 /// Send the bulk-sync request and collect the chunked dataset frames the
@@ -529,6 +557,8 @@ async fn exchange_bulk(
     let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut status: Option<BulkStatus> = None;
     let mut offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer> = Vec::new();
+    let mut deleted: Vec<String> = Vec::new();
+    let mut listing = crate::core::phone_files::ListingAssembler::default();
     let mut contacts = crate::core::contacts::ContactsAssembler::default();
     let mut call_log = crate::core::call_log::CallLogAssembler::default();
     let mut sms = crate::core::sms::SmsAssembler::default();
@@ -578,7 +608,21 @@ async fn exchange_bulk(
                 if !offers.is_empty() {
                     info!("← {} file offer(s) announced over LAN", offers.len());
                 }
+                deleted = parse_deleted(&pt);
+                if !deleted.is_empty() {
+                    info!("← {} capture(s) deleted on the phone", deleted.len());
+                }
                 break;
+            }
+            ty::PHONE_FILES => {
+                if let Some((total, idx, data)) = crate::core::phone_files::parse_chunk(&pt) {
+                    if let Some(json) = listing.add(total, idx, data) {
+                        info!("← phone folder listing ({} bytes)", json.len());
+                        out.push((ty::PHONE_FILES, json));
+                    }
+                } else {
+                    tracing::warn!("bulk-sync: malformed listing chunk; dropping");
+                }
             }
             ty::CONTACTS => {
                 if let Some((total, idx, data)) = crate::core::contacts::parse_chunk(&pt) {
@@ -664,6 +708,16 @@ async fn exchange_bulk(
                     }
                     // Live progress for the transfer panel (chunks → %).
                     crate::core::file_progress::report(file_chunks_seen, total as u32);
+                    // Between two chunks is the only place a pull can be
+                    // interrupted, so this is where a cancel takes effect.
+                    // Ending the whole exchange is the point: the phone is
+                    // mid-stream, and reading the rest only to drop it is the
+                    // wait the user just asked to be let out of. The session
+                    // is disposable — the next heartbeat opens another.
+                    if crate::core::file_progress::take_cancel() {
+                        info!("file pull cancelled by the user after {file_chunks_seen} chunk(s)");
+                        break;
+                    }
                     if let Some(blob) = clipboard_file.add(total, idx, data) {
                         let secs = file_start
                             .map(|s| s.elapsed().as_secs_f64())
@@ -689,13 +743,13 @@ async fn exchange_bulk(
             }
         }
     }
-    Ok(BulkExchange { datasets: out, status, offers })
+    Ok(BulkExchange { datasets: out, status, offers, deleted })
 }
 
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_offers, BulkStatus};
+    use super::{parse_deleted, parse_offers, BulkStatus};
 
     /// The done frame carries offers beside the per-dataset outcomes, and the
     /// status map must not choke on the array sitting next to its strings.
@@ -711,6 +765,26 @@ mod tests {
         // The status map still reads its own fields and ignores the array.
         let s = BulkStatus::parse(body).unwrap();
         assert_eq!(s.get("contacts"), Some("match"));
+    }
+
+    /// Deletions ride the same frame as the offers and the status map, and
+    /// each reader must ignore the other two.
+    #[test]
+    fn deletions_ride_the_done_frame_too() {
+        let body = br#"{"contacts":"match","deleted":["abc123","def456"],
+            "offers":[{"token":"t","name":"a.jpg","bytes":1,"mime":"image/jpeg","kind":"photo"}]}"#;
+        assert_eq!(parse_deleted(body), vec!["abc123".to_string(), "def456".to_string()]);
+        assert_eq!(parse_offers(body).len(), 1);
+        assert_eq!(BulkStatus::parse(body).unwrap().get("contacts"), Some("match"));
+    }
+
+    /// A build that reports no deletions, and an array with an entry that is
+    /// not a token: neither may cost the caller the rest.
+    #[test]
+    fn missing_or_malformed_deletions_are_survivable() {
+        assert!(parse_deleted(br#"{"contacts":"match"}"#).is_empty());
+        assert!(parse_deleted(b"not json").is_empty());
+        assert_eq!(parse_deleted(br#"{"deleted":[7,"keepme"]}"#), vec!["keepme".to_string()]);
     }
 
     /// A done frame from a build that doesn't announce offers, and one whose

@@ -145,6 +145,12 @@ object FrameType {
      *  `[total u16 BE][idx u16 BE][slice]`; the laptop reassembles the inner
      *  bytes and processes them as one arrival. FRAG itself is NOT sealed —
      *  the inner frame already is. Mirrors Rust `ty::FRAG`. */
+    /** A listing of one folder on the phone: `[total][idx][json]` chunks,
+     *  answering a `browse` key in the bulk-sync request. Browsing, not
+     *  syncing — nothing is copied until the laptop asks for a file, and then
+     *  it comes back over CLIPBOARD_FILE. Mirrors Rust `ty::PHONE_FILES`. */
+    const val PHONE_FILES: Byte = 0x4F
+
     const val FRAG: Byte = 0x4E
     const val ERROR: Byte = 0x7F
 }
