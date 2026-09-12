@@ -273,6 +273,26 @@ async fn connect_and_run(
             None => return Err("IK produced no transport ciphers".to_string()),
         };
 
+        // Tell the arbiter, exactly where the BlueZ loop does: IK has just
+        // proved this address really is this peer, so ownership can be claimed
+        // on evidence rather than on a scan result.
+        //
+        // Missing here, this loop only ever READ the arbiter (`preferred_peer`
+        // above) and never wrote to it — so on Windows no peer was ever active
+        // until a restart happened to claim one. Two things fell out of that: a
+        // freshly-paired laptop never took ownership from the phone's previous
+        // one, and `peer_cache::peer_dir` — which keys on the ACTIVE peer —
+        // returned `None`, quietly disabling every per-peer cache.
+        crate::arbiter::note_connected(&peer.peer_static_pub);
+        if let crate::arbiter::Claim::Busy { current } =
+            crate::arbiter::claim(&peer.peer_static_pub)
+        {
+            tracing::warn!(
+                peer = %hex::encode(&peer.peer_static_pub[..4]),
+                active = %hex::encode(&current[..4]),
+                "second peer connected while another is active; link up but not active"
+            );
+        }
         tracing::info!(addr = %addr, "BLE link established");
         crate::presence::touch_presence();
         crate::presence::touch_peer_contact();

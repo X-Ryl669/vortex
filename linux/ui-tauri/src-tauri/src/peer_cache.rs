@@ -21,11 +21,20 @@
 
 use std::path::PathBuf;
 
-/// `~/.cache/vortex` — the shared root (notes, clipboard, icons live here).
+/// The shared cache root (notes, clipboard, icons live here too).
+///
+/// Through the platform seam, NOT `$HOME`. `$HOME` is a Unix variable Windows
+/// does not set, so this returned `None` there — and because every path below
+/// is built on it, that silently disabled the entire per-peer cache: SMS,
+/// contacts and call-log history could not be read or written, so the bulk-sync
+/// hash gate never matched and the phone re-sent its whole history on every
+/// 12-second heartbeat. About a megabyte each time, forever.
+///
+/// The seam resolves to `$XDG_CACHE_HOME/vortex` (`~/.cache/vortex` by default)
+/// on Linux — the same path this used to hardcode — and
+/// `%LOCALAPPDATA%\Vortex\Cache` on Windows.
 fn cache_root() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex");
-    Some(p)
+    vortex_l3_daemon::core::platform::paths().cache()
 }
 
 /// Directory for the active peer's caches, created if absent.

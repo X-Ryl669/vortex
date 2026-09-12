@@ -80,9 +80,11 @@ pub(crate) struct ClipEntry {
     pub pinned: bool,
 }
 
+/// Through the seam rather than `$HOME`: the latter is unset on Windows, where
+/// this resolved to `None` and clipboard history was quietly never persisted.
+/// Same `~/.cache/vortex` on Linux as before.
 fn clip_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cache/vortex/clipboard"))
+    Some(vortex_l3_daemon::core::platform::paths().cache()?.join("clipboard"))
 }
 
 fn index_path() -> Option<PathBuf> {

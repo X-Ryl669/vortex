@@ -51,9 +51,10 @@ pub(crate) fn now_ms() -> i64 {
 /// `~/.cache/vortex/notes.json` — the full item array incl. tombstones (so a
 /// delete still propagates after a restart).
 fn cache_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/notes.json");
-    Some(p)
+    // Seam, not `$HOME` — unset on Windows, where notes were therefore never
+    // written to disk and came back empty after every restart. Resolves to the
+    // same `~/.cache/vortex` on Linux.
+    Some(vortex_l3_daemon::core::platform::paths().cache()?.join("notes.json"))
 }
 
 /// How long a tombstone is kept before it is dropped.
