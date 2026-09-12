@@ -415,7 +415,11 @@ const earbudsStatus = computed(() => {
            and because on Android this is its own card too. Only once a phone
            exists: with none paired the "Add phone" card above IS this. -->
       <div v-if="primaryPeer" class="vx-card col-span-2 flex items-center gap-4">
-        <span class="vx-icon"><Plus class="h-5 w-5" /></span>
+        <!-- A phone, NOT a plus, unlike the two "Add …" cards above. Those are
+             each a single button, so a plus on them is honest. This tile is
+             not clickable — its action is the Pair button on the right — and a
+             plus here invited a click on the icon that did nothing. -->
+        <span class="vx-icon"><Smartphone class="h-5 w-5" /></span>
         <div class="min-w-0 flex-1">
           <div class="text-sm font-medium">{{ t("peers.add_pair") }}</div>
           <div class="mt-0.5 text-xs text-muted-foreground">{{ t("peers.add_pair_hint") }}</div>
