@@ -894,10 +894,17 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 .map { it.prs }
         }
         if (peerStore.list().isNotEmpty()) {
+            // No `isConnected` argument: `adv.linkedProvider` above answers the
+            // same question, and answers it better. Upstream passed
+            // `hasActiveConnection()`, which is merely ACL-connected — and
+            // BlueZ owns the ACL, so it outlives the laptop app. After a laptop
+            // restart the phone saw a "connection" with no session behind it,
+            // stayed silent, and became unreachable. `linkedProvider` keys on
+            // the audio-signal SUBSCRIPTION instead, which cannot outlive the
+            // session it belongs to.
             adv.startPresenceLoop(
                 scope = scope,
                 rotationWindowSec = 60L,
-                isConnected = { gattServer?.hasActiveConnection() == true },
                 onError = { reason -> Log.w(TAG, "presence adv error: $reason") },
             )
             Log.i(TAG, "presence loop started (have ${peerStore.list().size} peer(s))")

@@ -47,6 +47,15 @@ object ClipboardFileReader {
      * -1 for plenty of providers, and a wrong one must not be able to kill the
      * app either.
      */
+    /** The file, or null if it could not be read or was over the cap.
+     *
+     *  For callers with nowhere to put the reason — a MediaStore auto-send, a
+     *  file-browser fetch. Anything facing the user should call [read] and say
+     *  which of the two it was: "too large" and "unreadable" are different
+     *  problems and only one of them is the user's to fix. */
+    fun readOrNull(context: Context, uri: Uri): ClipboardOutgoingFile? =
+        (read(context, uri) as? Outcome.Ok)?.file
+
     fun read(context: Context, uri: Uri): Outcome {
         val cr = context.contentResolver
         val mime = cr.getType(uri) ?: "application/octet-stream"
