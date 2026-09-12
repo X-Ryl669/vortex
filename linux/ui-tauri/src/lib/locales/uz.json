@@ -106,6 +106,7 @@
     "failed": "Juftlash muvaffaqiyatsiz",
     "done": "Tayyor",
     "add_phone": "Telefon qo'shish",
+    "add_another": "Yana bir telefon ulash",
     "add_phone_hint": "Yaqindagilarni topish uchun bosing",
     "add_phone_modal_hint": "Android'da Vortex'ni oching, keyin pastdagi natijani bosing.",
     "add_phone_btn": "Juftlash",

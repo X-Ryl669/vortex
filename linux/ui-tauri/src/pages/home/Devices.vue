@@ -212,6 +212,19 @@ const earbudsStatus = computed(() => {
             <Loader2 v-if="peerSwitchScanning" class="h-[18px] w-[18px] animate-spin" />
             <TabletSmartphone v-else class="h-[18px] w-[18px]" :stroke-width="1.9" />
           </button>
+          <!-- Pair ANOTHER phone. The "Add phone" card below is only rendered
+               when nothing is paired yet, so once the first phone was linked
+               there was no way to reach pairing at all — the only route to a
+               second phone was to forget the first. Lives here beside Switch
+               because that button is the other one about phones that are not
+               this one. -->
+          <button
+            class="vx-ring"
+            :title="t('pair.add_another')"
+            @click="openPairPhoneModal"
+          >
+            <Plus class="h-[18px] w-[18px]" :stroke-width="1.9" />
+          </button>
         </div>
         <div class="flex items-center gap-2">
           <span

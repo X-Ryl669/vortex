@@ -106,6 +106,7 @@
     "failed": "Сопряжение не удалось",
     "done": "Готово",
     "add_phone": "Добавить телефон",
+    "add_another": "Добавить ещё один телефон",
     "add_phone_hint": "Нажмите для поиска",
     "add_phone_modal_hint": "Откройте Vortex на Android и выберите устройство ниже.",
     "add_phone_btn": "Связать",

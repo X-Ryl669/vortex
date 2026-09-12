@@ -106,6 +106,7 @@
     "failed": "Pairing failed",
     "done": "Done",
     "add_phone": "Add phone",
+    "add_another": "Pair another phone",
     "add_phone_hint": "Tap to discover nearby",
     "add_phone_modal_hint": "Open Vortex on your Android phone, then tap a result below.",
     "add_phone_btn": "Pair",
