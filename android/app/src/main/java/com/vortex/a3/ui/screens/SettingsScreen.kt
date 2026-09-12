@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -108,7 +109,17 @@ fun SettingsScreen(
     onBack: () -> Unit,
 ) {
     Column(
-        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            // targetSdk 36 makes edge-to-edge mandatory: the app draws behind
+            // the status bar whether it asks to or not, so this header sat in
+            // the same band as the clock, where the system consumes the touch.
+            // The back arrow rendered fine and simply did not respond, which
+            // reads as a broken button rather than a mispositioned one.
+            // Background BEFORE padding, so the status bar still sits on our
+            // colour instead of a bare strip.
+            .systemBarsPadding(),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
