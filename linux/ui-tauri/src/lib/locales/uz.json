@@ -75,7 +75,18 @@
     "switch_scanning": "Boshqa telefonlaringiz qidirilmoqda…",
     "switch_pick": "Qaysi telefonga o'tamiz?",
     "switch_none": "Yaqinda boshqa ulangan telefon yo'q.",
-    "switch_cancel": "Bekor qilish"
+    "switch_cancel": "Bekor qilish",
+    "other_title": "Yana ulangan",
+    "other_hint": "O'tish uchun bosing",
+    "add_pair": "Yana bir telefon ulash",
+    "add_pair_hint": "Boshqa telefonni ulanish rejimiga o'tkazing, so'ng bu yerda qidiruvni boshlang.",
+    "seen": "{ago} ko'rilgan",
+    "paired_ago": "{ago} ulangan",
+    "never": "ulanmagan",
+    "just_now": "hozirgina",
+    "mins": "{n} daq oldin",
+    "hours": "{n} soat oldin",
+    "days": "{n} kun oldin"
   },
   "discover": {
     "looking": "Yaqindagi qurilmalar qidirilmoqda…",
@@ -106,7 +117,6 @@
     "failed": "Juftlash muvaffaqiyatsiz",
     "done": "Tayyor",
     "add_phone": "Telefon qo'shish",
-    "add_another": "Yana bir telefon ulash",
     "add_phone_hint": "Yaqindagilarni topish uchun bosing",
     "add_phone_modal_hint": "Android'da Vortex'ni oching, keyin pastdagi natijani bosing.",
     "add_phone_btn": "Juftlash",

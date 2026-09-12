@@ -75,7 +75,18 @@
     "switch_scanning": "Looking for your other phones…",
     "switch_pick": "Switch to which phone?",
     "switch_none": "No other paired phone nearby.",
-    "switch_cancel": "Cancel"
+    "switch_cancel": "Cancel",
+    "other_title": "Also paired",
+    "other_hint": "Click to switch",
+    "add_pair": "Pair another phone",
+    "add_pair_hint": "Put the other phone in pairing mode, then start the scan here.",
+    "seen": "seen {ago}",
+    "paired_ago": "paired {ago}",
+    "never": "not connected",
+    "just_now": "just now",
+    "mins": "{n} min ago",
+    "hours": "{n} h ago",
+    "days": "{n} d ago"
   },
   "discover": {
     "looking": "Looking for nearby devices…",
@@ -106,7 +117,6 @@
     "failed": "Pairing failed",
     "done": "Done",
     "add_phone": "Add phone",
-    "add_another": "Pair another phone",
     "add_phone_hint": "Tap to discover nearby",
     "add_phone_modal_hint": "Open Vortex on your Android phone, then tap a result below.",
     "add_phone_btn": "Pair",

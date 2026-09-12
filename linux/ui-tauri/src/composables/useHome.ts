@@ -328,7 +328,11 @@ export const activeEarbuds = computed<
  * contact", and is comfortably above the 12 s heartbeat.
  */
 const PEER_ONLINE_SECS = 35;
-const nowTick = ref(Math.floor(Date.now() / 1000));
+
+/** Epoch seconds, re-read every 10 s. Exported so the "Also paired" rows can
+ *  age their "seen 5 min ago" labels off the same clock the online dot uses —
+ *  two tickers would drift and blink at different moments. */
+export const nowTick = ref(Math.floor(Date.now() / 1000));
 setInterval(() => (nowTick.value = Math.floor(Date.now() / 1000)), 10_000);
 
 /** True if we have a paired peer AND have seen its state within ~3 min. */

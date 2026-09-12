@@ -38,11 +38,13 @@ import {
   peerSwitchScanning,
   peerSwitchCandidates,
   peerSwitchNoneFound,
+  nowTick,
   startPeerSwitch,
   abortPeerSwitch,
   choosePeer,
 } from "@/composables/useHome";
-import { peers } from "@/lib/connectionStore";
+import { peers, peerStates } from "@/lib/connectionStore";
+import type { TrustedPeer } from "@/lib/bridge";
 
 const { t } = useI18n();
 
@@ -130,6 +132,33 @@ async function openPhoneFiles() {
   }
 }
 
+// Every paired phone EXCEPT the one on the card above. Mirrors the Android
+// home screen's "Also paired" list, which is the layout this page is supposed
+// to match — the phone shows the active laptop, then the others, then a way to
+// add one, and the laptop now shows the same three things about phones.
+const otherPeers = computed(() =>
+  peers.value.filter((p) => p.peer_static_pub !== primaryPeer.value?.peer_static_pub),
+);
+
+function ago(secs: number) {
+  const s = Math.max(0, secs);
+  if (s < 60) return t("peers.just_now");
+  if (s < 3600) return t("peers.mins", { n: Math.floor(s / 60) });
+  if (s < 86_400) return t("peers.hours", { n: Math.floor(s / 3600) });
+  return t("peers.days", { n: Math.floor(s / 86_400) });
+}
+
+// Never claim one of these is reachable: they are by definition the phones we
+// are NOT the active peer of, so the honest line is when it was last heard
+// from — falling back to when it was paired, which is all we know about a phone
+// that has not checked in this session.
+function lastSeenLabel(p: TrustedPeer) {
+  const st = peerStates.value[p.peer_static_pub];
+  if (st?.ts) return t("peers.seen", { ago: ago(nowTick.value - st.ts) });
+  if (p.paired_at) return t("peers.paired_ago", { ago: ago(nowTick.value - p.paired_at) });
+  return t("peers.never");
+}
+
 const earbudsStatus = computed(() => {
   if (!activeEarbuds.value) return t("earbuds.not_connected");
   return activeEarbuds.value.on === "local" ? t("earbuds.on_local") : t("earbuds.on_peer");
@@ -211,19 +240,6 @@ const earbudsStatus = computed(() => {
           >
             <Loader2 v-if="peerSwitchScanning" class="h-[18px] w-[18px] animate-spin" />
             <TabletSmartphone v-else class="h-[18px] w-[18px]" :stroke-width="1.9" />
-          </button>
-          <!-- Pair ANOTHER phone. The "Add phone" card below is only rendered
-               when nothing is paired yet, so once the first phone was linked
-               there was no way to reach pairing at all — the only route to a
-               second phone was to forget the first. Lives here beside Switch
-               because that button is the other one about phones that are not
-               this one. -->
-          <button
-            class="vx-ring"
-            :title="t('pair.add_another')"
-            @click="openPairPhoneModal"
-          >
-            <Plus class="h-[18px] w-[18px]" :stroke-width="1.9" />
           </button>
         </div>
         <div class="flex items-center gap-2">
@@ -363,6 +379,51 @@ const earbudsStatus = computed(() => {
           </span>
         </div>
       </div>
+
+      <!-- ALSO PAIRED — every other remembered phone, click to switch.
+           Compact rows rather than a card each: at full card size a second
+           phone would push the rest of the page away for what is mostly "this
+           one exists". Same shape and same wording as the Android home
+           screen's list, which is the layout this page mirrors. -->
+      <div v-if="primaryPeer && otherPeers.length" class="vx-card col-span-2 flex flex-col gap-2">
+        <div class="text-sm font-semibold">{{ t("peers.other_title") }}</div>
+        <div class="text-xs text-muted-foreground">{{ t("peers.other_hint") }}</div>
+        <button
+          v-for="p in otherPeers"
+          :key="p.peer_static_pub"
+          class="vx-row"
+          :disabled="peerSwitchScanning"
+          @click="choosePeer(p.peer_static_pub)"
+        >
+          <span class="vx-row-icon">
+            <Smartphone class="h-[18px] w-[18px]" :stroke-width="1.9" />
+          </span>
+          <span class="min-w-0 flex-1 text-left">
+            <span class="block truncate text-[13.5px]">
+              {{ p.peer_name || t("device.android") }}
+            </span>
+            <span class="block truncate text-[11.5px] text-muted-foreground">
+              {{ lastSeenLabel(p) }}
+            </span>
+          </span>
+          <Loader2 v-if="peerSwitchScanning" class="h-4 w-4 shrink-0 animate-spin" />
+        </button>
+      </div>
+
+      <!-- PAIR ANOTHER PHONE. Its own tile rather than a fourth icon on the
+           phone card, whose header already carries ring / switch / files —
+           and because on Android this is its own card too. Only once a phone
+           exists: with none paired the "Add phone" card above IS this. -->
+      <div v-if="primaryPeer" class="vx-card col-span-2 flex items-center gap-4">
+        <span class="vx-icon"><Plus class="h-5 w-5" /></span>
+        <div class="min-w-0 flex-1">
+          <div class="text-sm font-medium">{{ t("peers.add_pair") }}</div>
+          <div class="mt-0.5 text-xs text-muted-foreground">{{ t("peers.add_pair_hint") }}</div>
+        </div>
+        <button class="vx-chip shrink-0" @click="openPairPhoneModal">
+          {{ t("pair.add_phone_btn") }}
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -379,6 +440,19 @@ const earbudsStatus = computed(() => {
 }
 .vx-dot {
   @apply h-2 w-2 shrink-0 rounded-full;
+}
+/* A smaller sibling of `.vx-icon` for the compact rows. Its own class rather
+   than `vx-icon` plus size utilities: Vue scoped styles compile to
+   `.vx-icon[data-v-hash]`, which out-specifies a plain `.h-[34px]`, so the
+   override would have been silently ignored. */
+.vx-row-icon {
+  @apply flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[10px] border border-white/[0.06] bg-white/[0.05];
+  color: #e8eaed;
+}
+/* One "Also paired" row. The whole row is the button — there is a single
+   action per row, and the heading already says what it is. */
+.vx-row {
+  @apply flex w-full items-center gap-2.5 rounded-[10px] px-1 py-1.5 transition-colors hover:bg-white/[0.05] disabled:opacity-50;
 }
 .vx-chip {
   @apply inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.05] px-[13px] py-2 text-[12.5px] font-medium transition-colors hover:bg-white/[0.09] hover:text-foreground disabled:opacity-50;
