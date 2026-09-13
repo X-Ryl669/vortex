@@ -336,12 +336,12 @@ async fn connect_and_run(
         crate::presence::touch_peer_contact();
         publish_writers(&link, &transport, writers).await;
 
-        // The liveness beat. Runs until the listener below returns.
-        let beat = tokio::spawn(state_beat(link.clone(), transport.clone()));
+        // The liveness beat, which is also how a dead session is detected.
+        let mut beat = tokio::spawn(state_beat(link.clone(), transport.clone()));
 
         // Runs until the phone stops notifying — a disconnect, or the cipher
         // desync escalation dropping the session on purpose.
-        let r = audio_signal::run_listener(
+        let run = audio_signal::run_listener(
             &*link,
             transport,
             peer.peer_static_pub,
@@ -362,8 +362,25 @@ async fn connect_and_run(
             Some(sinks.clipboard_offer.clone()),
             Some(sinks.handoff.clone()),
             Some(sinks.raw.clone()),
-        )
-        .await;
+        );
+        // Whichever ends first ends the session.
+        //
+        // The beat is a liveness PROBE, not just a state push: it writes every
+        // 12 s and gives up after six consecutive failures, which is proof the
+        // link is gone. The listener cannot prove that — it is parked waiting
+        // for a notification that will never arrive, and on a phone that
+        // restarted, WinRT can take minutes to surface the disconnect.
+        //
+        // Letting the beat end the session is what closes that gap. Without
+        // it, `LINK_UP` stayed true, the LAN heartbeat kept its relaxed
+        // 4-minute cadence on the strength of a BLE link that no longer
+        // existed, and reconnecting took minutes. That cost arrived with the
+        // relaxed cadence; before it, LAN ticked every 12 s regardless and
+        // covered for this.
+        let r = tokio::select! {
+            r = run => r.map_err(|e| e.to_string()),
+            _ = &mut beat => Err("state beat gave up — the link is dead".to_string()),
+        };
         beat.abort();
         let _ = link.disconnect().await;
         return match r {
@@ -447,6 +464,8 @@ async fn state_beat(link: Arc<dyn GattLink>, transport: Arc<Mutex<TransportState
     /// staleness window with room for a lost one.
     const STATE_BEAT: std::time::Duration = std::time::Duration::from_secs(12);
     const MAX_FAILS: u32 = 6;
+    /// Gap after a FAILED write, so a verdict takes ~12 s rather than ~72 s.
+    const FAILED_BEAT_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
     // Let the phone register its receive cipher first — it does that on its own
     // IK callback, and a frame written before it lands is dropped without
@@ -483,6 +502,12 @@ async fn state_beat(link: Arc<dyn GattLink>, transport: Arc<Mutex<TransportState
                     tracing::info!("BLE state beat giving up; link looks dead");
                     return;
                 }
+                // Retry sooner than the beat interval. A healthy link wants a
+                // 12 s heartbeat; a failing one wants an answer, and six
+                // failures at the beat's own cadence would take 72 s to reach a
+                // verdict the session is waiting on.
+                tokio::time::sleep(FAILED_BEAT_RETRY).await;
+                continue;
             }
         }
         tokio::time::sleep(STATE_BEAT).await;
