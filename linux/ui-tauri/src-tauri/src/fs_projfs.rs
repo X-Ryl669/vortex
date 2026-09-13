@@ -55,7 +55,7 @@ use windows::core::{GUID, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HOST_DOWN, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_IO_DEVICE, ERROR_NOT_SUPPORTED,
-    ERROR_WRITE_PROTECT,
+    ERROR_TIMEOUT, ERROR_WRITE_PROTECT,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY};
 use windows::Win32::Storage::ProjectedFileSystem::*;
@@ -82,6 +82,19 @@ const INSTANCE_ID: GUID = GUID::from_u128(0x7b1f9a42_5d33_4c86_9e10_2f6a4c8d1b57
 /// point of the ranged protocol. Rounded up to the volume's write alignment at
 /// use, since every chunk but the file's last must be a multiple of it.
 const HYDRATE_CHUNK: u32 = 1024 * 1024;
+
+/// How long a metadata callback waits on the phone before giving up.
+///
+/// Deliberately far below the protocol's own 20 s reply timeout: that one
+/// bounds a REQUEST, this one bounds how long Explorer is allowed to look
+/// frozen. Hydration is not held to it — copying a large file over a slow link
+/// legitimately takes minutes, and ProjFS is built to show that as a slow copy
+/// rather than a hang.
+const META_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Locally-generated: the phone did not answer in time. Never on the wire, the
+/// same way [`crate::fs_link::NO_LINK`] is not.
+const TIMED_OUT: i32 = -1;
 
 /// ProjFS threads. Above [`MAX_INFLIGHT`] on purpose — see the module docs:
 /// the shared semaphore is meant to be what limits concurrency, not the pool.
@@ -110,6 +123,8 @@ fn hresult_of(c: i32) -> HRESULT {
         code::ISDIR => ERROR_ACCESS_DENIED,
         code::ROFS => ERROR_WRITE_PROTECT,
         crate::fs_link::NO_LINK => ERROR_HOST_DOWN,
+        // Asked, and nothing came back in the time a file manager can wait.
+        TIMED_OUT => ERROR_TIMEOUT,
         // Includes `code::IO`, and anything a future peer invents.
         _ => ERROR_IO_DEVICE,
     };
@@ -215,9 +230,34 @@ impl Provider {
         self.rt.block_on(f)
     }
 
+    /// Run one metadata operation, and give up quickly if the phone is silent.
+    ///
+    /// A callback holds a ProjFS pool thread for as long as it runs, and every
+    /// Explorer action on the projection is a callback — so the protocol's 20 s
+    /// reply timeout is the length of time Explorer appears hung when the phone
+    /// stops answering. Observed exactly that: a phone that went quiet mid
+    /// transfer left the folder frozen until the whole timeout expired, twice.
+    ///
+    /// Five seconds is already far longer than a listing takes on a working
+    /// link (11 ms over Wi-Fi, ~2.5 s over BLE), so this only ever fires when
+    /// something is genuinely wrong — and then "the host is down" in a moment
+    /// beats a frozen window for twenty seconds.
+    ///
+    /// Abandoning the future is safe: `fs_link` keeps its in-flight entry keyed
+    /// by request id, and drops it when the late reply arrives or when the
+    /// session ends, so nothing accumulates.
+    fn block_meta<T>(&self, f: impl std::future::Future<Output = Result<T, i32>>) -> Result<T, i32> {
+        self.block(async move {
+            match tokio::time::timeout(META_TIMEOUT, f).await {
+                Ok(v) => v,
+                Err(_) => Err(TIMED_OUT),
+            }
+        })
+    }
+
     /// Resolve a ProjFS-relative path to the peer's opaque address.
     fn resolve(&self, rel: &str) -> Result<p::FsEntry, i32> {
-        self.block(self.vfs.resolve(rel))
+        self.block_meta(self.vfs.resolve(rel))
     }
 }
 
@@ -281,7 +321,7 @@ unsafe extern "system" fn start_enumeration(
     if !entry.is_dir {
         return HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0);
     }
-    let mut entries = match prov.block(prov.vfs.listing(&entry.path)) {
+    let mut entries = match prov.block_meta(prov.vfs.listing(&entry.path)) {
         Ok(v) => (*v).clone(),
         Err(c) => return hresult_of(c),
     };
@@ -440,7 +480,7 @@ unsafe extern "system" fn get_file_data(
         Ok(e) => e,
         Err(c) => return hresult_of(c),
     };
-    let fh = match prov.block(prov.vfs.open(&entry.path)) {
+    let fh = match prov.block_meta(prov.vfs.open(&entry.path)) {
         Ok(fh) => fh,
         Err(c) => return hresult_of(c),
     };

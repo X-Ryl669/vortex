@@ -120,6 +120,9 @@ pub fn stop_screen_mirror(_state: State<'_, CmdChannel>) -> Result<(), String> {
 /// Backs off 2s → 30s for [`STARTUP_RETRY_WINDOW_SECS`] — long enough to
 /// outlast a slow boot or someone typing their keyring password — and only then
 /// calls it fatal, out loud.
+// Every user of this is a BlueZ or Secret Service startup step, all of which
+// are Linux-gated — so off Linux it is an unused macro rather than dead weight.
+#[cfg(target_os = "linux")]
 macro_rules! retry_startup {
     ($app:expr, $what:expr, $call:expr) => {{
         let started = std::time::Instant::now();
