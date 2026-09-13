@@ -143,6 +143,10 @@ mod universal_control;
 mod virtual_display;
 mod voice_settings;
 mod window;
+// Explorer's "Share via Vortex", the counterpart of the Nautilus extension and
+// Dolphin ServiceMenu that install_linux.sh writes.
+#[cfg(target_os = "windows")]
+mod win_shell;
 mod worker;
 mod x11_focus;
 
@@ -401,6 +405,13 @@ pub fn run() {
     // log that ends mid-startup with no reason given.
     log_panics();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "vortex starting");
+    // Explorer's "Share via Vortex". Re-registered every start rather than
+    // once, because the command has this exe's full path in it and Explorer
+    // will not go looking for a binary that moved. Cheap, and it means an
+    // unzipped standalone .exe gets the menu entry without an installer —
+    // which is the same reason the toast AUMID shortcut registers itself.
+    #[cfg(target_os = "windows")]
+    win_shell::register_share_verb();
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<UiCmd>();
     // Tray heartbeat: the 5-second local-earbuds rescan used to live in the
