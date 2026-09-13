@@ -188,7 +188,7 @@ const earbudsStatus = computed(() => {
             >{{ t("device.this") }}</span>
           </div>
           <div class="mt-1.5 flex items-center gap-2">
-            <span class="vx-dot bg-primary shadow-[0_0_8px_hsl(var(--primary)/0.6)]" />
+            <span class="vx-dot vx-glow text-primary" />
             <span class="text-[12.5px] text-muted-foreground">{{ thisDeviceKind }}</span>
           </div>
         </div>
@@ -245,7 +245,7 @@ const earbudsStatus = computed(() => {
         <div class="flex items-center gap-2">
           <span
             class="vx-dot"
-            :class="phoneOnline ? 'bg-primary vx-pulse' : phoneConnecting ? 'bg-amber-400 vx-pulse' : 'bg-muted-foreground'"
+            :class="phoneOnline ? 'text-primary vx-glow vx-pulse' : phoneConnecting ? 'text-amber-400 vx-pulse' : 'text-muted-foreground'"
           />
           <span class="text-[13px] text-[hsl(var(--card-foreground)/0.82)]">
             {{ phoneOnline ? t("peers.connected") : phoneConnecting ? t("peers.connecting") : t("peers.offline") }}
@@ -365,7 +365,7 @@ const earbudsStatus = computed(() => {
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <span class="vx-dot" :class="activeEarbuds.connected ? 'bg-primary shadow-[0_0_8px_hsl(var(--primary)/0.6)]' : 'bg-muted-foreground'" />
+          <span class="vx-dot" :class="activeEarbuds.connected ? 'vx-glow text-primary' : 'text-muted-foreground'" />
           <span class="text-[13px] text-[hsl(var(--card-foreground)/0.82)]">{{ earbudsStatus }}</span>
         </div>
         <div class="flex items-center gap-1.5">
@@ -442,8 +442,38 @@ const earbudsStatus = computed(() => {
   @apply flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-xl border border-white/[0.06] bg-white/[0.05];
   color: #e8eaed;
 }
+/* The dot is drawn by a masked pseudo-element, not by a background colour
+   clipped with `border-radius`. It is eight CSS pixels — eleven device pixels at
+   a fractional display scale — and a clipped circle that small rasterises to a
+   different silhouette depending on the sub-pixel offset it happens to land on:
+   from the identical rule, the "This device" dot came out round and the phone's
+   came out a squircle. A radial mask is antialiased the same way wherever it
+   falls. It has to be a mask and not a gradient: a gradient fading to
+   `transparent` fades through black and leaves a dark rim at this size.
+   The colour rides on `currentColor` (text-primary, …) rather than bg-*. */
 .vx-dot {
-  @apply h-2 w-2 shrink-0 rounded-full;
+  @apply relative h-[11px] w-[11px] shrink-0;
+}
+.vx-dot::before,
+.vx-pulse::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: currentColor;
+  -webkit-mask-image: radial-gradient(circle at 50% 50%, #000 0 45%, transparent 55%);
+  mask-image: radial-gradient(circle at 50% 50%, #000 0 45%, transparent 55%);
+}
+/* The halo: a second copy of the dot growing out of it and fading. See the
+   `vx-pulse` keyframes in style.css for why it scales rather than animating a
+   `box-shadow`, and why it steps rather than easing. */
+.vx-pulse::after {
+  pointer-events: none;
+  animation: vx-pulse 2.2s steps(33, end) infinite;
+}
+/* `drop-shadow`, not `box-shadow`: the glow has to follow the masked circle,
+   and a box-shadow would trace the square border box (and be masked away). */
+.vx-glow {
+  filter: drop-shadow(0 0 3px hsl(var(--primary) / 0.75));
 }
 /* A smaller sibling of `.vx-icon` for the compact rows. Its own class rather
    than `vx-icon` plus size utilities: Vue scoped styles compile to

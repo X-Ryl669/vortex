@@ -1,6 +1,7 @@
 package com.vortex.a3.ui
 
 import androidx.activity.ComponentActivity
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
@@ -10,6 +11,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -136,6 +138,26 @@ fun VortexRoot(
             .isAppearanceLightStatusBars = isLight
         @Suppress("DEPRECATION")
         window.statusBarColor = colorScheme.background.toArgb()
+    }
+    // Hold the screen on, but only while the phone is waiting on another device
+    // to find it: the pairing window, the SAS comparison, and the switch-laptop
+    // seek. Those are the bounded stretches where the user is reading the screen
+    // without touching it, and a display timeout in the middle of a handshake
+    // takes the radio work down with it. Everywhere else the phone is free to
+    // sleep — MainActivity.onCreate deliberately sets no window-level
+    // KEEP_SCREEN_ON, which used to keep the display up for as long as Vortex
+    // was in front.
+    val advertising by ui.advertise.collectAsState()
+    val awaitingSas by ui.pendingApproval.collectAsState()
+    val seekingLaptop by ui.seekingLaptop.collectAsState()
+    val holdScreenOn = advertising is AdvertiseState.Starting ||
+        advertising is AdvertiseState.Active ||
+        awaitingSas != null ||
+        seekingLaptop
+    DisposableEffect(holdScreenOn) {
+        val w = activity.window
+        if (holdScreenOn) w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose { w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
     }
     CompositionLocalProvider(LocalVortexLocale provides activeLocale) {
         MaterialTheme(colorScheme = colorScheme) {

@@ -11,7 +11,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -354,11 +353,18 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Dev-only: keep the screen on so the lab tester can read the
-        // generated identity. Production removes this.
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        window.addFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
-        window.addFlags(WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD)
+        // No KEEP_SCREEN_ON / TURN_SCREEN_ON / DISMISS_KEYGUARD here. They were
+        // lab scaffolding — "keep the screen on so the tester can read the
+        // generated identity" — and left the phone unable to sleep for as long
+        // as Vortex was in front, with the keyguard flag quietly waiving a
+        // swipe lock screen whenever this activity came up. Nothing in the app
+        // depends on them: the phone-to-laptop mirror holds its own
+        // SCREEN_DIM_WAKE_LOCK inside ScreenMirrorService (it has to, since it
+        // keeps capturing with the activity gone), LaptopMirrorActivity sets
+        // its own FLAG_KEEP_SCREEN_ON while you watch the laptop, and
+        // RingActivity wakes the screen with setShowWhenLocked/setTurnScreenOn.
+        // If a screen ever genuinely needs to stay lit — the pairing SAS, say —
+        // scope the flag to that screen, not to the whole activity.
         uiSettings.load()                               // saved locale + theme
         val identity = identityStore.loadOrGenerate(Platform.Android)
         identityState.value = identity
