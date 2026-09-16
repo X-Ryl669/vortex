@@ -756,6 +756,18 @@ pub(crate) async fn try_lan_reconnect(
                         tracing::warn!("offer sink is not up; LAN-announced offer dropped");
                     }
                 }
+                // Clipboard text the phone could not push over BLE. Same sink
+                // the BLE path uses, so the loop guard and history behave the
+                // same whichever link delivered it. Length only in the log.
+                if let Some(clip) = outcome.clipboard.clone() {
+                    tracing::info!(
+                        chars = clip.text.chars().count(),
+                        "clipboard text carried over LAN"
+                    );
+                    if !crate::clipboard_sync::submit_clipboard(clip) {
+                        tracing::warn!("clipboard sink is not up; LAN-carried text dropped");
+                    }
+                }
                 if outcome.peer_counter < local_counter {
                     tracing::warn!(
                         "possible trust rollback: peer counter={} local={}",

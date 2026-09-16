@@ -1266,6 +1266,15 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         lan.deletedCapturesProvider = {
             com.vortex.a3.core.media.CaptureLedger.deletedTokens(ctx)
         }
+        // Clipboard text the BLE notify could not deliver, so a laptop with a
+        // dead GATT link but a live LAN session still gets what was copied.
+        lan.pendingClipboardProvider = {
+            if (com.vortex.a3.core.clipboard.ClipboardSyncSetting.isEnabled()) {
+                com.vortex.a3.core.clipboard.ClipboardOutbox.take()
+            } else {
+                null
+            }
+        }
         lanServer = lan
         // Let code with no handle on the stack ship a snapshot immediately —
         // the accessibility service reporting an input-focus change, which the
