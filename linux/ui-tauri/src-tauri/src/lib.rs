@@ -566,6 +566,20 @@ pub fn run() {
                 let special = std::env::args()
                     .any(|a| a == "--hidden" || a == "--clipboard" || a == "--share");
                 if !special {
+                    // Shown here, at the configured size, rather than after the
+                    // webview reports its layout.
+                    //
+                    // Measuring first would be better — open once, already the
+                    // right size — but it cannot work on this stack: WebKitGTK
+                    // does not lay out an unmapped window, so everything the
+                    // page measures while hidden comes back at or near zero.
+                    // Tried it; the window opened at the 560x600 minimum.
+                    //
+                    // So the window appears at its configured size and
+                    // `fit_main_window` GROWS it afterwards if the content
+                    // turns out not to fit. That costs a visible resize on
+                    // exactly the displays that need one, and nothing at all
+                    // on the displays that do not.
                     window::present_main(app.handle());
                 }
             }
@@ -637,6 +651,7 @@ pub fn run() {
             // is not the stack, so there is nothing to reset.
             #[cfg(target_os = "linux")]
             ble::reset_bluetooth_adapter,
+            window::fit_main_window,
             worker::start_scan,
             worker::refresh_state,
             ipc::get_peer_states,
