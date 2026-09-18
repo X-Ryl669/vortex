@@ -97,6 +97,22 @@ mod fs_pull;
 mod contacts;
 mod desktop_apps;
 mod diagnostics;
+
+/// Whether a BLE session to a phone is live, on whichever loop this build runs.
+///
+/// Linux drives BLE through the BlueZ loop in `ble`; every other platform uses
+/// the portable one. Both keep the same flag, so callers that just want the
+/// answer — the peer-state DTO, the heartbeat cadence — need not know which.
+pub(crate) fn ble_link_up() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::ble::link_is_up()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::ble_portable::link_is_up()
+    }
+}
 mod dnd;
 mod first_run;
 #[cfg(target_os = "linux")]
@@ -617,6 +633,10 @@ pub fn run() {
             phone_files::fetch_phone_file,
             send_to_phone::send_to_phone,
             diagnostics::diagnostics_report,
+            // Linux-only: the wedged-discovery escape hatch. Elsewhere BlueZ
+            // is not the stack, so there is nothing to reset.
+            #[cfg(target_os = "linux")]
+            ble::reset_bluetooth_adapter,
             worker::start_scan,
             worker::refresh_state,
             ipc::get_peer_states,
