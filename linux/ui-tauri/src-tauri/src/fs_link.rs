@@ -269,6 +269,13 @@ async fn round_trip(op: u8, id: u32, payload: Vec<u8>) -> Result<Reply, i32> {
                 g.remove(&id);
             }
             tracing::warn!(id, "fs: request timed out");
+            // Do not keep using a LAN session that just ate a request. The
+            // phone drops a frame it cannot open without saying so, and a
+            // Noise session that has lost nonce sync never recovers — every
+            // later request would also wait out the full timeout, one after
+            // another, for as long as the file manager keeps asking. Dropping
+            // it makes the next request reopen (or fall back to BLE) instead.
+            crate::fs_lan::close().await;
             Err(code::IO)
         }
     }
@@ -450,7 +457,7 @@ pub(crate) async fn read_all(
             let Some((at, res)) = pending.next().await else {
                 break Ok(offset);
             };
-            let (bytes, eof) = match res {
+            let (bytes, mut eof) = match res {
                 Ok(v) => v,
                 Err(c) => break Err(c),
             };
@@ -462,6 +469,38 @@ pub(crate) async fn read_all(
                 offset = at + bytes.len() as u64;
             } else if !eof {
                 tracing::warn!(at, "fs: read stalled without EOF");
+                break Err(code::IO);
+            }
+            // A short chunk is not the end of the file — the phone answers
+            // with one `pread`, which may return less than asked. The next
+            // chunk is already in flight at `at + MAX_READ_LEN`, so carrying on
+            // would leave a hole of zeros in the copy. Fetch the gap first.
+            let chunk_end = (at + p::MAX_READ_LEN as u64).min(size);
+            let mut stalled = false;
+            while !eof && offset < chunk_end {
+                let want = (chunk_end - offset) as u32;
+                match read(handle, offset, want).await {
+                    Ok((more, _)) if more.is_empty() => {
+                        stalled = true;
+                        break;
+                    }
+                    Ok((more, e)) => {
+                        if let Err(err) = sink(offset, &more) {
+                            tracing::warn!("fs: sink failed at offset {offset}: {err}");
+                            stalled = true;
+                            break;
+                        }
+                        offset += more.len() as u64;
+                        eof = e;
+                    }
+                    Err(_) => {
+                        stalled = true;
+                        break;
+                    }
+                }
+            }
+            if stalled {
+                tracing::warn!(offset, "fs: could not complete a short read");
                 break Err(code::IO);
             }
             if eof {

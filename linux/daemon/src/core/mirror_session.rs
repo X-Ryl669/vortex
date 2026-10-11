@@ -353,6 +353,11 @@ async fn seal_and_write_half(
     plain: &[u8],
 ) -> Result<(), String> {
     let mut out = vec![0u8; plain.len() + 16];
+    // Write half locked BEFORE sealing: with implicit Noise nonces, a
+    // concurrent caller sealing between our seal and our write would put its
+    // later nonce on the wire first and desync the phone for the rest of the
+    // session. See `fs_lan::open_session`.
+    let mut w = writer_half.lock().await;
     let n = {
         let mut t = transport.lock().await;
         t.write_message(plain, &mut out)
@@ -360,7 +365,6 @@ async fn seal_and_write_half(
     };
     let frame = Frame::new(ty, sub, out[..n].to_vec());
     let bytes = frame.encode();
-    let mut w = writer_half.lock().await;
     w.write_all(&bytes).await.map_err(|e| format!("tcp write: {e}"))?;
     w.flush().await.map_err(|e| format!("tcp flush: {e}"))?;
     Ok(())

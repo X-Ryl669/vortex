@@ -1050,8 +1050,14 @@ class LanServer(
                                 aeadOpen(pair.receiver, frame.payload)
                             }.getOrNull()
                             if (plain == null) {
-                                Log.w(TAG, "fs: reply AEAD decrypt failed")
-                                continue
+                                // Noise nonces are implicit and a failed open
+                                // does not advance ours, so one lost frame
+                                // means every later one fails too. Hang up
+                                // rather than drop it quietly: the laptop
+                                // sees the socket close and reopens at once,
+                                // instead of timing out request after request.
+                                Log.w(TAG, "fs: reply AEAD decrypt failed; closing the session")
+                                break
                             }
                             // This socket is demonstrably the laptop's FS
                             // session, so it is the one to send our own
@@ -1073,8 +1079,12 @@ class LanServer(
                                 aeadOpen(pair.receiver, frame.payload)
                             }.getOrNull()
                             if (plain == null) {
-                                Log.w(TAG, "fs: AEAD decrypt failed")
-                                continue
+                                // Same as the reply branch above: a session
+                                // that has lost nonce sync never gets it back,
+                                // and staying silent left the laptop's file
+                                // manager waiting out a 20 s timeout per op.
+                                Log.w(TAG, "fs: AEAD decrypt failed; closing the session")
+                                break
                             }
                             val serve = fsServe
                             if (serve == null) {

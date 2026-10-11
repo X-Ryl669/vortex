@@ -38,9 +38,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    Errno, FileAttr, FileType, FopenFlags, Generation, INodeNo, KernelConfig, MountOption,
-    OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    Errno, FileAttr, FileType, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig,
+    MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
 };
 use vortex_l3_daemon::core::fs_proto::{self as p, code};
 
@@ -211,6 +211,17 @@ impl<R: FsRemote> fuser::Filesystem for PhoneFs<R> {
         // Background requests are how many of those may be outstanding. Ours
         // are answered off-thread, so a deeper queue costs nothing here.
         let _ = config.set_max_background(MAX_INFLIGHT as u16 * 2);
+        // What makes FOPEN_KEEP_CACHE (see `open`) safe: cached pages are
+        // invalidated when the attributes we report change, so a photo edited
+        // on the phone is not served stale for longer than ATTR_TTL. Every
+        // kernel since 2.6.x has it; if one somehow does not, keeping the cache
+        // is still right for a read-only mount of mostly immutable media.
+        if let Err(missing) = config.add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA) {
+            tracing::warn!(
+                ?missing,
+                "fs-mount: kernel lacks auto-invalidation; cache may lag edits"
+            );
+        }
         tracing::info!(readahead, "fs-mount: kernel session up");
         Ok(())
     }
@@ -315,9 +326,15 @@ impl<R: FsRemote> fuser::Filesystem for PhoneFs<R> {
                 return reply.error(Errno::ENOENT);
             };
             match vfs.open(&addr).await {
-                // No flags: keeping the page cache is what lets the kernel serve
-                // a re-read without us, and read ahead of the reader.
-                Ok(fh) => reply.opened(fuser::FileHandle(fh), FopenFlags::empty()),
+                // KEEP_CACHE, or the kernel throws away this file's cached
+                // pages on every open — the opposite of what the old comment
+                // here assumed. Without it a photo the thumbnailer just read
+                // came over Wi-Fi again when the image viewer opened it, while
+                // the thumbnailers were still saturating the link. Staleness
+                // is covered by FUSE_AUTO_INVAL_DATA (see `init`): the kernel
+                // drops the pages itself when a getattr shows a new size or
+                // mtime.
+                Ok(fh) => reply.opened(fuser::FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE),
                 Err(c) => reply.error(errno_of(c)),
             }
         });

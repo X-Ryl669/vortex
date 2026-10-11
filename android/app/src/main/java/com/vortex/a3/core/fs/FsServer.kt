@@ -363,7 +363,18 @@ class FsServer(
             // concurrent ranged reads on one handle cannot interleave into each
             // other's bytes. A thumbnailer firing parallel reads makes that a
             // real case, not a theoretical one.
-            Os.pread(pfd.fileDescriptor, buf, 0, want, r.offset)
+            //
+            // Looped: one pread may return less than asked — /sdcard is itself
+            // a FUSE mount — and the laptop's mount reads a short reply as "the
+            // file ends here", which cut photos off mid-file. Stop only at a
+            // real end (0) or once the request is filled.
+            var got = 0
+            while (got < want) {
+                val k = Os.pread(pfd.fileDescriptor, buf, got, want - got, r.offset + got)
+                if (k <= 0) break
+                got += k
+            }
+            got
         } catch (e: ErrnoException) {
             return if (e.errno == OsConstants.ESPIPE) {
                 // Some providers (cloud-backed documents) hand back a pipe,

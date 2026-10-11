@@ -164,6 +164,9 @@ pub async fn start_initiator_session(
                     .to_json()
                     .map_err(|e| format!("frame json: {e}"))?;
                 let mut out = vec![0u8; plain.len() + 16];
+                // Write half locked BEFORE sealing, so seal order is wire
+                // order — see `fs_lan::open_session` for the desync otherwise.
+                let mut w = writer_w.lock().await;
                 let n = {
                     let mut t = transport_w.lock().await;
                     t.write_message(&plain, &mut out)
@@ -171,7 +174,6 @@ pub async fn start_initiator_session(
                 };
                 let frame = Frame::new(ty::AUDIO_OP, 0x01, out[..n].to_vec());
                 let bytes = frame.encode();
-                let mut w = writer_w.lock().await;
                 w.write_all(&bytes).await.map_err(|e| format!("tcp write: {e}"))?;
                 w.flush().await.map_err(|e| format!("tcp flush: {e}"))?;
                 Ok(())

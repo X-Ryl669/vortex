@@ -47,6 +47,11 @@ struct Session {
     /// that issues fifty reads over a dead network produces one notification
     /// rather than fifty.
     warned: bool,
+    /// Bumped per session opened, so a session's `on_closed` can tell whether
+    /// it is still the current one. A session retired by [`close`] keeps its
+    /// read loop until the peer hangs up, and that late callback must not
+    /// clear the session that replaced it.
+    generation: u64,
 }
 
 fn session() -> &'static tokio::sync::Mutex<Session> {
@@ -124,11 +129,14 @@ pub(crate) async fn writer() -> Option<FsLanWriter> {
             payload: f.payload,
         });
     });
-    let on_closed = Arc::new(|| {
-        tokio::spawn(async {
+    let generation = s.generation.wrapping_add(1);
+    let on_closed = Arc::new(move || {
+        tokio::spawn(async move {
             let mut s = session().lock().await;
-            s.writer = None;
-            s.last_used = None;
+            if s.generation == generation {
+                s.writer = None;
+                s.last_used = None;
+            }
         });
     });
 
@@ -144,6 +152,7 @@ pub(crate) async fn writer() -> Option<FsLanWriter> {
     .await
     {
         Ok(w) => {
+            s.generation = generation;
             s.writer = Some(w.clone());
             s.last_used = Some(Instant::now());
             s.last_failed = None;
