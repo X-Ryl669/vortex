@@ -352,6 +352,14 @@ pub struct AppState {
     /// and make a fresh tap look like a replay. `0` = never rung. See [`ring`].
     #[serde(default)]
     pub ring_seq: u64,
+    /// Laptop→phone "raise your Wi-Fi Direct group": unix-millis of the request.
+    ///
+    /// Sent when the laptop has a file to push and no LAN route to the phone
+    /// (BLE-only). The phone brings up its P2P group owner and answers with the
+    /// usual encrypted Wi-Fi Direct offer, which the laptop joins before
+    /// pushing over the direct link. Rising-edge, same contract as [`ring_seq`].
+    #[serde(default)]
+    pub wifi_direct_req_seq: u64,
     /// Laptop→phone "open this on the phone": the URL or text the user sent,
     /// and the unix-millis they sent it at.
     ///
@@ -494,6 +502,7 @@ impl AppState {
             camera_facing: String::new(), // filled by the UI front/back toggle
             camera_offer: None,       // laptop never offers a camera
             ring_seq: 0,              // bumped by the UI's "Ring my phone" tap
+            wifi_direct_req_seq: 0,   // stamped by the app when a share needs the group
             wifi_ip: None,            // phone→laptop only (cached-peer-IP hint)
             display_hz: None,         // phone→laptop only (mirror frame-rate ceiling)
             ts,
@@ -670,6 +679,7 @@ mod tests {
             camera_facing: String::new(),
             camera_offer: None,
             ring_seq: 0,
+            wifi_direct_req_seq: 0,
             wifi_ip: Some("192.168.1.42".into()),
             display_hz: Some(120),
             ts: 1_700_000_000,

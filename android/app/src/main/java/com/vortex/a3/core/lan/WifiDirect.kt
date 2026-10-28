@@ -44,6 +44,16 @@ object WifiDirect {
             Log.w(TAG, "no WifiP2pManager")
             return
         }
+        // The framework answers BUSY (2) to EVERY request while Wi-Fi is off,
+        // which reads like a transient clash and hides the real cause. Say it.
+        val wifi = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+        val wifiOn = wifi?.isWifiEnabled
+        val p2pOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) wifi?.isP2pSupported else null
+        Log.i(TAG, "start: wifiEnabled=$wifiOn p2pSupported=$p2pOk")
+        if (wifiOn == false) {
+            Log.w(TAG, "Wi-Fi is OFF on this phone: Wi-Fi Direct cannot start (turn Wi-Fi on; it need not be connected)")
+            return
+        }
         val c = m.initialize(ctx.applicationContext, Looper.getMainLooper(), null)
         manager = m
         channel = c
@@ -51,11 +61,26 @@ object WifiDirect {
         // Clear any stale group first, then (re)create regardless of the result.
         m.removeGroup(c, object : WifiP2pManager.ActionListener {
             override fun onSuccess() = create(m, c, band5 = true)
-            override fun onFailure(reason: Int) = create(m, c, band5 = true)
+            override fun onFailure(reason: Int) {
+                Log.d(TAG, "pre-clean removeGroup: reason=$reason (no stale group is fine)")
+                create(m, c, band5 = true)
+            }
         })
     }
 
-    private fun create(m: WifiP2pManager, c: WifiP2pManager.Channel, band5: Boolean) {
+    /** BUSY (2) is often transient — a group still tearing down, a discovery in
+     *  flight — so retry it a few times before concluding anything. */
+    private const val BUSY = 2
+    private const val MAX_BUSY_RETRIES = 4
+    private const val BUSY_RETRY_DELAY_MS = 1500L
+    private val handler = android.os.Handler(Looper.getMainLooper())
+
+    private fun create(
+        m: WifiP2pManager,
+        c: WifiP2pManager.Channel,
+        band5: Boolean,
+        busyRetries: Int = 0,
+    ) {
         val builder = WifiP2pConfig.Builder()
             .setNetworkName(SSID)
             .setPassphrase(PASS)
@@ -72,9 +97,16 @@ object WifiDirect {
                     onReady = null
                 }
                 override fun onFailure(reason: Int) {
-                    Log.w(TAG, "createGroup failed reason=$reason band5=$band5")
-                    // 5 GHz unsupported on some chipsets → retry on auto band.
-                    if (band5) create(m, c, band5 = false)
+                    Log.w(TAG, "createGroup failed reason=$reason band5=$band5 busyRetries=$busyRetries")
+                    if (reason == BUSY && busyRetries < MAX_BUSY_RETRIES) {
+                        handler.postDelayed(
+                            { create(m, c, band5, busyRetries + 1) },
+                            BUSY_RETRY_DELAY_MS,
+                        )
+                    } else if (band5) {
+                        // 5 GHz unsupported on some chipsets → retry on auto band.
+                        create(m, c, band5 = false)
+                    }
                 }
             })
         } catch (e: Exception) {

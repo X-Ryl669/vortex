@@ -191,6 +191,10 @@ data class AppState(
      *  Ring tap. We ring loudly (overriding silent/DND) on the rising edge and
      *  dedup repeats by comparing against the last value we acted on. 0 = none. */
     val ringSeq: Long = 0L,
+    /** Laptop→phone "raise your Wi-Fi Direct group": unix-millis of the request,
+     *  sent when the laptop has a file to push and no LAN route to us. Acted on
+     *  at the rising edge only. 0 = none. */
+    val wifiDirectReqSeq: Long = 0L,
     /** Laptop→phone "open this on my phone": a URL or snippet plus the
      *  unix-millis it was sent at. Rising-edge, same contract as [ringSeq]. */
     val openOnPhone: String? = null,
@@ -395,6 +399,7 @@ data class AppState(
                 },
                 cameraReq = obj.optBoolean("camera_req", false),
                 ringSeq = obj.optLong("ring_seq", 0L),
+                wifiDirectReqSeq = obj.optLong("wifi_direct_req_seq", 0L),
                 wifiIp = obj.optString("wifi_ip", "").takeIf { it.isNotBlank() },
                 displayHz = obj.optInt("display_hz", 0).takeIf { it > 0 },
                 inputFocused = obj.optBoolean("input_focused", false),

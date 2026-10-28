@@ -212,6 +212,12 @@ internal fun VortexStack.handlePeerAppState(peerPub: ByteArray, state: com.vorte
     handleCameraRequest(state.cameraReq, state.cameraFacing)
     // Find-My: the laptop tapped "Ring my phone" — ring loudly on the edge.
     com.vortex.a3.core.ring.RingController.onRingSeq(ctx, state.ringSeq)
+    // Laptop has a file for us and no LAN route: raise the P2P group, which
+    // offers itself to the laptop over BLE (same path a big phone→laptop file uses).
+    if (com.vortex.a3.core.lan.WifiDirectRequest.isNew(state.wifiDirectReqSeq)) {
+        Log.i(VortexStack.TAG, "wifi-direct: laptop asked for a group")
+        maybeStartWifiDirect()
+    }
     // "Open this on my phone" — rising-edge, posts a notification to tap.
     com.vortex.a3.core.handoff.OpenOnPhone.onState(ctx, state.openOnPhone, state.openOnPhoneSeq)
     // Shared smart-switch setting, LWW: adopt the laptop's value when its
