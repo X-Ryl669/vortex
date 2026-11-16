@@ -3,6 +3,10 @@
 //! over the ~20 MB/s direct link, then restores its normal Wi-Fi (single adapter
 //! ⇒ briefly offline). `lan.rs`'s heartbeat reads `wd_active()` to target the GO
 //! IP, and calls `restore_wifi` once the pull drains.
+//!
+//! Both directions use it. The phone offers a group on its own for a large
+//! share; for a laptop → phone share the laptop asks for one
+//! ([`on_round_failed`]) when the phone can't be reached on the local network.
 
 use std::time::Duration;
 
@@ -45,6 +49,98 @@ const WD_IDLE_GRACE: Duration = Duration::from_secs(25);
 /// How long a pull may make NO progress before the watchdog restores Wi-Fi.
 /// Bounds a genuinely stuck transfer without capping a healthy long one.
 const WD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// When we last asked the phone for a group ([`on_round_failed`]).
+static WD_REQUESTED_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Don't ask again sooner than this. Matches the phone's own offer
+/// coalescing gap (`WIFI_DIRECT_OFFER_MIN_GAP_MS`): a group takes a few
+/// seconds to come up, and a request per failed round would only re-announce
+/// the one already on its way.
+const WD_REQUEST_GAP: Duration = Duration::from_secs(30);
+
+/// The pending share whose "phone out of reach" notice was already shown, by
+/// when it was queued — one notice per share, not one per failed round.
+static UNREACHABLE_NOTICE_FOR: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+fn requested_recently() -> bool {
+    WD_REQUESTED_AT
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .is_some_and(|t| t.elapsed() < 2 * WD_REQUEST_GAP)
+}
+
+/// Anything still to move in either direction? While this holds, the group
+/// link is in use and must not be given back.
+fn transfer_busy() -> bool {
+    crate::lan::files_queued()
+        || vortex_l3_daemon::core::outgoing_share::pending()
+        || vortex_l3_daemon::core::outgoing_share::in_flight()
+}
+
+/// A heartbeat round failed to reach the phone. If a laptop → phone share is
+/// waiting on it, ask the phone over BLE to bring up its Wi-Fi Direct group:
+/// it answers with the same `WIFI_DIRECT_OFFER` its own large shares send, and
+/// [`on_wifi_direct_offer`] joins it and pushes over the direct link.
+///
+/// The trigger is "the phone can't be reached", not a file size: a share of
+/// any size waits on the same missing route, and the user is watching it.
+/// Two failed rounds in a row, so one dozing radio doesn't cost the laptop its
+/// Wi-Fi for a switch it didn't need.
+pub(crate) async fn on_round_failed(consec_fail: u32) {
+    use vortex_l3_daemon::core::outgoing_share;
+    let Some(queued_at) = outgoing_share::pending_since() else {
+        return;
+    };
+    if wd_active() || consec_fail < 2 {
+        return;
+    }
+    if !cfg!(target_os = "linux") {
+        // The join goes through NetworkManager; elsewhere the phone would open
+        // a group nobody joins.
+        crate::transfers_out::waiting("Phone not reachable on this network — waiting");
+        return;
+    }
+    let writer = match crate::BLE_SEALED_WRITER.get() {
+        Some(holder) => holder.lock().await.clone(),
+        None => None,
+    };
+    let Some(writer) = writer else {
+        crate::transfers_out::waiting("Phone out of reach — will send when it's back");
+        let first = UNREACHABLE_NOTICE_FOR
+            .lock()
+            .map(|mut g| g.replace(queued_at) != Some(queued_at))
+            .unwrap_or(false);
+        if first {
+            crate::share::notify_problem(
+                "Share waiting for the phone".to_string(),
+                &["Neither Wi-Fi nor Bluetooth reaches it right now. It will be sent when the phone is back.".to_string()],
+            );
+        }
+        return;
+    };
+    let due = WD_REQUESTED_AT
+        .lock()
+        .map(|g| g.is_none_or(|t| t.elapsed() >= WD_REQUEST_GAP))
+        .unwrap_or(false);
+    if !due {
+        return;
+    }
+    use vortex_l3_daemon::core::ble::frame::ty;
+    match writer(ty::WIFI_DIRECT_REQUEST, 0, Vec::new()).await {
+        Ok(()) => {
+            if let Ok(mut g) = WD_REQUESTED_AT.lock() {
+                *g = Some(std::time::Instant::now());
+            }
+            tracing::info!("→ BLE Wi-Fi Direct request (share waiting, phone not on our network)");
+            crate::transfers_out::waiting("No shared Wi-Fi — opening a direct link…");
+        }
+        Err(e) => tracing::warn!("Wi-Fi Direct request not sent: {e}"),
+    }
+}
 
 /// Restore the normal Wi-Fi only once the queue has been empty for
 /// [`WD_IDLE_GRACE`]. Call on every heartbeat round while on the group link.
@@ -267,11 +363,10 @@ fn is_fast_lan_iface(name: &str) -> bool {
 /// Hook target (set in the worker): the phone offered a P2P group. If files are
 /// pending, switch onto it so the heartbeat pulls them over the fast link.
 pub(crate) fn on_wifi_direct_offer(app: AppHandle, ssid: String, pass: String) {
-    let pending = crate::PENDING_FILE_OFFERS
-        .get()
-        .and_then(|m| m.lock().ok().map(|g| !g.is_empty()))
-        .unwrap_or(false);
-    if !pending || wd_active() {
+    // Either direction: files the phone offered us, or a share of ours waiting
+    // for a route to the phone.
+    let outgoing = vortex_l3_daemon::core::outgoing_share::pending();
+    if !(crate::lan::files_queued() || outgoing) || wd_active() {
         return;
     }
     // Already on the same LAN as the phone? Then the AP path already reaches
@@ -279,7 +374,12 @@ pub(crate) fn on_wifi_direct_offer(app: AppHandle, ssid: String, pass: String) {
     // association — one radio each, so that is unavoidable. Observed: a
     // 65-file share on a shared network switched networks purely because one
     // file happened to exceed the size trigger.
-    if let Some(peer_ip) = crate::lan::last_good_peer_ip() {
+    //
+    // Skipped when WE asked for this group: we only ask after the LAN path
+    // failed, so "same subnet" then means a stale address or a network that
+    // blocks device-to-device traffic, not a working route.
+    let we_asked = outgoing && requested_recently();
+    if let (false, Some(peer_ip)) = (we_asked, crate::lan::last_good_peer_ip()) {
         if peer_on_same_fast_lan(peer_ip) {
             tracing::info!(
                 %peer_ip,
@@ -293,6 +393,11 @@ pub(crate) fn on_wifi_direct_offer(app: AppHandle, ssid: String, pass: String) {
         tracing::info!(?saved, %ssid, "Wi-Fi Direct: joining group for fast pull");
         if !join_go(&ssid, &pass).await {
             tracing::warn!("Wi-Fi Direct: join failed; staying on router path");
+            if vortex_l3_daemon::core::outgoing_share::pending() {
+                crate::transfers_out::waiting(
+                    "Couldn't join the phone's direct link — waiting for Wi-Fi",
+                );
+            }
             return;
         }
         if let Ok(mut g) = WIFI_DIRECT.lock() {
@@ -312,26 +417,43 @@ pub(crate) fn on_wifi_direct_offer(app: AppHandle, ssid: String, pass: String) {
         // `file_pull_active()` already answers (queued AND progressing).
         let app2 = app.clone();
         tokio::spawn(async move {
-            let joined_at = tokio::time::Instant::now();
+            let joined_at = std::time::Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 if !wd_active() {
                     return; // restored elsewhere (idle grace, or a new join)
                 }
-                // With nothing queued there is nothing to be stuck on — the
-                // idle-grace path owns that decision, and stepping on it here
-                // is what cut a healthy batch short.
-                if !crate::lan::files_queued() {
+                let incoming = crate::lan::files_queued();
+                let outgoing = vortex_l3_daemon::core::outgoing_share::pending_since();
+                // With nothing queued there is nothing to be stuck on, so only
+                // the idle grace applies. It is applied HERE as well as after
+                // each successful round: once the phone tears its group down no
+                // round succeeds again, and with the 240 s BLE-live cadence the
+                // heartbeat alone left the laptop parked on a dead group.
+                // A push in flight is not idle — its batch has left the queue
+                // but the phone is still pulling it.
+                if !incoming && outgoing.is_none() {
+                    restore_when_idle(&app2, !transfer_busy()).await;
+                    if !wd_active() {
+                        return;
+                    }
                     continue;
                 }
                 // Files ARE queued: measure real progress. `queue_progress_age`
                 // is the time since one last COMPLETED, which survives the
                 // queue oscillating empty→full under a paced sender.
-                let stalled = crate::lan::queue_progress_age()
-                    .map(|age| age >= WD_STALL_TIMEOUT)
-                    // Nothing has ever completed — fall back to time on the
-                    // group so a join that never delivers still gets unstuck.
-                    .unwrap_or(joined_at.elapsed() >= WD_STALL_TIMEOUT);
+                let stalled_in = incoming
+                    && crate::lan::queue_progress_age()
+                        .map(|age| age >= WD_STALL_TIMEOUT)
+                        // Nothing has ever completed — fall back to time on the
+                        // group so a join that never delivers still gets unstuck.
+                        .unwrap_or(joined_at.elapsed() >= WD_STALL_TIMEOUT);
+                // A queued share leaves the queue the moment a round takes it,
+                // so one still waiting this long after we joined (or after it
+                // was queued, if later) means no round reaches the phone here.
+                let stalled_out =
+                    outgoing.is_some_and(|t| joined_at.max(t).elapsed() >= WD_STALL_TIMEOUT);
+                let stalled = stalled_in || stalled_out;
                 if stalled {
                     tracing::warn!(
                         "Wi-Fi Direct: queued pull made no progress for {}s → force-restore Wi-Fi",

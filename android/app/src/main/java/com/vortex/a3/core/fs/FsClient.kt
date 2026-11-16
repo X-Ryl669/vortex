@@ -198,6 +198,38 @@ object FsClient {
         dest: File,
         onProgress: (done: Long, total: Long) -> Unit = { _, _ -> },
     ): File {
+        dest.parentFile?.mkdirs()
+        try {
+            RandomAccessFile(dest, "rw").use { out ->
+                out.setLength(0)
+                readAll(path, sink = { at, bytes ->
+                    out.seek(at)
+                    out.write(bytes)
+                }, onProgress = onProgress)
+            }
+        } catch (e: Exception) {
+            // No half-written file left behind: a truncated download looks like
+            // a real one and is worse than none.
+            dest.delete()
+            throw e
+        }
+        return dest
+    }
+
+    /**
+     * Read [path] by ranges, handing each one to [sink] with its offset, front
+     * to back. Returns the bytes read. The Kotlin twin of Rust
+     * `fs_link::read_all`, and what [download] and the laptop → phone share
+     * (`IncomingFile.pull`) both sit on.
+     *
+     * Peak memory is [READ_WINDOW] chunks however big the file is. Throws
+     * [FsException] on any failure; the handle is closed either way.
+     */
+    suspend fun readAll(
+        path: String,
+        sink: (offset: Long, bytes: ByteArray) -> Unit,
+        onProgress: (done: Long, total: Long) -> Unit = { _, _ -> },
+    ): Long {
         val openId = newId()
         val opened = roundTrip(
             FsOp.OPEN,
@@ -208,75 +240,65 @@ object FsClient {
         val handle = o.optLong("handle")
         val size = o.optLong("size", -1)
 
-        dest.parentFile?.mkdirs()
         var offset = 0L
         try {
-            RandomAccessFile(dest, "rw").use { out ->
-                out.setLength(0)
-                if (size > 0) {
-                    // Pipelined: keep [READ_WINDOW] reads outstanding so the
-                    // next request is already on the wire while the current
-                    // reply is still coming back. Only when the size is known —
-                    // without it there is no way to tell how many reads to
-                    // issue, and speculative ones past the end would be waste
-                    // on a link this feature exists to stop wasting.
-                    coroutineScope {
-                        val inflight = ArrayDeque<kotlinx.coroutines.Deferred<FsData>>()
-                        var nextOffset = 0L
-                        while (offset < size) {
-                            while (inflight.size < READ_WINDOW && nextOffset < size) {
-                                val at = nextOffset
-                                nextOffset += MAX_READ_LEN
-                                inflight.addLast(async { readAt(handle, at, MAX_READ_LEN) })
-                            }
-                            // Consumed in ISSUE order, which is also offset
-                            // order, so the file is written front to back and
-                            // progress only ever moves forward. Replies may
-                            // still arrive in any order; this just declines to
-                            // care.
-                            val d = inflight.removeFirst().await()
-                            if (d.bytes.isNotEmpty()) {
-                                out.seek(d.offset)
-                                out.write(d.bytes)
-                                offset = d.offset + d.bytes.size
-                                onProgress(offset, size)
-                            } else if (!d.eof) {
-                                throw FsException(FsCode.IO, "transfer stalled")
-                            }
-                            if (d.eof && inflight.isEmpty()) break
+            if (size > 0) {
+                // Pipelined: keep [READ_WINDOW] reads outstanding so the next
+                // request is already on the wire while the current reply is
+                // still coming back. Only when the size is known — without it
+                // there is no way to tell how many reads to issue, and
+                // speculative ones past the end would be waste on a link this
+                // feature exists to stop wasting.
+                coroutineScope {
+                    val inflight = ArrayDeque<kotlinx.coroutines.Deferred<FsData>>()
+                    var nextOffset = 0L
+                    while (offset < size) {
+                        while (inflight.size < READ_WINDOW && nextOffset < size) {
+                            val at = nextOffset
+                            nextOffset += MAX_READ_LEN
+                            inflight.addLast(async { readAt(handle, at, MAX_READ_LEN) })
                         }
-                        // A short file, or one that shrank under us: drop the
-                        // rest rather than awaiting reads past its end.
-                        inflight.forEach { it.cancel() }
-                    }
-                } else {
-                    // Unknown size: sequential, following EOF.
-                    while (true) {
-                        val d = readAt(handle, offset, MAX_READ_LEN)
+                        // Consumed in ISSUE order, which is also offset order,
+                        // so the sink sees the file front to back and progress
+                        // only ever moves forward. Replies may still arrive in
+                        // any order; this just declines to care.
+                        val d = inflight.removeFirst().await()
                         if (d.bytes.isNotEmpty()) {
-                            out.seek(d.offset)
-                            out.write(d.bytes)
+                            sink(d.offset, d.bytes)
                             offset = d.offset + d.bytes.size
                             onProgress(offset, size)
-                        }
-                        if (d.eof) break
-                        if (d.bytes.isEmpty()) {
-                            // No EOF and no bytes: the far side is not
-                            // advancing, and retrying would spin forever.
+                        } else if (!d.eof) {
                             throw FsException(FsCode.IO, "transfer stalled")
                         }
+                        if (d.eof && inflight.isEmpty()) break
+                    }
+                    // A short file, or one that shrank under us: drop the rest
+                    // rather than awaiting reads past its end.
+                    inflight.forEach { it.cancel() }
+                }
+            } else {
+                // Unknown (or zero) size: sequential, following EOF.
+                while (true) {
+                    val d = readAt(handle, offset, MAX_READ_LEN)
+                    if (d.bytes.isNotEmpty()) {
+                        sink(d.offset, d.bytes)
+                        offset = d.offset + d.bytes.size
+                        onProgress(offset, size)
+                    }
+                    if (d.eof) break
+                    if (d.bytes.isEmpty()) {
+                        // No EOF and no bytes: the far side is not advancing,
+                        // and retrying would spin forever.
+                        throw FsException(FsCode.IO, "transfer stalled")
                     }
                 }
             }
         } catch (e: Exception) {
-            // No half-written file left behind: a truncated download looks like
-            // a real one and is worse than none.
-            dest.delete()
             closeQuietly(handle)
             throw e
         }
         closeQuietly(handle)
-        return dest
+        return offset
     }
 
     private suspend fun closeQuietly(handle: Long) {

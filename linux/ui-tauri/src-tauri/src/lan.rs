@@ -866,7 +866,8 @@ pub(crate) async fn try_lan_reconnect(
                 // Wi-Fi Direct: once every queued file is pulled over the group
                 // link, hop back to the normal Wi-Fi; otherwise pull the next now.
                 if wd_active() {
-                    let queue_empty = !files_queued();
+                    let queue_empty = !files_queued()
+                        && !vortex_l3_daemon::core::outgoing_share::pending();
                     // Hold the group link across brief gaps. A paced batch
                     // empties the queue between windows, and restoring on each
                     // gap cost a Wi-Fi disconnect/reconnect every few seconds.
@@ -1461,6 +1462,9 @@ pub(crate) fn spawn_heartbeat(
                         consec_lan_fail = 0;
                     } else if had_trust {
                         consec_lan_fail = consec_lan_fail.saturating_add(1);
+                        // A share to the phone waiting on this missing route
+                        // asks for a direct link over BLE.
+                        crate::lan_wifi_direct::on_round_failed(consec_lan_fail).await;
                     }
                     // Adaptive cadence — the seamless-continuity shape: BLE is
                     // the signalling plane, Wi-Fi comes up on demand. While
@@ -1484,7 +1488,9 @@ pub(crate) fn spawn_heartbeat(
                         Duration::from_secs(2)
                     } else if had_trust && !lan_synced && consec_lan_fail <= 3 {
                         Duration::from_secs(2)
-                    } else if file_pull_active() {
+                    } else if file_pull_active()
+                        || vortex_l3_daemon::core::outgoing_share::pending()
+                    {
                         // A phone file batch is mid-pull. One file rides each
                         // round, so the cadence IS the transfer rate here, and
                         // the idle branches below are ruinous: with BLE live
@@ -1494,6 +1500,10 @@ pub(crate) fn spawn_heartbeat(
                         // easing off only after the phone has been unreachable
                         // for a while so an offer it can no longer serve does
                         // not spin a TCP+IK every 2 s forever.
+                        // Same for a share to the phone that is waiting: the
+                        // user is watching its pill, and the round that finds
+                        // a route (or asks for a direct one) should not sit
+                        // out 240 s.
                         if consec_lan_fail <= 15 {
                             Duration::from_secs(2)
                         } else {

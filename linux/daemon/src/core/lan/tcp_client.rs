@@ -436,15 +436,14 @@ pub async fn run_lan_reconnect(
         }
     }
 
-    // Outgoing file share (laptop → phone): push a queued file now over this
+    // Outgoing file share (laptop → phone): offer a queued batch now over this
     // established session, after bulk-sync, so the phone's control loop reads
     // it in nonce lock-step. FIFO-drained across heartbeats.
+    // The phone pulls each file over this session; the push reports its own
+    // terminal state to the pill, so an error here only needs logging.
     if let Some(files) = crate::core::outgoing_share::take_batch() {
         if let Err(e) = push_outgoing_batch(&mut stream, &mut transport, &files).await {
             tracing::warn!("file push failed: {e}");
-            crate::core::outgoing_share::report_progress(
-                crate::core::outgoing_share::OutProgress::Fail,
-            );
         }
     }
 
@@ -490,25 +489,91 @@ async fn recv_frame(stream: &mut TcpStream, wait: Duration) -> Result<Frame, Lan
         .map_err(|_| LanError::Timeout("file-push decision"))?
 }
 
-/// Push a batch of laptop-shared files to the phone (instant-share, reverse). One
-/// FILE_PUSH_OFFER lists every file (name/mime/size); the phone shows a single
-/// consent prompt and replies FILE_PUSH_DECISION (1 byte: accept/decline). On
-/// accept we stream each file's FILE_PUSH chunks in order — the phone delimits
-/// files by each chunk stream's own `[total][idx]` header. The phone saves them
-/// all to its Downloads.
+/// How a pushed batch ended, short of a transport error.
+enum PushEnd {
+    /// The phone user declined (or let the prompt time out).
+    Declined,
+    /// Delivered; names the files the phone reported it could not save.
+    Done(Vec<String>),
+    /// Not sent, for a reason the user should be told.
+    Refused(String),
+}
+
+/// Push a batch of laptop-shared files to the phone (instant-share, reverse).
+///
+/// Every file is granted a `share:<token>` address ([`crate::core::share_grants`])
+/// and one FILE_PUSH_OFFER lists the batch; the phone shows a single consent
+/// prompt and replies FILE_PUSH_DECISION. On accept the phone PULLS each file
+/// through the ranged-filesystem protocol on this same session, writing every
+/// range straight to its Downloads, and closes with a FILE_PUSH_DONE report.
+/// Nothing is held in memory on either side, so there is no size limit.
+///
+/// Reports its own terminal progress (Declined / Done / Fail). Grants are
+/// revoked and temporary archives deleted however the batch ends.
 async fn push_outgoing_batch(
     stream: &mut TcpStream,
     transport: &mut snow::TransportState,
     files: &[crate::core::outgoing_share::OutgoingFile],
 ) -> Result<(), LanError> {
-    use crate::core::outgoing_share::{report_progress, OutProgress};
+    use crate::core::outgoing_share::{discard, report_progress, InFlight, OutProgress};
+    use crate::core::share_grants;
+
+    let _busy = InFlight::begin();
+    let tokens: Vec<String> = files
+        .iter()
+        .map(|f| share_grants::grant(f.path.clone()))
+        .collect();
+    let result = push_granted(stream, transport, files, &tokens).await;
+    for t in &tokens {
+        share_grants::revoke(t);
+    }
+    discard(files);
+
+    match result {
+        Ok(PushEnd::Declined) => {
+            info!("← file push declined by phone ({} files)", files.len());
+            report_progress(OutProgress::Declined);
+            Ok(())
+        }
+        Ok(PushEnd::Done(failed)) => {
+            report_progress(OutProgress::Done { failed });
+            Ok(())
+        }
+        Ok(PushEnd::Refused(reason)) => {
+            tracing::warn!("file push not sent: {reason}");
+            report_progress(OutProgress::Fail { reason });
+            Ok(())
+        }
+        Err(e) => {
+            report_progress(OutProgress::Fail {
+                reason: push_failure_reason(&e),
+            });
+            Err(e)
+        }
+    }
+}
+
+/// A transport error, in words for the notification.
+fn push_failure_reason(e: &LanError) -> String {
+    match e {
+        LanError::Timeout(_) => "the phone stopped responding".to_string(),
+        LanError::Io(_) => "the connection to the phone dropped".to_string(),
+        _ => format!("transfer error ({e})"),
+    }
+}
+
+async fn push_granted(
+    stream: &mut TcpStream,
+    transport: &mut snow::TransportState,
+    files: &[crate::core::outgoing_share::OutgoingFile],
+    tokens: &[String],
+) -> Result<PushEnd, LanError> {
+    use crate::core::outgoing_share::{decision, report_progress, OutProgress};
+    use crate::core::share_grants::SHARE_PREFIX;
+
     let count = files.len() as u32;
-    let total_bytes: u64 = files.iter().map(|f| f.bytes.len() as u64).sum();
-    let label = if files.len() == 1 {
-        files[0].name.clone()
-    } else {
-        format!("{count} files")
-    };
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let label = crate::core::outgoing_share::batch_label(files);
     report_progress(OutProgress::Start {
         label,
         count,
@@ -516,61 +581,237 @@ async fn push_outgoing_batch(
     });
 
     // Offer: the full file list + aggregate total, so the phone can render one
-    // consent prompt ("N files · X MB").
+    // consent prompt ("N files · X MB"). `path` is what the phone OPENs to pull
+    // the file; `pull` tells it the laptop can serve that.
     let manifest: Vec<serde_json::Value> = files
         .iter()
-        .map(|f| serde_json::json!({"name": f.name, "mime": f.mime, "bytes": f.bytes.len(), "extract": f.extract}))
+        .zip(tokens)
+        .map(|(f, t)| {
+            let mut o = serde_json::json!({
+                "name": f.name,
+                "mime": f.mime,
+                "bytes": f.size,
+                "path": format!("{SHARE_PREFIX}{t}"),
+                "extract": f.folder.is_some(),
+            });
+            if let Some(z) = &f.folder {
+                o["unpacked"] = z.unpacked.into();
+                o["entries"] = z.entries.into();
+            }
+            o
+        })
         .collect();
     let offer = serde_json::json!({
-        "files": manifest, "count": count, "total": total_bytes,
+        "files": manifest, "count": count, "total": total_bytes, "pull": true,
     })
     .to_string();
-    if let Err(e) = send_sealed(stream, transport, ty::FILE_PUSH_OFFER, offer.as_bytes()).await {
-        report_progress(OutProgress::Fail);
-        return Err(e);
+    // The offer is a single frame. Saying so beats sending one the phone will
+    // drop as oversize, which would read as the prompt never appearing.
+    if offer.len() + 16 > MAX_FRAME_PAYLOAD {
+        return Ok(PushEnd::Refused(format!(
+            "too many files in one share ({count}) — zip them, or share a folder"
+        )));
     }
+    send_sealed(stream, transport, ty::FILE_PUSH_OFFER, offer.as_bytes()).await?;
 
     // Consent: wait for the phone user's Accept/Decline (the phone caps its own
     // prompt at ~45 s; give it 60 s before we treat silence as a decline).
-    let decision = recv_frame(stream, Duration::from_secs(60)).await?;
-    if decision.ty != ty::FILE_PUSH_DECISION {
-        report_progress(OutProgress::Declined);
-        return Err(LanError::Timeout("file-push decision (unexpected frame)"));
+    let decision_frame = recv_frame(stream, Duration::from_secs(60)).await?;
+    if decision_frame.ty != ty::FILE_PUSH_DECISION {
+        return Err(LanError::UnexpectedFrame {
+            ty: decision_frame.ty,
+            sub: decision_frame.sub,
+        });
     }
-    let mut pt = vec![0u8; decision.payload.len()];
-    let n = transport.read_message(&decision.payload, &mut pt)?;
+    let mut pt = vec![0u8; decision_frame.payload.len()];
+    let n = transport.read_message(&decision_frame.payload, &mut pt)?;
     pt.truncate(n);
-    let accepted = pt.first().copied() == Some(1);
-    if !accepted {
-        report_progress(OutProgress::Declined);
-        info!("← file push declined by phone ({count} files)");
-        return Ok(());
+    match pt.first().copied() {
+        Some(decision::ACCEPT_PULL) => {
+            report_progress(OutProgress::Accepted);
+            serve_pull(stream, transport, files, tokens, total_bytes).await
+        }
+        Some(decision::ACCEPT_STREAM) => {
+            report_progress(OutProgress::Accepted);
+            stream_legacy(stream, transport, files, total_bytes).await
+        }
+        _ => Ok(PushEnd::Declined),
     }
-    report_progress(OutProgress::Accepted);
+}
 
-    // Stream every file's chunks in order. Cumulative byte counter drives the
-    // aggregate pill.
-    let mut sent: u64 = 0;
-    for (fi, f) in files.iter().enumerate() {
-        for payload in crate::core::outgoing_share::build_chunks(&f.bytes) {
-            // chunk payload = [total u16][idx u16][data]; bytes shipped this
-            // frame = payload.len() - 4.
-            let data_len = payload.len().saturating_sub(4) as u64;
-            if let Err(e) = send_sealed(stream, transport, ty::FILE_PUSH, &payload).await {
-                report_progress(OutProgress::Fail);
-                return Err(e);
+/// Serve the phone's pull of an accepted batch, on this session, until it
+/// reports FILE_PUSH_DONE.
+///
+/// The phone reads each `share:` path in ranges with the same FS_REQ ops it
+/// uses to browse, so this is the ordinary filesystem server over this socket
+/// — `fs_server` already answers `share:` opens from the grant table. Its
+/// browse roots are served too: the phone sends ALL its filesystem requests on
+/// the session that last carried one, so a browse started mid-transfer lands
+/// here and must not be refused for arriving on the wrong socket.
+///
+/// One request at a time, in arrival order: the phone pipelines a few reads,
+/// TCP queues them, and answering in order is what keeps the Noise nonces in
+/// lock-step on both sides.
+async fn serve_pull(
+    stream: &mut TcpStream,
+    transport: &mut snow::TransportState,
+    files: &[crate::core::outgoing_share::OutgoingFile],
+    tokens: &[String],
+    total_bytes: u64,
+) -> Result<PushEnd, LanError> {
+    use crate::core::ble::frame::sub;
+    use crate::core::fs_proto as p;
+    use crate::core::fs_server::{self, FsHandles, Served};
+    use crate::core::outgoing_share::{report_progress, OutProgress, PushReport};
+    use crate::core::share_grants::token_of;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // Sliding, not total: a large file on a slow link keeps making progress and
+    // must never be cut off, while a phone that stops asking (killed, out of
+    // range) still releases the session. Longer than the phone's own 20 s
+    // request timeout, so it is always the phone that gives up first and can
+    // say why.
+    const IDLE: Duration = Duration::from_secs(30);
+
+    let roots = Arc::new(fs_server::load_roots());
+    let handles = Arc::new(FsHandles::new());
+    // Progress bookkeeping: which batch file each handle reads, and how far
+    // into each file the phone has got.
+    let mut file_of_handle: HashMap<u64, usize> = HashMap::new();
+    let mut reached: Vec<u64> = vec![0; files.len()];
+
+    loop {
+        let frame = timeout(IDLE, read_frame(stream))
+            .await
+            .map_err(|_| LanError::Timeout("file pull (phone went quiet)"))??;
+        let mut pt = vec![0u8; frame.payload.len()];
+        let n = transport.read_message(&frame.payload, &mut pt)?;
+        pt.truncate(n);
+
+        match frame.ty {
+            ty::FS_REQ => {
+                let op = frame.sub;
+                let opening = (op == p::op::OPEN)
+                    .then(|| serde_json::from_slice::<p::OpenReq>(&pt).ok())
+                    .flatten()
+                    .and_then(|r| {
+                        let t = token_of(&r.path)?;
+                        tokens.iter().position(|x| x == t)
+                    });
+                let reading = (op == p::op::READ)
+                    .then(|| serde_json::from_slice::<p::ReadReq>(&pt).ok())
+                    .flatten()
+                    .and_then(|r| file_of_handle.get(&r.handle).copied());
+
+                // `fs_server` is synchronous and touches the disk.
+                let served = {
+                    let (roots, handles) = (roots.clone(), handles.clone());
+                    tokio::task::spawn_blocking(move || fs_server::serve(&roots, &handles, op, &pt))
+                        .await
+                        .map_err(|e| LanError::Io(std::io::Error::other(e)))?
+                };
+                let (ty_byte, payload) = match served {
+                    Served::Meta(reply) => {
+                        if let (Some(i), p::FsReply::Open { handle, .. }) = (opening, &reply) {
+                            file_of_handle.insert(*handle, i);
+                        }
+                        (ty::FS_META, serde_json::to_vec(&reply).unwrap_or_default())
+                    }
+                    Served::Data(bytes) => {
+                        if let Some(i) = reading {
+                            if let Some((_, off, _, b)) = p::decode_data(&bytes) {
+                                reached[i] = reached[i].max(off + b.len() as u64);
+                                report_progress(OutProgress::Progress {
+                                    sent: reached.iter().sum(),
+                                    total: total_bytes,
+                                });
+                            }
+                        }
+                        (ty::FS_DATA, bytes)
+                    }
+                    Served::Err(e) => (ty::FS_ERR, serde_json::to_vec(&e).unwrap_or_default()),
+                };
+                send_sealed(stream, transport, ty_byte, &payload).await?;
             }
-            sent += data_len;
+            ty::FILE_PUSH if frame.sub == sub::FILE_PUSH_DONE => {
+                let report: PushReport = serde_json::from_slice(&pt).unwrap_or_default();
+                info!(
+                    "→ file push batch pulled ({} saved, {} failed, {} bytes)",
+                    report.saved,
+                    report.failed.len(),
+                    reached.iter().sum::<u64>()
+                );
+                return Ok(PushEnd::Done(report.failed));
+            }
+            other => {
+                return Err(LanError::UnexpectedFrame {
+                    ty: other,
+                    sub: frame.sub,
+                })
+            }
+        }
+    }
+}
+
+/// The pre-pull wire, for a phone app that answered ACCEPT_STREAM: each file
+/// as FILE_PUSH `[total][idx][data]` chunks, in order. Read from disk a chunk at
+/// a time, so this side still holds nothing; the old phone app assembles each
+/// file in its memory, which is the limit the pull exists to remove.
+async fn stream_legacy(
+    stream: &mut TcpStream,
+    transport: &mut snow::TransportState,
+    files: &[crate::core::outgoing_share::OutgoingFile],
+    total_bytes: u64,
+) -> Result<PushEnd, LanError> {
+    use crate::core::outgoing_share::{
+        legacy_chunk, legacy_chunk_count, report_progress, OutProgress, PUSH_CHUNK_BYTES,
+    };
+    use tokio::io::AsyncReadExt as _;
+
+    // Checked up front, for the whole batch: once the phone has accepted it
+    // reads files strictly in order, so one that cannot be sent cannot simply
+    // be skipped mid-stream.
+    if let Some(f) = files.iter().find(|f| legacy_chunk_count(f.size).is_none()) {
+        return Ok(PushEnd::Refused(format!(
+            "'{}' is too large for the Vortex app on the phone — update the phone app",
+            f.name
+        )));
+    }
+
+    let count = files.len();
+    let mut sent: u64 = 0;
+    let mut buf = vec![0u8; PUSH_CHUNK_BYTES];
+    for (fi, f) in files.iter().enumerate() {
+        let mut file = tokio::fs::File::open(&f.path).await?;
+        // Chunk count is fixed by the size we offered: the phone keys its
+        // assembly off the total in the first chunk. A file that changed size
+        // since then is sent truncated or zero-padded to that, not desynced.
+        let total = legacy_chunk_count(f.size).unwrap_or(1);
+        let mut left = f.size;
+        for idx in 0..total {
+            let want = (left as usize).min(PUSH_CHUNK_BYTES);
+            let mut got = 0;
+            while got < want {
+                match file.read(&mut buf[got..want]).await? {
+                    0 => break,
+                    n => got += n,
+                }
+            }
+            buf[got..want].fill(0);
+            send_sealed(stream, transport, ty::FILE_PUSH, &legacy_chunk(total, idx, &buf[..want]))
+                .await?;
+            left -= want as u64;
+            sent += want as u64;
             report_progress(OutProgress::Progress {
                 sent,
                 total: total_bytes,
             });
         }
-        info!("→ file push [{}/{count}] '{}' ({} bytes)", fi + 1, f.name, f.bytes.len());
+        info!("→ file push [{}/{count}] '{}' ({} bytes, legacy stream)", fi + 1, f.name, f.size);
     }
-    report_progress(OutProgress::Done);
     info!("→ file push batch done ({count} files, {total_bytes} bytes)");
-    Ok(())
+    Ok(PushEnd::Done(Vec::new()))
 }
 
 /// What one bulk-sync round brought back.
@@ -922,5 +1163,254 @@ mod tests {
         assert!(s.unservable("clipboard_file"));
         assert!(BulkStatus::parse(b"[]").is_none());
         assert!(BulkStatus::parse(b"not json").is_none());
+    }
+}
+
+/// The laptop → phone push, end to end over a loopback socket: the real
+/// `push_outgoing_batch` against a fake phone that speaks the same Noise
+/// transport and pulls with the same FS ops the Android `FsClient` sends.
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use crate::core::ble::frame::sub;
+    use crate::core::crypto::noise::NOISE_IK;
+    use crate::core::crypto::x25519::public_from_private;
+    use crate::core::fs_proto as p;
+    use crate::core::outgoing_share::{decision, FolderZip, OutgoingFile, PUSH_CHUNK_BYTES};
+    use crate::core::share_grants;
+    use tokio::net::TcpListener;
+
+    /// Two transports that completed IK with each other in memory, so the test
+    /// can skip the handshake frames and start at the offer.
+    fn transports() -> (snow::TransportState, snow::TransportState) {
+        let laptop_priv = [7u8; 32];
+        let phone_priv = [9u8; 32];
+        let phone_pub = public_from_private(&phone_priv);
+        let mut init = snow::Builder::new(NOISE_IK.parse().unwrap())
+            .local_private_key(&laptop_priv)
+            .unwrap()
+            .remote_public_key(&phone_pub)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut resp = snow::Builder::new(NOISE_IK.parse().unwrap())
+            .local_private_key(&phone_priv)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let (mut a, mut b) = (vec![0u8; 1024], vec![0u8; 1024]);
+        let n = init.write_message(&[], &mut a).unwrap();
+        resp.read_message(&a[..n], &mut b).unwrap();
+        let n = resp.write_message(&[], &mut a).unwrap();
+        init.read_message(&a[..n], &mut b).unwrap();
+        (init.into_transport_mode().unwrap(), resp.into_transport_mode().unwrap())
+    }
+
+    async fn pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (c, s) = tokio::join!(TcpStream::connect(addr), l.accept());
+        (c.unwrap(), s.unwrap().0)
+    }
+
+    struct Phone {
+        s: TcpStream,
+        t: snow::TransportState,
+        next_id: u32,
+    }
+
+    impl Phone {
+        async fn recv(&mut self) -> (u8, u8, Vec<u8>) {
+            let f = read_frame(&mut self.s).await.unwrap();
+            let mut pt = vec![0u8; f.payload.len()];
+            let n = self.t.read_message(&f.payload, &mut pt).unwrap();
+            pt.truncate(n);
+            (f.ty, f.sub, pt)
+        }
+        async fn send(&mut self, ty_byte: u8, sub: u8, plain: &[u8]) {
+            let mut ct = vec![0u8; plain.len() + 16];
+            let n = self.t.write_message(plain, &mut ct).unwrap();
+            ct.truncate(n);
+            write_frame(&mut self.s, &Frame::new(ty_byte, sub, ct)).await.unwrap();
+        }
+        async fn fs(&mut self, op: u8, mut req: serde_json::Value) -> (u8, Vec<u8>) {
+            self.next_id += 1;
+            req["id"] = self.next_id.into();
+            self.send(ty::FS_REQ, op, req.to_string().as_bytes()).await;
+            let (ty_byte, _, pt) = self.recv().await;
+            (ty_byte, pt)
+        }
+        /// Pull one `share:` path the way `FsClient.readAll` does.
+        async fn pull(&mut self, path: &str) -> Result<Vec<u8>, i32> {
+            let (ty_byte, pt) = self.fs(p::op::OPEN, serde_json::json!({"path": path})).await;
+            if ty_byte == ty::FS_ERR {
+                return Err(serde_json::from_slice::<p::FsErr>(&pt).unwrap().code);
+            }
+            let handle = match serde_json::from_slice::<p::FsReply>(&pt).unwrap() {
+                p::FsReply::Open { handle, .. } => handle,
+                other => panic!("expected an open reply, got {other:?}"),
+            };
+            let mut out = Vec::new();
+            loop {
+                let (ty_byte, pt) = self
+                    .fs(
+                        p::op::READ,
+                        serde_json::json!({"handle": handle, "offset": out.len(), "len": p::MAX_READ_LEN}),
+                    )
+                    .await;
+                assert_eq!(ty_byte, ty::FS_DATA);
+                let (_, off, eof, bytes) = p::decode_data(&pt).unwrap();
+                assert_eq!(off as usize, out.len());
+                out.extend_from_slice(bytes);
+                if eof {
+                    break;
+                }
+            }
+            self.fs(p::op::CLOSE, serde_json::json!({"handle": handle})).await;
+            Ok(out)
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("vortex-push-{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Bigger than any old cap would care about is not needed to prove the
+    /// point: what matters is several ranges and a short tail.
+    fn content(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    fn file(path: &std::path::Path, folder: Option<FolderZip>) -> OutgoingFile {
+        OutgoingFile {
+            name: path.file_name().unwrap().to_string_lossy().to_string(),
+            mime: "application/octet-stream".into(),
+            path: path.to_path_buf(),
+            size: std::fs::metadata(path).unwrap().len(),
+            folder,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_phone_pulls_every_file_byte_exact_and_grants_end_with_the_batch() {
+        let dir = scratch("pull");
+        let a = dir.join("Formation au CAP électricien.pdf");
+        let b = dir.join("empty.txt");
+        let z = dir.join("123-ours.zip");
+        std::fs::write(&a, content(3 * p::MAX_READ_LEN as usize + 17)).unwrap();
+        std::fs::write(&b, b"").unwrap();
+        std::fs::write(&z, content(1000)).unwrap();
+        let files = vec![
+            file(&a, None),
+            file(&b, None),
+            file(&z, Some(FolderZip { unpacked: 5000, entries: 3 })),
+        ];
+
+        let (mut laptop, phone_sock) = pair().await;
+        let (mut lt, pt) = transports();
+        let mut phone = Phone { s: phone_sock, t: pt, next_id: 0 };
+
+        let phone_task = tokio::spawn(async move {
+            let (ty_byte, _, offer) = phone.recv().await;
+            assert_eq!(ty_byte, ty::FILE_PUSH_OFFER);
+            let offer: serde_json::Value = serde_json::from_slice(&offer).unwrap();
+            assert_eq!(offer["pull"], true);
+            phone.send(ty::FILE_PUSH_DECISION, 0, &[decision::ACCEPT_PULL]).await;
+            let mut got = Vec::new();
+            let mut paths = Vec::new();
+            for f in offer["files"].as_array().unwrap() {
+                let path = f["path"].as_str().unwrap().to_string();
+                got.push(phone.pull(&path).await.unwrap());
+                paths.push(path);
+            }
+            // A guessed token opens nothing.
+            assert_eq!(phone.pull("share:00000000000000000000000000000000").await, Err(p::code::NOENT));
+            let report = serde_json::json!({"saved": got.len(), "failed": []});
+            phone.send(ty::FILE_PUSH, sub::FILE_PUSH_DONE, report.to_string().as_bytes()).await;
+            (offer, got, paths)
+        });
+
+        push_outgoing_batch(&mut laptop, &mut lt, &files).await.unwrap();
+        let (offer, got, paths) = phone_task.await.unwrap();
+
+        assert_eq!(got[0], std::fs::read(&a).unwrap(), "byte-exact across ranges");
+        assert!(got[1].is_empty(), "an empty file is a file, not a skip");
+        assert_eq!(got[2], content(1000));
+        // The folder archive carries the totals the phone unpacks against.
+        assert_eq!(offer["files"][2]["extract"], true);
+        assert_eq!(offer["files"][2]["unpacked"], 5000);
+        assert_eq!(offer["files"][2]["entries"], 3);
+        assert_eq!(offer["files"][0]["extract"], false);
+        assert!(offer["files"][0].get("unpacked").is_none());
+        // The batch is over: no grant still opens, our archive is gone, the
+        // user's files are untouched.
+        for path in &paths {
+            assert!(share_grants::get(share_grants::token_of(path).unwrap()).is_none());
+        }
+        assert!(!z.exists(), "temp archive discarded");
+        assert!(a.exists() && b.exists(), "user files never deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_old_phone_gets_the_legacy_chunk_stream_read_from_disk() {
+        let dir = scratch("legacy");
+        let a = dir.join("a.bin");
+        std::fs::write(&a, content(2 * PUSH_CHUNK_BYTES + 5)).unwrap();
+        let files = vec![file(&a, None)];
+
+        let (mut laptop, phone_sock) = pair().await;
+        let (mut lt, pt) = transports();
+        let mut phone = Phone { s: phone_sock, t: pt, next_id: 0 };
+
+        let phone_task = tokio::spawn(async move {
+            let (ty_byte, _, _) = phone.recv().await;
+            assert_eq!(ty_byte, ty::FILE_PUSH_OFFER);
+            phone.send(ty::FILE_PUSH_DECISION, 0, &[decision::ACCEPT_STREAM]).await;
+            let mut out = Vec::new();
+            loop {
+                let (ty_byte, _, c) = phone.recv().await;
+                assert_eq!(ty_byte, ty::FILE_PUSH);
+                let total = u16::from_be_bytes([c[0], c[1]]);
+                let idx = u16::from_be_bytes([c[2], c[3]]);
+                out.extend_from_slice(&c[4..]);
+                if idx + 1 == total {
+                    break;
+                }
+            }
+            out
+        });
+
+        push_outgoing_batch(&mut laptop, &mut lt, &files).await.unwrap();
+        assert_eq!(phone_task.await.unwrap(), std::fs::read(&a).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_decline_sends_nothing_and_still_cleans_up() {
+        let dir = scratch("decline");
+        let z = dir.join("999-ours.zip");
+        std::fs::write(&z, b"zip").unwrap();
+        let files = vec![file(&z, Some(FolderZip { unpacked: 3, entries: 1 }))];
+
+        let (mut laptop, phone_sock) = pair().await;
+        let (mut lt, pt) = transports();
+        let mut phone = Phone { s: phone_sock, t: pt, next_id: 0 };
+
+        let phone_task = tokio::spawn(async move {
+            let (_, _, offer) = phone.recv().await;
+            let offer: serde_json::Value = serde_json::from_slice(&offer).unwrap();
+            phone.send(ty::FILE_PUSH_DECISION, 0, &[decision::DECLINE]).await;
+            offer["files"][0]["path"].as_str().unwrap().to_string()
+        });
+
+        push_outgoing_batch(&mut laptop, &mut lt, &files).await.unwrap();
+        let path = phone_task.await.unwrap();
+        assert!(share_grants::get(share_grants::token_of(&path).unwrap()).is_none());
+        assert!(!z.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

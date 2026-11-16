@@ -11,6 +11,7 @@ import com.southernstorm.noise.protocol.HandshakeState
 import com.southernstorm.noise.protocol.Noise
 import com.vortex.a3.core.ble.FRAME_HEADER_LEN
 import com.vortex.a3.core.ble.Frame
+import com.vortex.a3.core.ble.FilePushDecision
 import com.vortex.a3.core.ble.FrameSub
 import com.vortex.a3.core.ble.FrameType
 import com.vortex.a3.core.ble.MAX_FRAME_PAYLOAD
@@ -802,9 +803,13 @@ class LanServer(
                 // V1 does not exchange a channel join proof — each
                 // transport runs its own IK (spec §8.5).
                 var pending: Frame? = firstFrame
+                // A session over our Wi-Fi Direct group keeps the group up for
+                // as long as it carries frames (see VortexStack.maybeStartWifiDirect).
+                val overDirectLink = sock.localAddress?.hostAddress == WifiDirect.GO_IP
                 while (true) {
                     val frame = pending ?: readFrame(input) ?: break
                     pending = null
+                    if (overDirectLink) WifiDirect.noteActivity()
                     when {
                         frame.type == FrameType.TRANSPORT_KEEPALIVE
                             && frame.sub == FrameSub.PING -> {
@@ -1137,13 +1142,18 @@ class LanServer(
                         }
                         frame.type == FrameType.FILE_PUSH_OFFER -> {
                             // Laptop → phone file PUSH batch (reverse-direction share). The
-                            // offer lists every file {name,bytes}; we ask the user
-                            // (ONE consent prompt), reply FILE_PUSH_DECISION (1 byte
-                            // accept/decline), and on accept read each file's
-                            // FILE_PUSH chunk stream in order (each self-delimited by
-                            // its own [total][idx] header) and save to Downloads.
-                            // Lock-step: offer(1) + decision(1) [+ chunks] keeps the
-                            // cipher nonces in sync with the laptop.
+                            // offer lists every file {name,bytes,path}; we ask the user
+                            // (ONE consent prompt) and reply FILE_PUSH_DECISION.
+                            //
+                            // On accept we PULL each file by its `share:` path through
+                            // FsClient — ranged reads on THIS socket, each range written
+                            // straight to Downloads, so nothing is held in memory and no
+                            // size is too large — then report FILE_PUSH_DONE. A laptop
+                            // that predates the pull sends no paths; for it we accept
+                            // the legacy stream and read each file's FILE_PUSH chunk
+                            // stream in order (each self-delimited by its own
+                            // [total][idx] header). Lock-step: offer(1) + decision(1)
+                            // keeps the cipher nonces in sync with the laptop.
                             val plain = runCatching {
                                 aeadOpen(pair.receiver, frame.payload)
                             }.getOrNull()
@@ -1155,21 +1165,34 @@ class LanServer(
                             // Parallel to names: true ⇒ the laptop zipped a folder for
                             // us, so auto-extract it back to a folder and drop the .zip.
                             val extracts = ArrayList<Boolean>()
+                            // Parallel to names: the `share:` address to pull, and for
+                            // a zipped folder the totals the user is consenting to.
+                            val paths = ArrayList<String?>()
+                            val unpacked = ArrayList<Long?>()
+                            val entryCounts = ArrayList<Long?>()
                             var total = 0L
+                            var laptopServesPull = false
                             runCatching {
                                 val obj = org.json.JSONObject(String(plain, Charsets.UTF_8))
                                 total = obj.optLong("total", 0L)
+                                laptopServesPull = obj.optBoolean("pull", false)
                                 val arr = obj.optJSONArray("files")
                                 if (arr != null) {
                                     for (i in 0 until arr.length()) {
                                         val fo = arr.getJSONObject(i)
                                         names.add(fo.optString("name", "vortex-file"))
                                         extracts.add(fo.optBoolean("extract", false))
+                                        paths.add(fo.optString("path", "").ifEmpty { null })
+                                        unpacked.add(if (fo.has("unpacked")) fo.optLong("unpacked") else null)
+                                        entryCounts.add(if (fo.has("entries")) fo.optLong("entries") else null)
                                     }
                                 } else {
                                     // Back-compat: single-file offer {name,bytes}.
                                     names.add(obj.optString("name", "vortex-file"))
                                     extracts.add(false)
+                                    paths.add(null)
+                                    unpacked.add(null)
+                                    entryCounts.add(null)
                                     total = obj.optLong("bytes", 0L)
                                 }
                             }
@@ -1177,16 +1200,64 @@ class LanServer(
                                 Log.w(TAG, "file-push offer: empty/invalid")
                                 continue
                             }
+                            val pull = laptopServesPull && paths.all { it != null }
                             val label = if (names.size == 1) names[0] else "${names.size} files"
-                            Log.i(TAG, "← file-push offer: $label ($total bytes); asking user")
+                            Log.i(TAG, "← file-push offer: $label ($total bytes, pull=$pull); asking user")
                             val accepted = FileConsent.request(context, label, names.size, total)
-                            // Reply with the decision (1 = accept, 0 = decline).
                             lockedSealAndWrite(
                                 FrameType.FILE_PUSH_DECISION, 0x00,
-                                byteArrayOf(if (accepted) 1 else 0),
+                                byteArrayOf(
+                                    when {
+                                        !accepted -> FilePushDecision.DECLINE
+                                        pull -> FilePushDecision.ACCEPT_PULL
+                                        else -> FilePushDecision.ACCEPT_STREAM
+                                    },
+                                ),
                             )
                             if (!accepted) {
                                 Log.i(TAG, "file-push declined")
+                                continue
+                            }
+                            if (pull) {
+                                // The laptop now serves our filesystem requests on this
+                                // socket until we report done, so this is where FsClient
+                                // must send them — over Wi-Fi, on a session known to be
+                                // up, rather than opening over BLE.
+                                fsWriter = fsOut
+                                // Off this thread: it has to keep reading, because the
+                                // laptop's replies to the pull arrive on this very loop
+                                // (the FS_META/FS_DATA/FS_ERR branch hands them to
+                                // FsClient). Pulling inline would wait on itself.
+                                scope.launch {
+                                    var saved = 0
+                                    val failed = ArrayList<String>()
+                                    for ((fi, name) in names.withIndex()) {
+                                        val path = paths[fi] ?: continue
+                                        val ok = if (extracts[fi]) {
+                                            IncomingFile.pullZipExtracted(
+                                                context, path, name, unpacked[fi], entryCounts[fi],
+                                            )
+                                        } else {
+                                            IncomingFile.pull(context, path, name)
+                                        }
+                                        if (ok) saved++ else failed.add(name)
+                                    }
+                                    Log.i(TAG, "file-push pulled: $saved saved, ${failed.size} failed")
+                                    try {
+                                        val report = org.json.JSONObject()
+                                            .put("saved", saved)
+                                            .put("failed", org.json.JSONArray(failed))
+                                        lockedSealAndWrite(
+                                            FrameType.FILE_PUSH, FrameSub.FILE_PUSH_DONE,
+                                            report.toString().toByteArray(Charsets.UTF_8),
+                                        )
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "file-push: couldn't report done: ${e.message}")
+                                    }
+                                    if (saved > 0) {
+                                        IncomingFile.notifyReceived(context, label, saved)
+                                    }
+                                }
                                 continue
                             }
                             var saved = 0

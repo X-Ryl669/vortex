@@ -157,6 +157,17 @@ pub mod ty {
     /// link (~20 MB/s vs the router path), then restores its Wi-Fi. Mirrors
     /// Kotlin `FrameType.WIFI_DIRECT_OFFER`.
     pub const WIFI_DIRECT_OFFER: u8 = 0x46;
+    /// "Please bring up Wi-Fi Direct" (laptop→phone): the laptop has a share
+    /// queued for the phone and cannot reach it on the local network. Empty
+    /// payload. The phone answers the way it does for its own large shares —
+    /// it creates the P2P group and sends [`WIFI_DIRECT_OFFER`] — and the
+    /// laptop joins and pushes over that link. The symmetric half of the
+    /// phone→laptop fast path.
+    ///
+    /// Additive: a phone without this build logs and ignores it, and the share
+    /// simply waits for the ordinary network. Mirrors Kotlin
+    /// `FrameType.WIFI_DIRECT_REQUEST`.
+    pub const WIFI_DIRECT_REQUEST: u8 = 0x55;
     /// Phone → laptop browsing HANDOFF (seamless-continuity style): the URL the user
     /// is on / wants to open on the laptop, `{url, title, app_id, open_now}` JSON.
     /// `open_now=true` (an explicit Share) opens it immediately; `false` (the
@@ -164,15 +175,18 @@ pub mod ty {
     /// clicks to open. An empty `url` clears the pill. Mirrors Kotlin
     /// `FrameType.HANDOFF`. (0x47/0x48 are reserved by the screen-mirror module.)
     pub const HANDOFF: u8 = 0x4C;
-    /// Laptop → phone file PUSH (instant-share, reverse): `FILE_PUSH_OFFER` carries
-    /// `{name, mime, bytes}` JSON, then `FILE_PUSH` chunks (`[total][idx][data]`)
-    /// stream the bytes. Sent over the LAN session after bulk-sync; the phone
-    /// saves the file to its Downloads. Mirror Kotlin `FrameType.FILE_PUSH*`.
+    /// Laptop → phone file PUSH (instant-share, reverse): `FILE_PUSH_OFFER` lists
+    /// the batch as JSON (`files: [{name, mime, bytes, path, extract, …}]`), each
+    /// `path` a `share:<token>` the phone pulls through `FS_REQ` on the same LAN
+    /// session, then reports with `FILE_PUSH`/`sub::FILE_PUSH_DONE`. A phone that
+    /// predates the pull gets the legacy `FILE_PUSH` chunk stream
+    /// (`[total][idx][data]`) instead. Mirror Kotlin `FrameType.FILE_PUSH*`.
     pub const FILE_PUSH_OFFER: u8 = 0x49;
     pub const FILE_PUSH: u8 = 0x4A;
     /// Phone → laptop reply to a `FILE_PUSH_OFFER`: the AEAD payload is a single
-    /// byte (1 = accept, 0 = decline) the user chose on the receiving phone.
-    /// The laptop streams `FILE_PUSH` chunks only on accept (consent-gated share).
+    /// byte the user chose on the receiving phone — see
+    /// `outgoing_share::decision` (0 decline, 1 accept + legacy stream, 2 accept
+    /// + pull). Nothing is sent before an accept (consent-gated share).
     /// Mirrors Kotlin `FrameType.FILE_PUSH_DECISION`.
     pub const FILE_PUSH_DECISION: u8 = 0x4B;
     /// Notes/Todos bidirectional sync. The full item set (incl. tombstones) is
@@ -264,6 +278,10 @@ pub mod sub {
     pub const HANDOFF_BUSY: u8 = 0x02;
     /// CLAIM: request to become the active peer.
     pub const HANDOFF_CLAIM: u8 = 0x03;
+    /// `FILE_PUSH` sent phone → laptop: the phone has finished pulling an
+    /// accepted batch. JSON `{"saved": n, "failed": [names]}`. Mirror Kotlin
+    /// `FrameSub.FILE_PUSH_DONE`.
+    pub const FILE_PUSH_DONE: u8 = 0x02;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

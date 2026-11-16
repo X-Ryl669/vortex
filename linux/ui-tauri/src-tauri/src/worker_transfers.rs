@@ -54,10 +54,29 @@ pub(crate) fn wire_transfer_indicators(ble_live_tx: UnboundedSender<LiveActivity
                     crate::transfers_out::set_progress(sent, total);
                 }
             }
-            OutProgress::Done => crate::transfers_out::complete(),
-            OutProgress::Fail => crate::transfers_out::fail(),
+            OutProgress::Done { failed } => {
+                crate::transfers_out::complete();
+                if !failed.is_empty() {
+                    let summary = if failed.len() == 1 {
+                        "1 file couldn't be saved on the phone".to_string()
+                    } else {
+                        format!("{} files couldn't be saved on the phone", failed.len())
+                    };
+                    crate::share::notify_problem(summary, &failed);
+                }
+            }
+            OutProgress::Fail { reason } => {
+                crate::transfers_out::fail(&reason);
+                crate::share::notify_problem(
+                    "Couldn't send to the phone".to_string(),
+                    std::slice::from_ref(&reason),
+                );
+            }
         }
     }));
+    // Archives staged for a share by an earlier run can never be sent now (the
+    // queue lived in that process's memory).
+    tokio::task::spawn_blocking(vortex_l3_daemon::core::outgoing_share::purge_temp_dir);
 
     // Phone→laptop receive consent: route fc:accept/fc:decline banner clicks
     // back to the waiting offer-consumer (instant-share style Accept/Decline).

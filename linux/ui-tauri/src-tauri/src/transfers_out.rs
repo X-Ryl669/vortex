@@ -29,6 +29,8 @@ struct Batch {
     total: u64,
     sent: u64,
     phase: Phase,
+    /// Why it failed, shown under the title.
+    detail: String,
 }
 
 static BATCH: Mutex<Option<Batch>> = Mutex::new(None);
@@ -47,9 +49,39 @@ pub(crate) fn start(label: &str, total: u64) {
             total,
             sent: 0,
             phase: Phase::Waiting,
+            detail: String::new(),
         });
     }
     emit();
+}
+
+/// A share was just queued. Shows its pill at once, so a share that has to
+/// wait for a route is visibly waiting rather than silently queued. Leaves a
+/// batch already on screen alone: the queue is FIFO, and this one gets its own
+/// pill when its turn comes.
+pub(crate) fn queued(label: &str, total: u64) {
+    let idle = BATCH.lock().map(|g| g.is_none()).unwrap_or(false);
+    if idle {
+        start(label, total);
+    }
+}
+
+/// Why the batch is still waiting, shown in place of "Waiting for phone…".
+/// Ignored once the batch is past waiting.
+pub(crate) fn waiting(reason: &str) {
+    let changed = BATCH
+        .lock()
+        .map(|mut g| match g.as_mut() {
+            Some(b) if b.phase == Phase::Waiting && b.detail != reason => {
+                b.detail = reason.to_string();
+                true
+            }
+            _ => false,
+        })
+        .unwrap_or(false);
+    if changed {
+        emit();
+    }
 }
 
 pub(crate) fn accepted() {
@@ -85,7 +117,12 @@ pub(crate) fn complete() {
     emit();
 }
 
-pub(crate) fn fail() {
+pub(crate) fn fail(reason: &str) {
+    if let Ok(mut g) = BATCH.lock() {
+        if let Some(b) = g.as_mut() {
+            b.detail = reason.to_string();
+        }
+    }
     set_phase(Phase::Failed);
 }
 
@@ -153,7 +190,11 @@ fn emit() {
         match b.phase {
             Phase::Waiting => (
                 format!("Sharing {}", b.label),
-                "Waiting for phone…".to_string(),
+                if b.detail.is_empty() {
+                    "Waiting for phone…".to_string()
+                } else {
+                    b.detail.clone()
+                },
                 -1,
                 false,
             ),
@@ -177,7 +218,7 @@ fn emit() {
             ),
             Phase::Failed => (
                 format!("Send failed: {}", b.label),
-                String::new(),
+                b.detail.clone(),
                 0,
                 true,
             ),

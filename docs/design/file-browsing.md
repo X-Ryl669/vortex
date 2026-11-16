@@ -473,6 +473,46 @@ has nothing to connect to. Listings are small and fine over BLE; pulling a large
 file this way runs at ~40 KiB/s. Closing that gap means giving the laptop a
 listener — worth doing, and the natural companion to step 3.
 
+## 8c. Sharing a file from the laptop to the phone
+
+"Share via Vortex" used to read every file into memory and stream it as
+`FILE_PUSH` chunks, which the phone reassembled in memory too, so it carried a
+64 MiB per-file cap. An 83 MB PDF was dropped at that cap with nothing but a log
+line. It now rides this protocol, the same way the phone → laptop share does:
+
+- The laptop grants each file a random `share:<token>` (`core::share_grants`,
+  the mirror of the phone's `ShareGrants`), and `fs_server` opens those tokens
+  read-only, outside every served root, while the batch is in flight. Folders
+  are zipped to a temporary file on disk, never into memory.
+- The offer lists each file's `share:` path. On accept (decision byte `2`), the
+  phone pulls every file with `FsClient.readAll` **on the heartbeat socket that
+  carried the offer**. That socket is known to be up and on Wi-Fi, so the pull
+  never depends on BLE being alive. Each range goes straight into a pending
+  MediaStore entry. The phone ends with `FILE_PUSH`/`FILE_PUSH_DONE` listing
+  what it could not save.
+- There is no size limit. A zipped folder carries its uncompressed total and
+  entry count in the offer, and the phone stops unpacking at those numbers.
+  That guard is what the user agreed to, not a fixed constant.
+- Old peers still work. A phone that answers `1` gets the legacy chunk stream,
+  now read from disk a chunk at a time. An offer without paths (an old laptop)
+  takes the old receive path.
+- Anything skipped, a failed transfer, or a file the phone could not save
+  produces a desktop notification, not just a log line.
+- **No shared Wi-Fi.** The share shows its pill as soon as it is queued. When
+  two heartbeat rounds in a row fail to reach the phone while a share is
+  waiting, the laptop sends `WIFI_DIRECT_REQUEST` (0x55) over BLE. The phone
+  answers as it does for its own large shares, by creating its P2P group and
+  sending `WIFI_DIRECT_OFFER`. The laptop then joins and pushes over the direct
+  link. This is the mirror of the phone → laptop fast path, except that it is
+  triggered by "no route", not by a file size. With BLE down as well, the pill
+  says so and one notification explains that the share will go out when the
+  phone is back.
+- The group lives as long as it is used. The phone tears it down after 60 s
+  with no frames over it, not 60 s after it was created, so a long transfer is
+  no longer cut off. The laptop's watchdog now also applies the idle grace when
+  no heartbeat round succeeds, so the laptop is never left on a group that has
+  gone away.
+
 ## 9. Open questions
 
 - **ProjFS is imported at load time, and that is wrong for shipping.** The

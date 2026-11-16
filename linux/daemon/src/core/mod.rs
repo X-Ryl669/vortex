@@ -36,6 +36,8 @@ pub mod fs_proto;
 pub mod fs_server;
 pub mod wifi_direct;
 pub mod outgoing_share;
+/// Files shared to the phone, pulled by token through [`fs_proto`].
+pub mod share_grants;
 pub mod mirror_session;
 pub mod mirror_udp;
 pub mod mirror_tcp;

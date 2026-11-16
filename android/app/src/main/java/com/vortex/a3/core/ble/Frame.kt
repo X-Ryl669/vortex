@@ -117,14 +117,24 @@ object FrameType {
     /** "Wi-Fi Direct ready" signal `{ssid, pass}` — phone made a P2P group for a
      *  fast pull. Mirrors Rust `ble::frame::ty::WIFI_DIRECT_OFFER`. */
     const val WIFI_DIRECT_OFFER: Byte = 0x46
-    /** Laptop → phone file PUSH (reverse-direction share): `FILE_PUSH_OFFER` {name,mime,
-     *  bytes}, then `FILE_PUSH` chunks. Phone saves to Downloads. Mirrors Rust
-     *  `ble::frame::ty::FILE_PUSH*`. (0x47/0x48 are the screen-mirror module's.) */
+    /** "Please bring up Wi-Fi Direct" (laptop → phone, empty payload): the laptop
+     *  has a share waiting for us and can't reach us on the local network. We
+     *  answer as for a large share of our own — create the group and send
+     *  [WIFI_DIRECT_OFFER] — and the laptop joins and pushes over it.
+     *  Mirrors Rust `ble::frame::ty::WIFI_DIRECT_REQUEST`. */
+    const val WIFI_DIRECT_REQUEST: Byte = 0x55
+    /** Laptop → phone file PUSH (reverse-direction share): `FILE_PUSH_OFFER` lists the
+     *  batch (`files: [{name, mime, bytes, path, extract, …}]`); on accept the phone
+     *  PULLS each `share:` path through FS_REQ on the same session and reports with
+     *  `FILE_PUSH`/[FrameSub.FILE_PUSH_DONE]. A laptop that predates the pull sends
+     *  no `path` and streams `FILE_PUSH` chunks instead. Phone saves to Downloads.
+     *  Mirrors Rust `ble::frame::ty::FILE_PUSH*`. (0x47/0x48 are the screen-mirror
+     *  module's.) */
     const val FILE_PUSH_OFFER: Byte = 0x49
     const val FILE_PUSH: Byte = 0x4A
-    /** Phone → laptop reply to a FILE_PUSH_OFFER: AEAD payload is one byte
-     *  (1 = accept, 0 = decline) the user chose on this phone. The laptop sends
-     *  FILE_PUSH chunks only on accept (receive consent). Mirrors Rust
+    /** Phone → laptop reply to a FILE_PUSH_OFFER: AEAD payload is one byte the
+     *  user chose on this phone — see [FilePushDecision]. Nothing is transferred
+     *  before an accept (receive consent). Mirrors Rust
      *  `ble::frame::ty::FILE_PUSH_DECISION`. */
     const val FILE_PUSH_DECISION: Byte = 0x4B
     /** Phone → laptop browsing HANDOFF (seamless-continuity): `{url,title,app_id,
@@ -200,6 +210,19 @@ object FrameSub {
     const val HANDOFF_BUSY: Byte = 0x02
     /** Request to become the active peer. */
     const val HANDOFF_CLAIM: Byte = 0x03
+    /** [FrameType.FILE_PUSH] sent phone → laptop: finished pulling an accepted
+     *  batch. JSON `{"saved": n, "failed": [names]}`. Mirrors Rust
+     *  `ty::sub::FILE_PUSH_DONE`. */
+    const val FILE_PUSH_DONE: Byte = 0x02
+}
+
+/** The single byte of a FILE_PUSH_DECISION. Mirrors Rust `outgoing_share::decision`. */
+object FilePushDecision {
+    const val DECLINE: Byte = 0
+    /** Accept, and receive the legacy FILE_PUSH chunk stream (old laptop). */
+    const val ACCEPT_STREAM: Byte = 1
+    /** Accept, and pull every file by its `share:` path. */
+    const val ACCEPT_PULL: Byte = 2
 }
 
 /** Header size in bytes. */

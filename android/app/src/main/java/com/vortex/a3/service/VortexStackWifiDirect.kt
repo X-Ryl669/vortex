@@ -13,8 +13,13 @@ import kotlinx.coroutines.launch
  */
 
 /** Create the Wi-Fi Direct GO (idempotent) and, once it's up, tell the laptop
- *  to join; tear it down after an idle window (reset on each big file). */
-internal fun VortexStack.maybeStartWifiDirect() {
+ *  to join; tear it down once the link has been idle for a while.
+ *
+ *  [requested] is true when the LAPTOP asked (it has a share for us and no LAN
+ *  route). That request is answered even inside the coalescing gap: the gap
+ *  exists to stop our own per-file calls from flooding the laptop with offers,
+ *  and a laptop that asks has, by definition, not taken the last one. */
+internal fun VortexStack.maybeStartWifiDirect(requested: Boolean = false) {
     com.vortex.a3.core.lan.WifiDirect.start(ctx) {
         // COALESCE the offer. `WifiDirect.start` is idempotent for the group but
         // re-invokes this callback on every call (`if (isUp) onReady()`), and
@@ -31,7 +36,7 @@ internal fun VortexStack.maybeStartWifiDirect() {
         // teardown window so a genuinely new batch is never starved.
         val now = android.os.SystemClock.elapsedRealtime()
         val since = now - lastWifiDirectOfferAtMs
-        if (lastWifiDirectOfferAtMs != 0L && since < VortexStack.WIFI_DIRECT_OFFER_MIN_GAP_MS) {
+        if (!requested && lastWifiDirectOfferAtMs != 0L && since < VortexStack.WIFI_DIRECT_OFFER_MIN_GAP_MS) {
             Log.d(VortexStack.TAG, "wifi-direct: offer suppressed (sent ${since}ms ago)")
             return@start
         }
@@ -47,7 +52,17 @@ internal fun VortexStack.maybeStartWifiDirect() {
     }
     wifiDirectTeardownJob?.cancel()
     wifiDirectTeardownJob = scope.launch {
-        kotlinx.coroutines.delay(60_000)
+        // Idle, not since-start: a transfer over the group outlives a fixed
+        // window (a 2 GB file is ~100 s at 20 MB/s), and tearing the group down
+        // under it cut the transfer off. Every frame over the group counts as
+        // use ([com.vortex.a3.core.lan.WifiDirect.noteActivity]).
+        val idleWindow = VortexStack.WIFI_DIRECT_IDLE_MS
+        kotlinx.coroutines.delay(idleWindow)
+        while (true) {
+            val idle = com.vortex.a3.core.lan.WifiDirect.idleMs()
+            if (idle >= idleWindow) break
+            kotlinx.coroutines.delay(idleWindow - idle)
+        }
         com.vortex.a3.core.lan.WifiDirect.stop()
         // Group is gone, so the next batch must be free to offer at once
         // rather than waiting out the coalescing gap.

@@ -181,6 +181,10 @@ class GattServer(
         successorName: String,
     ) -> Unit = { _, _, _ -> }
 
+    /** Invoked when the laptop WRITES a WIFI_DIRECT_REQUEST: it has a share for
+     *  us and no route over the local network, so bring up the P2P group. */
+    @Volatile var onWifiDirectRequested: () -> Unit = {}
+
     /** Invoked when the laptop WRITES a NOTES_SYNC chunk (`[total][idx][data]`):
      *  reassembled + LWW-merged into the local notes store. */
     @Volatile var onNotesSyncReceived: (peerStaticPub: ByteArray, chunk: ByteArray) -> Unit =
@@ -1267,6 +1271,14 @@ class GattServer(
                                 onNotesSyncReceived(peerPub, jsonBytes)
                             } catch (e: Exception) {
                                 Log.w(TAG, "onNotesSyncReceived threw: ${e.message}")
+                            }
+                        }
+                        FrameType.WIFI_DIRECT_REQUEST -> {
+                            Log.i(TAG, "← laptop asks for Wi-Fi Direct (share waiting, no LAN route)")
+                            try {
+                                onWifiDirectRequested()
+                            } catch (e: Exception) {
+                                Log.w(TAG, "onWifiDirectRequested threw: ${e.message}")
                             }
                         }
                         FrameType.FS_META, FrameType.FS_DATA, FrameType.FS_ERR -> {

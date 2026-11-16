@@ -82,7 +82,24 @@ object WifiDirect {
         }
     }
 
+    /** elapsedRealtime of the last frame over the group; 0 = none yet. */
+    @Volatile
+    private var lastActivityAtMs = 0L
+
+    /** A frame just crossed the group link (see [LanServer]). Keeps it up. */
+    fun noteActivity() {
+        lastActivityAtMs = android.os.SystemClock.elapsedRealtime()
+    }
+
+    /** How long since the group link last carried a frame. */
+    fun idleMs(): Long {
+        val last = lastActivityAtMs
+        if (last == 0L) return Long.MAX_VALUE
+        return android.os.SystemClock.elapsedRealtime() - last
+    }
+
     fun stop() {
+        lastActivityAtMs = 0L
         isUp = false
         onReady = null
         val c = channel ?: return

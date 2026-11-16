@@ -291,6 +291,12 @@ fn do_stat(roots: &p::Roots, r: &p::StatReq) -> Served {
 }
 
 fn do_open(roots: &p::Roots, handles: &FsHandles, r: &p::OpenReq) -> Served {
+    // A file the user shared to the phone, pulled by token. Not a browse: it is
+    // usually under no served root, and the authorisation is the share itself.
+    // Same convention as the phone's `FsRoots.resolve`.
+    if let Some(token) = crate::core::share_grants::token_of(&r.path) {
+        return open_granted(handles, r, token);
+    }
     let path = match resolve_or(roots, &r.path, r.write, r.id) {
         Ok(p) => p,
         Err(s) => return s,
@@ -334,6 +340,35 @@ fn do_open(roots: &p::Roots, handles: &FsHandles, r: &p::OpenReq) -> Served {
             handle,
             size,
             readonly,
+        }),
+        Err(c) => Served::Err(FsErr::new(r.id, c, "too many open handles")),
+    }
+}
+
+/// Open a shared file by its grant token. Read-only: a share hands the phone a
+/// copy, never the right to change the original.
+fn open_granted(handles: &FsHandles, r: &p::OpenReq, token: &str) -> Served {
+    if r.write {
+        return Served::err(r.id, code::ROFS, "shared files are read-only");
+    }
+    let Some(grant) = crate::core::share_grants::get(token) else {
+        return Served::err(r.id, code::NOENT, "no such share");
+    };
+    let file = match File::open(&grant.path) {
+        Ok(f) => f,
+        Err(e) => return Served::Err(FsErr::new(r.id, io_code(&e), "shared file unreadable")),
+    };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    match handles.insert(Handle {
+        file,
+        writable: false,
+        last_used: Instant::now(),
+    }) {
+        Ok(handle) => Served::Meta(FsReply::Open {
+            id: r.id,
+            handle,
+            size,
+            readonly: true,
         }),
         Err(c) => Served::Err(FsErr::new(r.id, c, "too many open handles")),
     }
@@ -551,6 +586,65 @@ mod tests {
             path: dir.clone(),
             writable: true,
         }])
+    }
+
+    /// A shared file is served by token even with NO roots at all (the share
+    /// is the authorisation), read-only, and only while the grant stands.
+    #[test]
+    fn a_granted_file_opens_by_token_outside_every_root() {
+        use crate::core::share_grants;
+        let dir = scratch("grant");
+        let file = dir.join("shared.pdf");
+        std::fs::write(&file, b"pdf-bytes").expect("write");
+        let roots = p::Roots::default();
+        let handles = FsHandles::new();
+        let token = share_grants::grant(file.clone());
+        let path = format!("{}{token}", share_grants::SHARE_PREFIX);
+
+        let open = |id: u32, write: bool| {
+            serde_json::to_vec(&p::OpenReq {
+                id,
+                path: path.clone(),
+                write,
+            })
+            .unwrap()
+        };
+        let handle = match serve(&roots, &handles, p::op::OPEN, &open(1, false)) {
+            Served::Meta(FsReply::Open { handle, size, readonly, .. }) => {
+                assert_eq!(size, 9);
+                assert!(readonly);
+                handle
+            }
+            _ => panic!("granted open failed"),
+        };
+        let req = serde_json::to_vec(&p::ReadReq {
+            id: 2,
+            handle,
+            offset: 0,
+            len: 100,
+        })
+        .unwrap();
+        match serve(&roots, &handles, p::op::READ, &req) {
+            Served::Data(d) => {
+                let (_, _, eof, bytes) = p::decode_data(&d).expect("decodes");
+                assert!(eof);
+                assert_eq!(bytes, b"pdf-bytes");
+            }
+            _ => panic!("granted read failed"),
+        }
+
+        // Never writable.
+        match serve(&roots, &handles, p::op::OPEN, &open(3, true)) {
+            Served::Err(e) => assert_eq!(e.code, code::ROFS),
+            _ => panic!("a share must not open for writing"),
+        }
+        // Gone once revoked.
+        share_grants::revoke(&token);
+        match serve(&roots, &handles, p::op::OPEN, &open(4, false)) {
+            Served::Err(e) => assert_eq!(e.code, code::NOENT),
+            _ => panic!("a revoked share must not open"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

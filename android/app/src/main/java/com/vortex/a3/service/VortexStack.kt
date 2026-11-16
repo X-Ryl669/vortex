@@ -969,6 +969,10 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // laptop that DOES want us can find us — otherwise we would sit
         // silently attached to a laptop that has moved on, invisible to
         // everything else until the link happened to drop.
+        // The laptop has a share for us and can't reach us over the LAN: open
+        // the direct link it can push through. Wired here, with the server,
+        // so a GATT rebuild after a Bluetooth off/on keeps it.
+        server.onWifiDirectRequested = { maybeStartWifiDirect(requested = true) }
         server.onPeerHandoffReceived = { peerPub, kind, successorName ->
             if (kind == FrameSub.HANDOFF_RELEASE) {
                 val who = if (successorName.isBlank()) "another phone" else successorName
@@ -1429,6 +1433,10 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
          *  Wi-Fi disconnect/reconnect (single adapter), so they must not track
          *  the file count. Well inside the 60 s idle teardown. */
         internal const val WIFI_DIRECT_OFFER_MIN_GAP_MS = 30_000L
+        /** The Wi-Fi Direct group comes down after this long with no traffic
+         *  over it. Above the laptop's 25 s idle grace, so the laptop leaves
+         *  the group before it disappears under it. */
+        internal const val WIFI_DIRECT_IDLE_MS = 60_000L
 
         /** How long an AUDIO_SIGNAL subscription must stay up before the
          *  companion mirror burst (contacts/recents/SMS, ~37 chunks) fires.
