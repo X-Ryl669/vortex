@@ -484,7 +484,6 @@ async fn state_beat(link: Arc<dyn GattLink>, transport: Arc<Mutex<TransportState
         state.camera_req = crate::camera::camera_wanted();
         state.camera_facing = crate::camera::camera_facing();
         state.ring_seq = crate::ring::ring_seq();
-        state.wifi_direct_req_seq = crate::lan_wifi_direct::request_seq();
         crate::media_remote::fill_now_playing(&mut state).await;
 
         match audio_signal::write_state(&*link, transport.clone(), &state).await {

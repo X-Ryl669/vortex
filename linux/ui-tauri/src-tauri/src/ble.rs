@@ -1388,7 +1388,6 @@ pub(crate) async fn run_ble_persistent_loop(
                     state.camera_facing = crate::camera::camera_facing();
                     // Find-My: the "ring my phone" request (unix-millis of last tap).
                     state.ring_seq = crate::ring::ring_seq();
-                    state.wifi_direct_req_seq = crate::lan_wifi_direct::request_seq();
                     let (otp, otp_seq) = crate::send_to_phone::pending();
                     state.open_on_phone = otp;
                     state.open_on_phone_seq = otp_seq;
