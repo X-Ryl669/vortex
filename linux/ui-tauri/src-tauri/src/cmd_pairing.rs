@@ -80,6 +80,24 @@ pub(crate) fn scan(ctx: &WorkerCtx, active_scan: &mut Option<tokio::task::JoinHa
     }));
 }
 
+/// Tear down the link `do_pair` used and drop its BlueZ device object.
+///
+/// Only touches an LE *random*-address device — the phone's RPA, which cannot
+/// carry classic profiles. `Device::disconnect()` tears down every bearer, so on
+/// a public/BR-EDR address it could cut the user's A2DP/HFP audio; those are
+/// left alone. Best-effort and bounded: nothing durable lives on this entry.
+#[cfg(target_os = "linux")]
+async fn drop_pairing_link(adapter: &bluer::Adapter, addr_str: &str) {
+    let Ok(addr) = addr_str.parse::<bluer::Address>() else { return };
+    let Ok(dev) = adapter.device(addr) else { return };
+    if !matches!(dev.address_type().await, Ok(bluer::AddressType::LeRandom)) {
+        return;
+    }
+    crate::ble::clear_pending_connect(adapter, addr).await;
+    crate::ble::forget_stale_device(adapter, addr).await;
+    tracing::info!(peer = %addr_str, "pairing link torn down");
+}
+
 /// `UiCmd::Pair` — quiet the radio (abort+await any scan), then run IK pairing.
 ///
 /// Linux-only for the same reason as [`scan`]; elsewhere the worker calls
@@ -114,6 +132,12 @@ pub(crate) async fn pair(
         }
     }
     let result = do_pair(app, &ctx.adapter, &addr_str, &ctx.identity, ctx.peer_store.clone()).await;
+    // Whatever the outcome, the pairing link has done its job. BlueZ does not
+    // reliably drop it when the GATT handles go, and a lingering link to the
+    // phone makes it refuse every later connect (the phone has rotated to a new
+    // RPA by then, so the persistent loop dials that and fails with
+    // le-connection-abort-by-local while the old link sits there).
+    drop_pairing_link(&ctx.adapter, &addr_str).await;
     match result {
         Ok(_) => {
             let _ = app.emit(
