@@ -904,6 +904,49 @@ pub(crate) async fn clear_pending_connect(adapter: &bluer::Adapter, addr: bluer:
     }
 }
 
+/// Drop every LE link BlueZ still holds to a Vortex phone that we do not own.
+///
+/// BlueZ keeps a link "Connected" after its client is gone — a killed or
+/// crashed app, or a pairing that never closed its link — and the phone, which
+/// still counts the laptop as connected, then refuses every new connect with
+/// le-connection-abort-by-local (the link comes up and is torn down at once, HCI
+/// 0x3e). Clearing the one orphan is enough; no daemon restart is needed.
+///
+/// Call it only where this process has no session of its own: at startup and
+/// when connects have failed repeatedly. Anything Connected and advertising the
+/// Vortex service at those points is an orphan.
+///
+/// LE random addresses only (the phone's RPA). `Device::disconnect()` tears
+/// down every bearer, so a public/BR-EDR address — a phone also paired as an
+/// audio device — is never touched. Returns how many links it dropped.
+pub(crate) async fn drop_orphan_vortex_links(adapter: &bluer::Adapter) -> usize {
+    let Ok(addrs) = adapter.device_addresses().await else { return 0 };
+    let mut dropped = 0;
+    for addr in addrs {
+        let Ok(dev) = adapter.device(addr) else { continue };
+        if !matches!(dev.address_type().await, Ok(bluer::AddressType::LeRandom)) {
+            continue;
+        }
+        if !dev.is_connected().await.unwrap_or(false) {
+            continue;
+        }
+        let is_vortex = dev
+            .uuids()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|u| u.contains(&vortex_l3_daemon::core::ble::VORTEX_SERVICE_UUID));
+        if !is_vortex {
+            continue;
+        }
+        tracing::info!(addr = %addr, "dropping orphaned BLE link to a Vortex phone");
+        clear_pending_connect(adapter, addr).await;
+        forget_stale_device(adapter, addr).await;
+        dropped += 1;
+    }
+    dropped
+}
+
 /// Persistent BLE link to the trusted phone (P2.13).
 ///
 /// Loops forever:
@@ -983,6 +1026,9 @@ pub(crate) async fn run_ble_persistent_loop(
     let mut consec_connect_fail: u32 = 0;
     let mut announced_no_peer = false;
     tracing::info!("BLE persistent loop started");
+    // Nothing of ours is connected yet, so a link BlueZ still holds to the phone
+    // is left over from a previous run and would make every connect fail.
+    drop_orphan_vortex_links(&adapter).await;
     loop {
         // Need a trusted peer record to authenticate against.
         // Same blocking-pool offload as the LAN heartbeat: libsecret
@@ -1113,6 +1159,9 @@ pub(crate) async fn run_ble_persistent_loop(
                         consec_connect_fail,
                         "BLE: repeated connect failures — backing off (adapter left alone)"
                     );
+                    // The cheap, targeted cause: a link BlueZ still holds to the
+                    // phone. Dropping it is not an adapter power-cycle.
+                    drop_orphan_vortex_links(&adapter).await;
                     consec_connect_fail = 0;
                     last_rpa = None;
                     tokio::time::sleep(Duration::from_secs(5)).await;
